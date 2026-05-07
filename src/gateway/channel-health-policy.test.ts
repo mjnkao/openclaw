@@ -223,6 +223,33 @@ describe("evaluateChannelHealth", () => {
     expect(evaluation).toEqual({ healthy: true, reason: "healthy" });
   });
 
+  it("flags app inbound as stale when a Discord watchdog sees fresh transport only", () => {
+    const evaluation = evaluateDiscordHealth({
+      running: true,
+      connected: true,
+      enabled: true,
+      configured: true,
+      lastStartAt: 0,
+      lastInboundAt: 10_000,
+      lastTransportActivityAt: 95_000,
+      appInboundWatchdogEnabled: true,
+    });
+    expect(evaluation).toEqual({ healthy: false, reason: "app-inbound-stale" });
+  });
+
+  it("keeps stale app inbound healthy unless the provider opts into the watchdog", () => {
+    const evaluation = evaluateDiscordHealth({
+      running: true,
+      connected: true,
+      enabled: true,
+      configured: true,
+      lastStartAt: 0,
+      lastInboundAt: 10_000,
+      lastTransportActivityAt: 95_000,
+    });
+    expect(evaluation).toEqual({ healthy: true, reason: "healthy" });
+  });
+
   it("keeps quiet telegram webhooks healthy when they do not publish transport tracking", () => {
     const evaluation = evaluateChannelHealth(
       {
@@ -319,5 +346,16 @@ describe("resolveChannelRestartReason", () => {
       { healthy: false, reason: "disconnected" },
     );
     expect(reason).toBe("disconnected");
+  });
+
+  it("maps app inbound stale to app-inbound-stale", () => {
+    const reason = resolveChannelRestartReason(
+      {
+        running: true,
+        connected: true,
+      },
+      { healthy: false, reason: "app-inbound-stale" },
+    );
+    expect(reason).toBe("app-inbound-stale");
   });
 });

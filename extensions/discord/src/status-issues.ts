@@ -24,6 +24,11 @@ type DiscordAccountStatus = {
   running?: unknown;
   connected?: unknown;
   healthState?: unknown;
+  lastInboundAt?: unknown;
+  lastTransportActivityAt?: unknown;
+  lastDispatchAt?: unknown;
+  lastDispatchType?: unknown;
+  lastMessageCreateAt?: unknown;
   application?: unknown;
   audit?: unknown;
 };
@@ -51,9 +56,18 @@ function readDiscordAccountStatus(value: ChannelAccountSnapshot): DiscordAccount
     running: value.running,
     connected: value.connected,
     healthState: value.healthState,
+    lastInboundAt: value.lastInboundAt,
+    lastTransportActivityAt: value.lastTransportActivityAt,
+    lastDispatchAt: value.lastDispatchAt,
+    lastDispatchType: value.lastDispatchType,
+    lastMessageCreateAt: value.lastMessageCreateAt,
     application: value.application,
     audit: value.audit,
   };
+}
+
+function asFiniteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function readDiscordApplicationSummary(value: unknown): DiscordApplicationSummary {
@@ -136,6 +150,7 @@ export function collectDiscordStatusIssues(
       healthState === "stale-socket" ||
       healthState === "stuck" ||
       healthState === "disconnected" ||
+      healthState === "app-inbound-stale" ||
       healthState === "not-running"
     ) {
       const runningLabel = running ? "running" : "not running";
@@ -153,6 +168,26 @@ export function collectDiscordStatusIssues(
         kind: "runtime",
         message: "Discord gateway transport is running but disconnected.",
         fix: "Check gateway logs for Discord websocket errors and wait for reconnect; restart the Discord channel or gateway if it does not recover.",
+      });
+    }
+
+    const lastInboundAt = asFiniteNumber(account.lastInboundAt);
+    const lastTransportActivityAt = asFiniteNumber(account.lastTransportActivityAt);
+    if (
+      running &&
+      account.connected === true &&
+      healthState !== "app-inbound-stale" &&
+      lastInboundAt !== undefined &&
+      lastTransportActivityAt !== undefined &&
+      lastTransportActivityAt - lastInboundAt > 10 * 60_000
+    ) {
+      issues.push({
+        channel: "discord",
+        accountId,
+        kind: "runtime",
+        message:
+          "Discord websocket transport is active, but no app-level inbound message event has been observed recently.",
+        fix: "Check whether MESSAGE_CREATE dispatches are reaching OpenClaw. If prompts are being sent and lastInboundAt stays stale, restart the Discord channel; the health monitor should classify this as app-inbound-stale once the watchdog threshold is reached.",
       });
     }
 

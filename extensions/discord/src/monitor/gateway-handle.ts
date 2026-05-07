@@ -3,6 +3,7 @@ import type { GatewayPlugin } from "../internal/gateway.js";
 
 export const DISCORD_GATEWAY_TRANSPORT_ACTIVITY_EVENT =
   "openclaw:discord-gateway-transport-activity";
+export const DISCORD_GATEWAY_DISPATCH_EVENT = "openclaw:discord-gateway-dispatch";
 
 export type DiscordGatewayHandle = Pick<GatewayPlugin, "disconnect"> & {
   emitter?: EventEmitter;

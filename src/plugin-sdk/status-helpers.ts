@@ -31,12 +31,16 @@ type RuntimeLifecycleSnapshot = {
     | null;
   lastEventAt?: number | null;
   lastTransportActivityAt?: number | null;
+  lastDispatchAt?: number | null;
+  lastDispatchType?: string | null;
+  lastMessageCreateAt?: number | null;
   healthState?: string | null;
   lastStartAt?: number | null;
   lastStopAt?: number | null;
   lastError?: string | null;
   lastInboundAt?: number | null;
   lastOutboundAt?: number | null;
+  appInboundWatchdogEnabled?: boolean | null;
 };
 
 type StatusSnapshotExtra = Record<string, unknown>;
@@ -313,7 +317,19 @@ export function buildRuntimeAccountStatusSnapshot<TExtra extends StatusSnapshotE
     ...(typeof runtime?.lastTransportActivityAt === "number"
       ? { lastTransportActivityAt: runtime.lastTransportActivityAt }
       : {}),
+    ...(typeof runtime?.lastDispatchAt === "number"
+      ? { lastDispatchAt: runtime.lastDispatchAt }
+      : {}),
+    ...(typeof runtime?.lastDispatchType === "string"
+      ? { lastDispatchType: runtime.lastDispatchType }
+      : {}),
+    ...(typeof runtime?.lastMessageCreateAt === "number"
+      ? { lastMessageCreateAt: runtime.lastMessageCreateAt }
+      : {}),
     ...(typeof runtime?.healthState === "string" ? { healthState: runtime.healthState } : {}),
+    ...(typeof runtime?.appInboundWatchdogEnabled === "boolean"
+      ? { appInboundWatchdogEnabled: runtime.appInboundWatchdogEnabled }
+      : {}),
     ...(extra ?? ({} as TExtra)),
   };
 }

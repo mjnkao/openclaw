@@ -4,6 +4,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi, type Mock } from "vite
 import type { GatewayPlugin } from "../internal/gateway.js";
 import type { WaitForDiscordGatewayStopParams } from "../monitor.gateway.js";
 import {
+  DISCORD_GATEWAY_DISPATCH_EVENT,
   DISCORD_GATEWAY_TRANSPORT_ACTIVITY_EVENT,
   type MutableDiscordGateway,
 } from "./gateway-handle.js";
@@ -314,6 +315,35 @@ describe("runDiscordGatewayLifecycle", () => {
         (patch) => patch.lastEventAt === undefined && patch.connected === undefined,
       ),
     ).toBe(true);
+
+    expect(resolveWait).toBeDefined();
+    resolveWait?.();
+    await expect(lifecyclePromise).resolves.toBeUndefined();
+  });
+
+  it("records gateway dispatch liveness separately from raw transport", async () => {
+    const { emitter, gateway } = createGatewayHarness();
+    gateway.isConnected = true;
+    let resolveWait: (() => void) | undefined;
+    waitForDiscordGatewayStopMock.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveWait = resolve;
+        }),
+    );
+    const { lifecycleParams, statusSink } = createLifecycleHarness({ gateway });
+
+    const lifecyclePromise = runDiscordGatewayLifecycle(lifecycleParams);
+    await vi.waitFor(() => expect(waitForDiscordGatewayStopMock).toHaveBeenCalledTimes(1));
+
+    const baselinePatchCount = statusSink.mock.calls.length;
+    emitter.emit(DISCORD_GATEWAY_DISPATCH_EVENT, { at: 222_000, type: "MESSAGE_CREATE" });
+
+    expect(statusSink.mock.calls.slice(baselinePatchCount).map((call) => call[0])).toContainEqual({
+      lastDispatchAt: 222_000,
+      lastDispatchType: "MESSAGE_CREATE",
+      lastMessageCreateAt: 222_000,
+    });
 
     expect(resolveWait).toBeDefined();
     resolveWait?.();

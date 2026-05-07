@@ -377,6 +377,10 @@ export class GatewayPlugin extends Plugin {
     if (!this.client || !payload.t) {
       return;
     }
+    this.emitter.emit("openclaw:discord-gateway-dispatch", {
+      at: Date.now(),
+      type: payload.t,
+    });
     if (payload.t === GatewayDispatchEvents.Ready) {
       const ready = payload.d as { session_id?: string; resume_gateway_url?: string };
       this.sessionId = ready.session_id ?? null;

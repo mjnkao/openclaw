@@ -8,6 +8,7 @@ import { attachDiscordGatewayLogging } from "../gateway-logging.js";
 import { getDiscordGatewayEmitter, waitForDiscordGatewayStop } from "../monitor.gateway.js";
 import type { DiscordVoiceManager } from "../voice/manager.js";
 import {
+  DISCORD_GATEWAY_DISPATCH_EVENT,
   DISCORD_GATEWAY_TRANSPORT_ACTIVITY_EVENT,
   type MutableDiscordGateway,
 } from "./gateway-handle.js";
@@ -185,6 +186,16 @@ function parseGatewayCloseCode(message: string): number | undefined {
 function resolveTransportActivityAt(event: unknown): number {
   const at = (event as { at?: unknown } | undefined)?.at;
   return typeof at === "number" && Number.isFinite(at) && at >= 0 ? at : Date.now();
+}
+
+function resolveGatewayDispatchEvent(event: unknown): { at: number; type: string } | null {
+  if (!event || typeof event !== "object") {
+    return null;
+  }
+  const record = event as { at?: unknown; type?: unknown };
+  const at = typeof record.at === "number" && Number.isFinite(record.at) ? record.at : Date.now();
+  const type = typeof record.type === "string" ? record.type : undefined;
+  return type ? { at, type } : null;
 }
 
 function createGatewayStatusObserver(params: {
@@ -464,6 +475,21 @@ export async function runDiscordGatewayLifecycle(params: {
     pushStatus(createTransportActivityStatusPatch(at));
   };
   gatewayEmitter?.on(DISCORD_GATEWAY_TRANSPORT_ACTIVITY_EVENT, onGatewayTransportActivity);
+  const onGatewayDispatch = (event: unknown) => {
+    if (lifecycleStopping || params.abortSignal?.aborted) {
+      return;
+    }
+    const dispatch = resolveGatewayDispatchEvent(event);
+    if (!dispatch) {
+      return;
+    }
+    pushStatus({
+      lastDispatchAt: dispatch.at,
+      lastDispatchType: dispatch.type,
+      ...(dispatch.type === "MESSAGE_CREATE" ? { lastMessageCreateAt: dispatch.at } : {}),
+    });
+  };
+  gatewayEmitter?.on(DISCORD_GATEWAY_DISPATCH_EVENT, onGatewayDispatch);
 
   let sawDisallowedIntents = false;
   const handleGatewayEvent = (event: DiscordGatewayEvent): "continue" | "stop" => {
@@ -553,6 +579,7 @@ export async function runDiscordGatewayLifecycle(params: {
       DISCORD_GATEWAY_TRANSPORT_ACTIVITY_EVENT,
       onGatewayTransportActivity,
     );
+    gatewayEmitter?.removeListener(DISCORD_GATEWAY_DISPATCH_EVENT, onGatewayDispatch);
     if (params.voiceManager) {
       await params.voiceManager.destroy();
       params.voiceManagerRef.current = null;

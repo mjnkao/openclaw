@@ -209,6 +209,9 @@ export type ChannelAccountSnapshot = {
   lastMessageAt?: number | null;
   lastEventAt?: number | null;
   lastTransportActivityAt?: number | null;
+  lastDispatchAt?: number | null;
+  lastDispatchType?: string | null;
+  lastMessageCreateAt?: number | null;
   lastError?: string | null;
   healthState?: string;
   lastStartAt?: number | null;
@@ -218,6 +221,7 @@ export type ChannelAccountSnapshot = {
   busy?: boolean;
   activeRuns?: number;
   lastRunActivityAt?: number | null;
+  appInboundWatchdogEnabled?: boolean;
   mode?: string;
   dmPolicy?: string;
   allowFrom?: string[];

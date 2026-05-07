@@ -10,10 +10,12 @@ type ChannelHealthSnapshot = {
   activeRuns?: number;
   lastRunActivityAt?: number | null;
   lastEventAt?: number | null;
+  lastInboundAt?: number | null;
   lastConnectedAt?: number | null;
   lastTransportActivityAt?: number | null;
   lastStartAt?: number | null;
   reconnectAttempts?: number;
+  appInboundWatchdogEnabled?: boolean;
   mode?: string;
 };
 
@@ -25,7 +27,8 @@ type ChannelHealthEvaluationReason =
   | "stuck"
   | "startup-connect-grace"
   | "disconnected"
-  | "stale-socket";
+  | "stale-socket"
+  | "app-inbound-stale";
 
 export type ChannelHealthEvaluation = {
   healthy: boolean;
@@ -39,7 +42,13 @@ export type ChannelHealthPolicy = {
   channelConnectGraceMs: number;
 };
 
-type ChannelRestartReason = "gave-up" | "stopped" | "stale-socket" | "stuck" | "disconnected";
+type ChannelRestartReason =
+  | "gave-up"
+  | "stopped"
+  | "stale-socket"
+  | "stuck"
+  | "disconnected"
+  | "app-inbound-stale";
 
 function isManagedAccount(snapshot: ChannelHealthSnapshot): boolean {
   return snapshot.enabled !== false && snapshot.configured !== false;
@@ -78,6 +87,10 @@ export function evaluateChannelHealth(
     typeof snapshot.lastTransportActivityAt === "number" &&
     Number.isFinite(snapshot.lastTransportActivityAt)
       ? snapshot.lastTransportActivityAt
+      : null;
+  const lastInboundAt =
+    typeof snapshot.lastInboundAt === "number" && Number.isFinite(snapshot.lastInboundAt)
+      ? snapshot.lastInboundAt
       : null;
   const busyStateInitializedForLifecycle =
     lastStartAt == null || (lastRunActivityAt != null && lastRunActivityAt >= lastStartAt);
@@ -124,6 +137,19 @@ export function evaluateChannelHealth(
       return { healthy: false, reason: "stale-socket" };
     }
   }
+  if (
+    snapshot.appInboundWatchdogEnabled === true &&
+    snapshot.connected === true &&
+    lastInboundAt != null &&
+    lastTransportActivityAt != null &&
+    (lastStartAt == null || lastInboundAt >= lastStartAt)
+  ) {
+    const inboundAge = policy.now - lastInboundAt;
+    const transportAge = policy.now - lastTransportActivityAt;
+    if (inboundAge > policy.staleEventThresholdMs && transportAge <= policy.staleEventThresholdMs) {
+      return { healthy: false, reason: "app-inbound-stale" };
+    }
+  }
   return { healthy: true, reason: "healthy" };
 }
 
@@ -133,6 +159,9 @@ export function resolveChannelRestartReason(
 ): ChannelRestartReason {
   if (evaluation.reason === "stale-socket") {
     return "stale-socket";
+  }
+  if (evaluation.reason === "app-inbound-stale") {
+    return "app-inbound-stale";
   }
   if (evaluation.reason === "not-running") {
     return snapshot.reconnectAttempts && snapshot.reconnectAttempts >= 10 ? "gave-up" : "stopped";

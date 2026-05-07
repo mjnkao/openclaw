@@ -461,6 +461,7 @@ export const discordPlugin: ChannelPlugin<ResolvedDiscordAccount, DiscordProbe> 
           lastConnectedAt: null,
           lastDisconnect: null,
           lastEventAt: null,
+          appInboundWatchdogEnabled: true,
         }),
         collectStatusIssues: collectDiscordStatusIssues,
         buildChannelSummary: ({ snapshot }) =>
@@ -618,6 +619,10 @@ export const discordPlugin: ChannelPlugin<ResolvedDiscordAccount, DiscordProbe> 
               lastConnectedAt: runtime?.lastConnectedAt ?? null,
               lastDisconnect: runtime?.lastDisconnect ?? null,
               lastEventAt: runtime?.lastEventAt ?? null,
+              lastDispatchAt: runtime?.lastDispatchAt ?? null,
+              lastDispatchType: runtime?.lastDispatchType ?? null,
+              lastMessageCreateAt: runtime?.lastMessageCreateAt ?? null,
+              appInboundWatchdogEnabled: true,
               application: app ?? undefined,
               bot: bot ?? undefined,
               audit,

@@ -89,4 +89,27 @@ describe("collectDiscordStatusIssues", () => {
       }),
     ]);
   });
+
+  it("reports stale app inbound when transport remains active", () => {
+    const issues = collectDiscordStatusIssues([
+      {
+        accountId: "ops",
+        enabled: true,
+        configured: true,
+        running: true,
+        connected: true,
+        lastInboundAt: 1_000,
+        lastTransportActivityAt: 15 * 60_000,
+      } as ChannelAccountSnapshot,
+    ]);
+
+    expect(issues).toEqual([
+      expect.objectContaining({
+        channel: "discord",
+        accountId: "ops",
+        kind: "runtime",
+        message: expect.stringContaining("websocket transport is active"),
+      }),
+    ]);
+  });
 });

@@ -215,6 +215,15 @@ export function projectSafeChannelAccountSnapshotFields(
     ...(readNumber(record, "lastTransportActivityAt") !== undefined
       ? { lastTransportActivityAt: readNumber(record, "lastTransportActivityAt") }
       : {}),
+    ...(readNullableNumber(record, "lastDispatchAt") !== undefined
+      ? { lastDispatchAt: readNullableNumber(record, "lastDispatchAt") }
+      : {}),
+    ...(normalizeOptionalString(record.lastDispatchType)
+      ? { lastDispatchType: normalizeOptionalString(record.lastDispatchType) }
+      : {}),
+    ...(readNullableNumber(record, "lastMessageCreateAt") !== undefined
+      ? { lastMessageCreateAt: readNullableNumber(record, "lastMessageCreateAt") }
+      : {}),
     ...(statusState ? { statusState } : {}),
     ...(healthState ? { healthState } : {}),
     ...(readBoolean(record, "busy") !== undefined ? { busy: readBoolean(record, "busy") } : {}),
@@ -223,6 +232,9 @@ export function projectSafeChannelAccountSnapshotFields(
       : {}),
     ...(readNullableNumber(record, "lastRunActivityAt") !== undefined
       ? { lastRunActivityAt: readNullableNumber(record, "lastRunActivityAt") }
+      : {}),
+    ...(readBoolean(record, "appInboundWatchdogEnabled") !== undefined
+      ? { appInboundWatchdogEnabled: readBoolean(record, "appInboundWatchdogEnabled") }
       : {}),
     ...(mode ? { mode } : {}),
     ...(dmPolicy ? { dmPolicy } : {}),
