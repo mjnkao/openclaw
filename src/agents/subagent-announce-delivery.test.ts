@@ -186,6 +186,7 @@ async function deliverSlackChannelAnnouncement(params: {
   sendMessage?: typeof runtimeSendMessage;
   internalEvents?: AgentInternalEvent[];
   sourceTool?: string;
+  runtimeConfig?: Record<string, unknown>;
 }) {
   const origin = {
     channel: "slack",
@@ -199,7 +200,7 @@ async function deliverSlackChannelAnnouncement(params: {
       sessionId: params.sessionId,
       isActive: params.isActive,
     }),
-    getRuntimeConfig: () => ({}) as never,
+    getRuntimeConfig: () => (params.runtimeConfig ?? {}) as never,
     ...(params.queueEmbeddedPiMessage
       ? { queueEmbeddedPiMessage: params.queueEmbeddedPiMessage }
       : {}),
@@ -1150,6 +1151,60 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
       }),
     );
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("reports subagent group completions that miss required message-tool delivery", async () => {
+    const callGateway = createGatewayMock({
+      result: {
+        payloads: [
+          {
+            text: "The child task is done.",
+          },
+        ],
+      },
+    });
+    const result = await deliverSlackChannelAnnouncement({
+      callGateway,
+      sessionId: "requester-session-channel",
+      isActive: false,
+      expectsCompletionMessage: true,
+      directIdempotencyKey: "announce-channel-subagent-message-tool",
+      runtimeConfig: { messages: { groupChat: { visibleReplies: "message_tool" } } },
+      internalEvents: [
+        {
+          type: "task_completion",
+          source: "subagent",
+          childSessionKey: "agent:worker:subagent:child",
+          childSessionId: "child-session-id",
+          announceType: "subagent task",
+          taskLabel: "channel completion smoke",
+          status: "ok",
+          statusLabel: "completed successfully",
+          result: "child completion output",
+          replyInstruction: "Summarize the result.",
+        },
+      ],
+    });
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        delivered: false,
+        path: "direct",
+        error: "completion agent did not deliver through the message tool",
+      }),
+    );
+    expect(callGateway).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "agent",
+        params: expect.objectContaining({
+          deliver: false,
+          channel: "slack",
+          accountId: "acct-1",
+          to: "channel:C123",
+          threadId: undefined,
+        }),
+      }),
+    );
   });
 
   it("reports generated media group completions that miss required message-tool delivery", async () => {

@@ -55,9 +55,8 @@ import { resolveRequesterStoreKey } from "./subagent-requester-store-key.js";
 import type { SpawnSubagentMode } from "./subagent-spawn.types.js";
 
 const DEFAULT_SUBAGENT_ANNOUNCE_TIMEOUT_MS = 120_000;
-const MAX_TIMER_SAFE_TIMEOUT_MS = 2_147_000_000;
 const AGENT_MEDIATED_COMPLETION_TOOLS = new Set(["music_generate", "video_generate"]);
-
+const MAX_TIMER_SAFE_TIMEOUT_MS = 2_147_000_000;
 type SubagentAnnounceDeliveryDeps = {
   callGateway: typeof callGateway;
   getRuntimeConfig: typeof getRuntimeConfig;
@@ -607,12 +606,15 @@ function completionRequiresMessageToolDelivery(params: {
   };
   directOrigin?: DeliveryContext;
   requesterSessionOrigin?: DeliveryContext;
+  requireExplicitMessageToolMode?: boolean;
 }): boolean {
   const chatType = inferCompletionChatType(params);
   if (chatType === "group" || chatType === "channel") {
     const configuredMode =
       params.cfg.messages?.groupChat?.visibleReplies ?? params.cfg.messages?.visibleReplies;
-    return configuredMode !== "automatic";
+    return params.requireExplicitMessageToolMode
+      ? configuredMode === "message_tool"
+      : configuredMode !== "automatic";
   }
   return params.cfg.messages?.visibleReplies === "message_tool";
 }
@@ -703,7 +705,7 @@ async function sendSubagentAnnounceDirectly(params: {
       sourceTool: params.sourceTool,
     });
     const requiresMessageToolDelivery =
-      agentMediatedCompletion &&
+      params.expectsCompletionMessage &&
       completionRequiresMessageToolDelivery({
         cfg,
         requesterSessionKey: params.requesterSessionKey,
@@ -711,6 +713,7 @@ async function sendSubagentAnnounceDirectly(params: {
         requesterEntry,
         directOrigin: effectiveDirectOrigin,
         requesterSessionOrigin,
+        requireExplicitMessageToolMode: !agentMediatedCompletion,
       });
     const shouldDeliverAgentFinal = deliveryTarget.deliver && !requiresMessageToolDelivery;
     const requesterActivity = resolveRequesterSessionActivity(canonicalRequesterSessionKey);
