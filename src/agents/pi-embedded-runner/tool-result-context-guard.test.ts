@@ -181,6 +181,36 @@ describe("installToolResultContextGuard", () => {
     expect(getToolResultText(contextForNextCall[0])).toBe("z".repeat(5_000));
   });
 
+  it("preserves tool-result replay identifiers and error state when compacting content", async () => {
+    const agent = makeGuardableAgent();
+    const contextForNextCall = [
+      castAgentMessage({
+        role: "toolResult",
+        toolCallId: "call_replay",
+        toolName: "aicos-x__aicos_get_document_index",
+        content: [{ type: "text", text: "x".repeat(5_000) }],
+        isError: true,
+        timestamp: Date.now(),
+      }),
+    ];
+
+    const transformed = (await applyGuardToContext(agent, contextForNextCall)) as AgentMessage[];
+    const compacted = transformed[0] as {
+      toolCallId?: unknown;
+      toolName?: unknown;
+      isError?: unknown;
+    };
+
+    expect(compacted.toolCallId).toBe("call_replay");
+    expect(compacted.toolName).toBe("aicos-x__aicos_get_document_index");
+    expect(compacted.isError).toBe(true);
+    expectPiStyleTruncation(getToolResultText(transformed[0]));
+  });
+
+  it.todo(
+    "contract: truncateToolResultToChars/replaceToolResultText should add args summary, digest, truncation reason, and expansion refs to compacted replay text",
+  );
+
   it("wraps an existing transformContext and guards the transformed output", async () => {
     const agent = makeGuardableAgent((messages) =>
       messages.map((msg) =>

@@ -130,6 +130,53 @@ describe("tool-policy-pipeline", () => {
     expect(warnings).toEqual([]);
   });
 
+  test("coding profile keeps AICOS bundled MCP on low-token tools and denies broad/protected tools", () => {
+    const profilePolicy = resolveToolProfilePolicy("coding");
+    const tools = [
+      { name: "exec" },
+      { name: "aicos-x__aicos_get_startup_bundle" },
+      { name: "aicos-x__aicos_get_document_index" },
+      { name: "aicos-x__aicos_write_project_note" },
+    ] as unknown as DummyTool[];
+
+    const filtered = applyToolPolicyPipeline({
+      tools: tools as any,
+      toolMeta: (tool: any) =>
+        String(tool.name).startsWith("aicos-x__") ? { pluginId: "bundle-mcp" } : undefined,
+      warn: () => {},
+      steps: buildDefaultToolPolicyPipelineSteps({
+        profile: "coding",
+        profilePolicy,
+        profileUnavailableCoreWarningAllowlist: profilePolicy?.allow,
+      }),
+    });
+
+    expect(filtered.map((tool) => (tool as unknown as DummyTool).name).toSorted()).toEqual([
+      "aicos-x__aicos_get_startup_bundle",
+      "exec",
+    ]);
+  });
+
+  test("full profile remains the explicit A2-capable AICOS bundled MCP escape hatch", () => {
+    const profilePolicy = resolveToolProfilePolicy("full");
+    const tools = [
+      { name: "aicos-x__aicos_get_source_ref" },
+      { name: "aicos-x__aicos_import_document" },
+    ] as unknown as DummyTool[];
+
+    const filtered = applyToolPolicyPipeline({
+      tools: tools as any,
+      toolMeta: () => ({ pluginId: "bundle-mcp" }),
+      warn: () => {},
+      steps: buildDefaultToolPolicyPipelineSteps({ profile: "full", profilePolicy }),
+    });
+
+    expect(filtered.map((tool) => (tool as unknown as DummyTool).name).toSorted()).toEqual([
+      "aicos-x__aicos_get_source_ref",
+      "aicos-x__aicos_import_document",
+    ]);
+  });
+
   test("dedupes identical unknown-allowlist warnings across repeated runs", () => {
     const warnings: string[] = [];
     const tools = [{ name: "exec" }] as unknown as DummyTool[];

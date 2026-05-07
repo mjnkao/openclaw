@@ -1,3 +1,4 @@
+import { resolveAicosMcpProfilePolicy } from "./aicos-tool-role-policy.js";
 import {
   CRON_TOOL_DISPLAY_SUMMARY,
   EXEC_TOOL_DISPLAY_SUMMARY,
@@ -373,9 +374,10 @@ export function resolveCoreToolProfilePolicy(profile?: string): ToolProfilePolic
   if (!resolved.allow && !resolved.deny) {
     return undefined;
   }
+  const deny = [...(resolved.deny ?? []), ...(resolveAicosMcpProfilePolicy(profile).deny ?? [])];
   return {
     allow: resolved.allow ? [...resolved.allow] : undefined,
-    deny: resolved.deny ? [...resolved.deny] : undefined,
+    deny: deny.length > 0 ? deny : undefined,
   };
 }
 
