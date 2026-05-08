@@ -51,6 +51,9 @@ type SubagentOutputSnapshot = {
   waitingForContinuation?: boolean;
 };
 
+const CHILD_COMPLETION_RESULT_CONTEXT_CHARS = 6_000;
+const CHILD_COMPLETION_RESULT_TAIL_CHARS = 1_500;
+
 type AgentWaitResult = {
   status?: string;
   startedAt?: number;
@@ -421,9 +424,23 @@ function formatChildResultData(resultText?: string | null): string {
   return (
     wrapPromptDataBlock({
       label: "Child result",
-      text: resultText?.trim() || "(no output)",
+      text: formatChildResultTextForParentContext(resultText?.trim()) || "(no output)",
     }) || "Child result: (no output)"
   );
+}
+
+function formatChildResultTextForParentContext(resultText?: string | null): string {
+  const text = resultText?.trim() ?? "";
+  if (text.length <= CHILD_COMPLETION_RESULT_CONTEXT_CHARS) {
+    return text;
+  }
+  const notice = `\n\n[truncated: child result exceeded ${CHILD_COMPLETION_RESULT_CONTEXT_CHARS} chars; showing head and tail]`;
+  const headChars = Math.max(
+    0,
+    CHILD_COMPLETION_RESULT_CONTEXT_CHARS - CHILD_COMPLETION_RESULT_TAIL_CHARS - notice.length,
+  );
+  const tailChars = Math.min(CHILD_COMPLETION_RESULT_TAIL_CHARS, text.length);
+  return `${text.slice(0, headChars)}${notice}\n\n${text.slice(-tailChars)}`;
 }
 
 export function buildChildCompletionFindings(

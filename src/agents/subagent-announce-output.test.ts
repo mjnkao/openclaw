@@ -157,4 +157,21 @@ describe("buildChildCompletionFindings", () => {
     expect(findings).toContain("1. visible task");
     expect(findings).not.toContain("2. visible task");
   });
+
+  it("caps child completion result text when rendering parent context", () => {
+    const longResult = `${"a".repeat(8_000)}TAIL-MARKER`;
+    const findings = buildChildCompletionFindings([
+      {
+        childSessionKey: "agent:main:subagent:verbose",
+        task: "verbose task",
+        createdAt: 1,
+        frozenResultText: longResult,
+        outcome: { status: "ok" },
+      },
+    ]);
+
+    expect(findings).toContain("TAIL-MARKER");
+    expect(findings).toContain("[truncated: child result exceeded 6000 chars");
+    expect(findings?.length ?? 0).toBeLessThan(longResult.length);
+  });
 });
