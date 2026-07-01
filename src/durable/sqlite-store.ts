@@ -1,11 +1,11 @@
 // SQLite-backed durable workflow store for the native control-plane prototype.
 import { randomUUID } from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
 import { runSqliteImmediateTransactionSync } from "../infra/sqlite-transaction.js";
 import { configureSqliteConnectionPragmas } from "../infra/sqlite-wal.js";
+import { ensureOpenClawStatePermissions } from "../state/openclaw-state-db.js";
 import { resolveDurableWorkflowSqlitePath } from "./config.js";
 import type {
   AppendDurableWorkflowEventInput,
@@ -593,8 +593,9 @@ export function openDurableWorkflowSqliteStore(options?: {
   path?: string;
   env?: NodeJS.ProcessEnv;
 }): DurableWorkflowStore {
+  const env = options?.env ?? process.env;
   const pathname = path.resolve(options?.path ?? resolveDurableWorkflowSqlitePath(options?.env));
-  fs.mkdirSync(path.dirname(pathname), { recursive: true, mode: 0o700 });
+  ensureOpenClawStatePermissions(pathname, env);
   const sqlite = requireNodeSqlite();
   const db = new sqlite.DatabaseSync(pathname);
   const walMaintenance = configureSqliteConnectionPragmas(db, {
@@ -606,6 +607,7 @@ export function openDurableWorkflowSqliteStore(options?: {
   });
   try {
     ensureDurableWorkflowSchema(db);
+    ensureOpenClawStatePermissions(pathname, env);
   } catch (err) {
     walMaintenance.close();
     if (db.isOpen) {

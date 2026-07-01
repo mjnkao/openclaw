@@ -91,8 +91,10 @@ describe("durable coordination projection", () => {
         open: 1,
       },
       controls: {
-        canCancel: true,
-        canResume: true,
+        canCancel: false,
+        canRetry: false,
+        canResume: false,
+        canSignal: false,
         canOpenTimeline: true,
       },
     });
