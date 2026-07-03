@@ -1720,7 +1720,7 @@ async function agentCommandInternal(
       }
       attemptLifecycleState.lifecycleEnded = true;
       const stopReason = runResult.meta.stopReason;
-      if (stopReason && stopReason !== "end_turn") {
+      if (stopReason && stopReason !== "end_turn" && stopReason !== "stop") {
         console.error(`[agent] run ${runId} ended with stopReason=${stopReason}`);
       }
       emitAgentEvent({

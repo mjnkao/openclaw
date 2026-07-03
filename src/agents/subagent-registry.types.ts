@@ -84,6 +84,15 @@ export type SubagentCompletionDeliveryState = {
     | "waiting_for_requester_turn";
 };
 
+export type SubagentProgressNoticeState = {
+  lastNoticedAt?: number;
+  lastAttemptedAt?: number;
+  noticeCount?: number;
+  lastIdempotencyKey?: string;
+  lastReason?: "wait_timeout";
+  lastError?: string | null;
+};
+
 export type SubagentRunRecord = {
   runId: string;
   childSessionKey: string;
@@ -122,6 +131,8 @@ export type SubagentRunRecord = {
   browserCleanupDispatchedAt?: number;
   /** Durable outbox marker for parent/external completion delivery. */
   delivery?: SubagentCompletionDeliveryState;
+  /** Durable progress/waiting notice marker for active child runs. */
+  progressNotice?: SubagentProgressNoticeState;
   attachmentsDir?: string;
   attachmentsRootDir?: string;
   retainAttachmentsOnKeep?: boolean;
