@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { closeSupersededAgentTurnContinuations } from "./agent-turn-continuations.js";
 import { isDurableRuntimesEnabled } from "./config.js";
 import { reconcileDurableFanIn, type DurableFanInPolicy } from "./fan-in.js";
 import {
@@ -105,6 +106,20 @@ function isTerminalRunStatus(status: DurableRuntimeRunStatus): boolean {
   return (
     status === "succeeded" || status === "failed" || status === "cancelled" || status === "lost"
   );
+}
+
+function isTerminalLinkStatus(status: DurableRuntimeLinkStatus): boolean {
+  return (
+    status === "succeeded" || status === "failed" || status === "cancelled" || status === "lost"
+  );
+}
+
+function isParentFanInComplete(params: {
+  store: DurableRuntimeStore;
+  parentRuntimeRunId: string;
+}): boolean {
+  const childLinks = params.store.listChildLinks(params.parentRuntimeRunId);
+  return childLinks.length > 0 && childLinks.every((link) => isTerminalLinkStatus(link.status));
 }
 
 function findRunByIdempotencyKey(params: {
@@ -455,7 +470,8 @@ export function recordDurableSubagentAnnounceDelivery(params: {
           params.delivered &&
           params.path === "direct" &&
           directRun?.status === "succeeded" &&
-          directRun.recoveryState === "terminal"
+          directRun.recoveryState === "terminal" &&
+          isParentFanInComplete({ store, parentRuntimeRunId: parent.runtimeRunId })
         ) {
           store.updateRun({
             runtimeRunId: parent.runtimeRunId,
@@ -483,6 +499,20 @@ export function recordDurableSubagentAnnounceDelivery(params: {
             correlationId: params.childSessionKey,
             payload,
           });
+          const parentSessionKey =
+            typeof parent.metadata?.sessionKey === "string" && parent.metadata.sessionKey.trim()
+              ? parent.metadata.sessionKey.trim()
+              : parent.sourceRef;
+          if (parentSessionKey) {
+            closeSupersededAgentTurnContinuations({
+              store,
+              sessionKey: parentSessionKey,
+              parentRuntimeRunId: parent.runtimeRunId,
+              excludeRuntimeRunId: directRun.runtimeRunId,
+              reason: "parent_terminal",
+              now,
+            });
+          }
           continue;
         }
         store.updateRun({

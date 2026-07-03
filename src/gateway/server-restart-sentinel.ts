@@ -12,6 +12,10 @@ import { dispatchAssembledChannelTurn } from "../channels/turn/kernel.js";
 import type { CliDeps } from "../cli/deps.types.js";
 import { resolveMainSessionKeyFromConfig } from "../config/sessions.js";
 import { parseSessionThreadInfo } from "../config/sessions/thread-info.js";
+import {
+  durableAgentTurnErrorPayload,
+  startDurableAgentTurnLifecycle,
+} from "../durable/agent-turn.js";
 import { formatErrorMessage, toErrorObject } from "../infra/errors.js";
 import { requestHeartbeat } from "../infra/heartbeat-wake.js";
 import { ackDelivery, enqueueDelivery, failDelivery } from "../infra/outbound/delivery-queue.js";
@@ -93,6 +97,17 @@ function enqueueRestartSentinelWake(
     ...(deliveryContext ? { deliveryContext } : {}),
   });
   requestHeartbeat({ source: "restart-sentinel", intent: "immediate", reason: "wake", sessionKey });
+}
+
+function buildInternalRestartContinuationRoute(params: {
+  sessionKey: string;
+  chatType?: ChatType;
+}): SessionDeliveryRoute {
+  return {
+    channel: INTERNAL_MESSAGE_CHANNEL,
+    to: params.sessionKey,
+    chatType: params.chatType ?? "direct",
+  };
 }
 
 async function waitForOutboundRetry(delayMs: number) {
@@ -264,95 +279,138 @@ async function deliverQueuedSessionDelivery(params: {
   }
 
   if (!params.entry.route) {
-    enqueueRestartSentinelWake(params.entry.message, canonicalKey, queuedDeliveryContext);
-    return;
+    log.info("restart continuation dispatching through internal session route", {
+      sessionKey: canonicalKey,
+      queueId: params.entry.id,
+    });
   }
 
-  const route = params.entry.route;
+  const route =
+    params.entry.route ??
+    buildInternalRestartContinuationRoute({
+      sessionKey: canonicalKey,
+      chatType: entry?.origin?.chatType,
+    });
   const messageId = resolveQueuedRestartContinuationMessageId(params.entry);
   const userMessage = params.entry.message.trim();
   const agentId = resolveSessionAgentId({
     sessionKey: canonicalKey,
     config: cfg,
   });
-  let dispatchError: unknown;
-  const ctxPayload = finalizeInboundContext(
-    {
-      // The per-message timestamp prefix is applied at the single LLM boundary
-      // (normalizeMessagesForLlmBoundary) from each message's own timestamp, so
-      // the current turn and historical turns carry identical bytes on the wire.
-      // See: https://github.com/openclaw/openclaw/issues/3658
-      Body: userMessage,
-      BodyForAgent: userMessage,
-      BodyForCommands: "",
-      RawBody: userMessage,
-      CommandBody: "",
-      SessionKey: canonicalKey,
-      AccountId: route.accountId,
-      MessageSid: messageId,
-      Timestamp: Date.now(),
-      InputProvenance: {
-        kind: "internal_system",
-        sourceChannel: route.channel,
-        sourceTool: "restart-sentinel",
-      },
-      Provider: INTERNAL_MESSAGE_CHANNEL,
-      Surface: INTERNAL_MESSAGE_CHANNEL,
-      ChatType: route.chatType,
-      CommandAuthorized: true,
-      GatewayClientScopes: ["operator.admin"],
-      ReplyToId: route.replyToId,
-      OriginatingChannel: route.channel,
-      OriginatingTo: route.to,
-      ExplicitDeliverRoute: false,
-      MessageThreadId: route.threadId,
-    },
-    {
-      forceBodyForCommands: true,
-      forceChatType: true,
-    },
-  );
-  await dispatchAssembledChannelTurn({
-    cfg,
-    channel: route.channel,
-    accountId: route.accountId,
+  const durableLifecycle = startDurableAgentTurnLifecycle({
+    runId: messageId,
+    message: userMessage,
     agentId,
-    routeSessionKey: canonicalKey,
-    storePath,
-    ctxPayload,
-    recordInboundSession,
-    dispatchReplyWithBufferedBlockDispatcher,
-    replyOptions: {
-      sourceReplyDeliveryMode: "message_tool_only",
-    },
-    delivery: {
-      preparePayload: (payload) => {
-        if (isRestartContinuationBusyPayload(payload)) {
-          throw new Error(RESTART_CONTINUATION_BUSY_RETRY_ERROR);
-        }
-        return payload;
-      },
-      durable: false,
-      // Restart continuations are internal lifecycle turns. Visible follow-up
-      // must go through the message tool; automatic final delivery stays off.
-      deliver: async () => ({ visibleReplySent: false }),
-      onError: (err, info) => {
-        dispatchError ??= err;
-        log.warn(`restart continuation dispatch failed during ${info.kind}: ${String(err)}`, {
-          sessionKey: canonicalKey,
-        });
-      },
-    },
-    record: {
-      onRecordError: (err) => {
-        log.warn(`restart continuation failed to record inbound session metadata: ${String(err)}`, {
-          sessionKey: canonicalKey,
-        });
-      },
-    },
+    sessionKey: canonicalKey,
+    channel: route.channel,
+    transport: "gateway",
+    deliver: false,
   });
-  if (dispatchError) {
-    throw toErrorObject(dispatchError, "Non-Error thrown");
+  durableLifecycle.markRunning({
+    source: "restart-sentinel",
+    queueId: params.entry.id,
+    routed: params.entry.route !== undefined,
+  });
+  let dispatchError: unknown;
+  try {
+    const ctxPayload = finalizeInboundContext(
+      {
+        // The per-message timestamp prefix is applied at the single LLM boundary
+        // (normalizeMessagesForLlmBoundary) from each message's own timestamp, so
+        // the current turn and historical turns carry identical bytes on the wire.
+        // See: https://github.com/openclaw/openclaw/issues/3658
+        Body: userMessage,
+        BodyForAgent: userMessage,
+        BodyForCommands: "",
+        RawBody: userMessage,
+        CommandBody: "",
+        SessionKey: canonicalKey,
+        AccountId: route.accountId,
+        MessageSid: messageId,
+        Timestamp: Date.now(),
+        InputProvenance: {
+          kind: "internal_system",
+          sourceChannel: route.channel,
+          sourceTool: "restart-sentinel",
+        },
+        Provider: INTERNAL_MESSAGE_CHANNEL,
+        Surface: INTERNAL_MESSAGE_CHANNEL,
+        ChatType: route.chatType,
+        CommandAuthorized: true,
+        GatewayClientScopes: ["operator.admin"],
+        ReplyToId: route.replyToId,
+        OriginatingChannel: route.channel,
+        OriginatingTo: route.to,
+        ExplicitDeliverRoute: false,
+        MessageThreadId: route.threadId,
+      },
+      {
+        forceBodyForCommands: true,
+        forceChatType: true,
+      },
+    );
+    await dispatchAssembledChannelTurn({
+      cfg,
+      channel: route.channel,
+      accountId: route.accountId,
+      agentId,
+      routeSessionKey: canonicalKey,
+      storePath,
+      ctxPayload,
+      recordInboundSession,
+      dispatchReplyWithBufferedBlockDispatcher,
+      replyOptions: {
+        sourceReplyDeliveryMode: "message_tool_only",
+      },
+      delivery: {
+        preparePayload: (payload) => {
+          if (isRestartContinuationBusyPayload(payload)) {
+            throw new Error(RESTART_CONTINUATION_BUSY_RETRY_ERROR);
+          }
+          return payload;
+        },
+        durable: false,
+        // Restart continuations are internal lifecycle turns. Visible follow-up
+        // must go through the message tool; automatic final delivery stays off.
+        deliver: async () => ({ visibleReplySent: false }),
+        onError: (err, info) => {
+          dispatchError ??= err;
+          log.warn(`restart continuation dispatch failed during ${info.kind}: ${String(err)}`, {
+            sessionKey: canonicalKey,
+          });
+        },
+      },
+      record: {
+        onRecordError: (err) => {
+          log.warn(
+            `restart continuation failed to record inbound session metadata: ${String(err)}`,
+            {
+              sessionKey: canonicalKey,
+            },
+          );
+        },
+      },
+    });
+    if (dispatchError) {
+      throw toErrorObject(dispatchError, "Non-Error thrown");
+    }
+    durableLifecycle.markTerminal({
+      status: "succeeded",
+      eventType: "agent.turn.succeeded",
+      payload: {
+        summary: "restart continuation completed",
+        routed: params.entry.route !== undefined,
+      },
+    });
+  } catch (err: unknown) {
+    durableLifecycle.markTerminal({
+      status: "failed",
+      eventType: "agent.turn.failed",
+      payload: durableAgentTurnErrorPayload(err),
+    });
+    throw err;
+  } finally {
+    durableLifecycle.close();
   }
 }
 
@@ -587,9 +645,8 @@ async function loadRestartSentinelStartupTask(params: {
     }
 
     await clearRestartSentinel();
-    const routedAgentTurnContinuation =
-      payload.continuation?.kind === "agentTurn" && continuationRoute !== undefined;
-    if (!routedAgentTurnContinuation) {
+    const agentTurnContinuation = payload.continuation?.kind === "agentTurn";
+    if (!agentTurnContinuation) {
       enqueueRestartSentinelWake(message, sessionKey, wakeDeliveryContext);
     }
 

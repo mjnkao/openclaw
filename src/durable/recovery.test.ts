@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { resolveDurableRuntimeSqlitePath } from "./config.js";
 import { DURABLE_INTAKE_ENVELOPE_SCHEMA } from "./intake-envelope.js";
 import {
+  reconcileDurableAgentTurnContinuationsOnGatewayStartup,
   reconcileDurableChatSendsOnGatewayStartup,
   reconcileDueDurableTimers,
   reconcileDurableAgentTurnsOnGatewayStartup,
@@ -111,6 +112,87 @@ describe("durable runtime recovery", () => {
           completedAt: 200,
         },
       ]);
+    } finally {
+      store.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("closes superseded child announce continuations on gateway startup", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-recovery-"));
+    const store = openDurableRuntimeSqliteStore({
+      path: path.join(dir, "openclaw.sqlite"),
+    });
+    try {
+      const parentSessionKey = "agent:bo:main";
+      const childRunId = "child-a-run";
+      const announceKey = `announce:v1:agent:bo-worker:subagent:child-a:${childRunId}`;
+      const parent = store.createRun({
+        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
+        idempotencyKey: "parent-run",
+        status: "succeeded",
+        recoveryState: "terminal",
+        sourceRef: parentSessionKey,
+        completedAt: 200,
+        metadata: { sessionKey: parentSessionKey },
+        now: 200,
+      });
+      store.createRun({
+        operationKind: DURABLE_SUBAGENT_RUN_OPERATION_KIND,
+        idempotencyKey: childRunId,
+        status: "succeeded",
+        recoveryState: "terminal",
+        sourceRef: "agent:bo-worker:subagent:child-a",
+        parentRuntimeRunId: parent.runtimeRunId,
+        parentStepId: "subagents",
+        completedAt: 190,
+        metadata: { childSessionKey: "agent:bo-worker:subagent:child-a" },
+        now: 190,
+      });
+      const staleContinuation = store.createRun({
+        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
+        idempotencyKey: announceKey,
+        status: "waiting_signal",
+        recoveryState: "waiting_signal",
+        sourceRef: parentSessionKey,
+        metadata: { sessionKey: parentSessionKey },
+        now: 180,
+      });
+      store.createStep({
+        runtimeRunId: staleContinuation.runtimeRunId,
+        stepId: "agent_invocation",
+        stepType: "agent",
+        status: "waiting",
+        recoveryState: "waiting_signal",
+        idempotencyKey: announceKey,
+        metadata: { sessionKey: parentSessionKey },
+        now: 180,
+      });
+
+      const result = reconcileDurableAgentTurnContinuationsOnGatewayStartup({
+        store,
+        processInstanceId: "process-1",
+        now: 300,
+      });
+
+      expect(result).toEqual({ scanned: 1, markedLost: 0, queuedRuns: 1 });
+      expect(store.getRun(staleContinuation.runtimeRunId)).toMatchObject({
+        status: "succeeded",
+        recoveryState: "terminal",
+        completedAt: 300,
+      });
+      expect(store.listSteps(staleContinuation.runtimeRunId)).toContainEqual(
+        expect.objectContaining({
+          stepId: "agent_invocation",
+          status: "succeeded",
+          recoveryState: "terminal",
+        }),
+      );
+      expect(store.getTimeline(staleContinuation.runtimeRunId)).toContainEqual(
+        expect.objectContaining({
+          eventType: "agent.turn.continuation_superseded",
+        }),
+      );
     } finally {
       store.close();
       fs.rmSync(dir, { recursive: true, force: true });
