@@ -194,6 +194,9 @@ function inferWaitingReason(params: {
   if (params.currentStep?.stepType === "fan_in" && params.currentStep.status === "waiting") {
     return "child";
   }
+  if (params.currentStep?.stepType === "result_mailbox") {
+    return "child";
+  }
   if (params.currentStep?.stepType === "signal" && params.currentStep.status === "waiting") {
     return "signal";
   }
