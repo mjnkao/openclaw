@@ -146,7 +146,10 @@ describe("durable coordination projection", () => {
           state: "lost",
           severity: "error",
           reportable: true,
-          retryable: true,
+          retryable: false,
+          recoveryReason: "unknown_after_restart",
+          retrySafety: "inspect_first",
+          requiredAction: "inspect_timeline_before_retry",
           reason: "gateway_startup_reconciliation",
           message: "Agent turn was marked lost during durable recovery.",
           nextAction: "inspect_timeline_then_retry_or_resume",
@@ -178,14 +181,17 @@ describe("durable coordination projection", () => {
         sessionKey: "agent:bo:direct",
       },
       controls: {
-        canRetry: true,
+        canRetry: false,
         canOpenTimeline: true,
       },
       recovery: {
         state: "lost",
         severity: "error",
         reportable: true,
-        retryable: true,
+        retryable: false,
+        recoveryReason: "unknown_after_restart",
+        retrySafety: "inspect_first",
+        requiredAction: "inspect_timeline_before_retry",
         reason: "gateway_startup_reconciliation",
         nextAction: "inspect_timeline_then_retry_or_resume",
         safeRecoveryActions: ["inspect_timeline", "retry_request"],
@@ -231,8 +237,12 @@ describe("durable coordination projection", () => {
           retryable: false,
           reason: "planned_gateway_restart",
           message: "Runtime run was interrupted by an approved gateway restart.",
-          nextAction: "inspect_timeline_then_resume_or_reconcile",
-          safeRecoveryActions: ["inspect_timeline", "resume_parent", "reconcile_side_effects"],
+          recoveryReason: "unknown_after_side_effect",
+          retrySafety: "unsafe_without_parent_decision",
+          requiredAction: "parent_reconcile_side_effect_boundary",
+          sideEffectBoundarySeen: true,
+          nextAction: "inspect_timeline_then_record_parent_decision",
+          safeRecoveryActions: ["inspect_timeline", "record_coordinator_decision"],
         },
       },
       createdAt: 100,
@@ -246,7 +256,7 @@ describe("durable coordination projection", () => {
       recoveryState: "unknown_after_side_effect",
       waitingReason: "unknown",
       controls: {
-        canRetry: true,
+        canRetry: false,
         canResume: true,
         canOpenTimeline: true,
       },
@@ -254,7 +264,80 @@ describe("durable coordination projection", () => {
         state: "unknown_after_side_effect",
         severity: "warning",
         retryable: false,
-        nextAction: "inspect_timeline_then_resume_or_reconcile",
+        retrySafety: "unsafe_without_parent_decision",
+        requiredAction: "parent_reconcile_side_effect_boundary",
+        nextAction: "inspect_timeline_then_record_parent_decision",
+      },
+    });
+  });
+
+  it("does not expose retry controls for legacy lost fallback records without diagnostics", () => {
+    const run: DurableRuntimeRun = {
+      runtimeRunId: "wfr_legacy_lost",
+      operationKind: "openclaw.agent.turn",
+      operationVersion: "1",
+      status: "lost",
+      recoveryState: "lost",
+      sourceType: "agent",
+      sourceRef: "agent:bo:legacy",
+      metadata: {
+        sessionKey: "agent:bo:legacy",
+      },
+      createdAt: 100,
+      updatedAt: 200,
+      completedAt: 200,
+    };
+
+    const projection = buildDurableCoordinationProjection({ run });
+
+    expect(projection).toMatchObject({
+      status: "lost",
+      recoveryState: "lost",
+      controls: {
+        canRetry: false,
+        canOpenTimeline: true,
+      },
+      recovery: {
+        state: "lost",
+        retryable: false,
+        retrySafety: "inspect_first",
+        requiredAction: "inspect_timeline_before_retry",
+      },
+    });
+  });
+
+  it("does not expose retry controls for unknown-after-side-effect fallback records", () => {
+    const run: DurableRuntimeRun = {
+      runtimeRunId: "wfr_legacy_unknown",
+      operationKind: "openclaw.agent.turn",
+      operationVersion: "1",
+      status: "unknown_after_side_effect",
+      recoveryState: "unknown_after_side_effect",
+      sourceType: "agent",
+      sourceRef: "agent:bo:legacy",
+      metadata: {
+        sessionKey: "agent:bo:legacy",
+      },
+      createdAt: 100,
+      updatedAt: 200,
+    };
+
+    const projection = buildDurableCoordinationProjection({ run });
+
+    expect(projection).toMatchObject({
+      status: "unknown_after_side_effect",
+      recoveryState: "unknown_after_side_effect",
+      waitingReason: "unknown",
+      controls: {
+        canRetry: false,
+        canResume: true,
+        canOpenTimeline: true,
+      },
+      recovery: {
+        state: "unknown_after_side_effect",
+        retryable: false,
+        retrySafety: "unsafe_without_parent_decision",
+        requiredAction: "parent_reconcile_side_effect_boundary",
       },
     });
   });

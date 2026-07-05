@@ -13,7 +13,13 @@ import {
   DURABLE_SUBAGENT_RUN_OPERATION_KIND,
 } from "./runtime-ids.js";
 import { openDurableRuntimeStore } from "./store-factory.js";
-import type { DurableRuntimeRun, DurableRuntimeStep, DurableRuntimeStore } from "./types.js";
+import type {
+  DurableRecoveryReason,
+  DurableRecoveryRetrySafety,
+  DurableRuntimeRun,
+  DurableRuntimeStep,
+  DurableRuntimeStore,
+} from "./types.js";
 
 const log = createSubsystemLogger("durable/recovery");
 
@@ -130,11 +136,38 @@ function lostNextAction(run: DurableRuntimeRun): string {
   return "inspect_timeline_then_apply_policy";
 }
 
+function lostRecoveryReason(run: DurableRuntimeRun, reason: string): DurableRecoveryReason {
+  if (run.operationKind === DURABLE_SUBAGENT_RUN_OPERATION_KIND) {
+    return reason === "stale_subagent_run_reconciliation"
+      ? "stale_waiting_child"
+      : "unknown_after_restart";
+  }
+  return reason.startsWith("stale_") ? "interrupted" : "unknown_after_restart";
+}
+
+function lostRetrySafety(run: DurableRuntimeRun): DurableRecoveryRetrySafety {
+  const input = lostInputRecoveryHint(run);
+  if (run.operationKind === DURABLE_SUBAGENT_RUN_OPERATION_KIND) {
+    return "unsafe_without_parent_decision";
+  }
+  if (input?.canReplay === true) {
+    return "safe_to_retry";
+  }
+  return "inspect_first";
+}
+
+function lostRequiredAction(run: DurableRuntimeRun): string {
+  if (run.operationKind === DURABLE_SUBAGENT_RUN_OPERATION_KIND) {
+    return "parent_reconcile_child_result";
+  }
+  return "inspect_timeline_before_retry";
+}
+
 function safeRecoveryActions(run: DurableRuntimeRun): string[] {
   const input = lostInputRecoveryHint(run);
   const actions = ["inspect_timeline"];
   if (run.operationKind === DURABLE_SUBAGENT_RUN_OPERATION_KIND) {
-    actions.push("retry_child", "continue_parent_by_policy");
+    actions.push("parent_reconcile_child_result", "record_coordinator_decision");
     return actions;
   }
   if (input?.canReplay) {
@@ -185,12 +218,16 @@ function buildLostRecoveryDiagnostic(params: {
 }): Record<string, unknown> {
   const subject = runtimeSubject(params.run);
   const input = lostInputRecoveryHint(params.run);
+  const retrySafety = lostRetrySafety(params.run);
   return {
     state: "lost",
     severity: "error",
     reportable: true,
-    retryable: true,
+    retryable: retrySafety === "safe_to_retry",
     reason: params.reason,
+    recoveryReason: lostRecoveryReason(params.run, params.reason),
+    retrySafety,
+    requiredAction: lostRequiredAction(params.run),
     message: `${subject} was marked lost during durable recovery; it did not reach a terminal result before the runner disappeared.`,
     nextAction: lostNextAction(params.run),
     processInstanceId: params.processInstanceId,
@@ -409,6 +446,7 @@ function markSubagentRunLost(params: {
       terminalOutcome: "lost",
       reason: params.reason,
       summary: "Subagent run was marked lost during durable recovery.",
+      recoveryDiagnostic,
       now: params.now,
     });
     if (!isDurableResultMailboxAcknowledged(mailbox)) {

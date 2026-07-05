@@ -229,3 +229,36 @@ machine should still run the full build before merge.
 
 - optional maintainer-machine `npm run build` or CI build confirmation, because
   the local full build was blocked by the root `tsdown` bundling phase.
+
+## 2026-07-06 Parent-Led Durable Recovery Safety Update
+
+Implementation status: P0/P0.5 safety slice completed on the durable runtime recovery branch.
+
+Completed:
+
+- Durable Core blocks legacy synthetic child/subagent auto-resume by default in `src/agents/subagent-orphan-recovery.ts` when durable runtime recovery is enabled.
+- Legacy compatibility remains available only with explicit opt-in: `OPENCLAW_LEGACY_SUBAGENT_AUTO_RESUME=1`.
+- Recovery state, runtime types, coordination projection, result mailbox, and restart interruption handling now include typed recovery reasons, retry safety metadata, `requiredAction`, `sideEffectBoundary`, and evidence refs.
+- Runtime recovery records observations and exposes parent/coordinator-visible inspection requirements instead of making unsafe retry/resume decisions by default.
+- Retry affordance invariant: expose `controls.canRetry=true` only when `recovery.retryable === true` and `recovery.retrySafety === "safe_to_retry"`. Legacy `lost`, unknown, `inspect_first`, and unsafe states require inspection or parent/coordinator decision first.
+
+Verification:
+
+```sh
+node scripts/run-vitest.mjs src/agents/subagent-orphan-recovery.test.ts src/durable/recovery.test.ts src/durable/restart-interruption.test.ts src/durable/coordination-projection.test.ts src/durable/subagent.test.ts src/durable/startup.test.ts
+node scripts/run-vitest.mjs src/durable/coordination-projection.test.ts src/durable/recovery.test.ts src/durable/restart-interruption.test.ts src/agents/subagent-orphan-recovery.test.ts
+npm run tsgo:core
+```
+
+Observed results:
+
+- Full targeted recovery shard: 51 tests passed.
+- Follow-up retry-affordance shard: 38 tests passed.
+- `npm run tsgo:core` passed.
+
+Remaining gaps for next phases:
+
+- Coordinator decision API/event before retry/resume/cancel/reconcile.
+- Inspect/reconcile tools for parent agents and operators.
+- Broader side-effect boundary coverage across message delivery, tool wrappers, external APIs, config mutation, and restart handoff.
+- End-to-end restart coverage for live parent/child interruption, parent wake, inspection, and explicit decision before retry/resume.

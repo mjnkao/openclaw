@@ -98,7 +98,11 @@ describe("durable gateway restart interruption", () => {
         metadata: {
           recoveryDiagnostic: expect.objectContaining({
             state: "unknown_after_side_effect",
-            nextAction: "inspect_timeline_then_resume_or_reconcile",
+            recoveryReason: "unknown_after_side_effect",
+            retrySafety: "unsafe_without_parent_decision",
+            requiredAction: "parent_reconcile_side_effect_boundary",
+            sideEffectBoundarySeen: true,
+            nextAction: "inspect_timeline_then_record_parent_decision",
           }),
         },
       });
@@ -111,11 +115,36 @@ describe("durable gateway restart interruption", () => {
           status: "lost",
           metadata: expect.objectContaining({
             terminalOutcome: "unknown_after_side_effect",
+            recoveryDiagnostic: expect.objectContaining({
+              retrySafety: "unsafe_without_parent_decision",
+            }),
           }),
         }),
       ]);
+      expect(verifyStore.listSteps(parent!.runtimeRunId)).toContainEqual(
+        expect.objectContaining({
+          stepType: "result_mailbox",
+          status: "queued",
+          recoveryState: "runnable",
+          metadata: expect.objectContaining({
+            kind: "child_result_mailbox",
+            childRuntimeRunId: child!.runtimeRunId,
+            outcome: expect.objectContaining({
+              terminalOutcome: "unknown_after_side_effect",
+              reason: "unknown_after_side_effect",
+              recoveryDiagnostic: expect.objectContaining({
+                requiredAction: "parent_reconcile_side_effect_boundary",
+              }),
+            }),
+          }),
+        }),
+      );
       expect(verifyStore.getTimeline(parent!.runtimeRunId).map((event) => event.eventType)).toEqual(
-        ["subagent.child.restart_interrupted", "fan_in.ready"],
+        [
+          "subagent.child.restart_interrupted",
+          "subagent.child.result_mailbox_queued",
+          "fan_in.ready",
+        ],
       );
     } finally {
       verifyStore.close();

@@ -31,6 +31,21 @@ export type DurableRecoveryState =
   | "lost"
   | "terminal";
 
+export type DurableRecoveryReason =
+  | "interrupted"
+  | "unknown_after_restart"
+  | "unknown_after_side_effect"
+  | "terminal_observed_not_delivered"
+  | "needs_parent_reconciliation"
+  | "stale_waiting_child"
+  | "delivery_failed";
+
+export type DurableRecoveryRetrySafety =
+  | "safe_to_retry"
+  | "inspect_first"
+  | "unsafe_without_parent_decision"
+  | "requires_human";
+
 export type DurableRuntimeStepType =
   | "agent"
   | "tool"

@@ -67,6 +67,7 @@ export function upsertDurableChildResultMailbox(params: {
   error?: string;
   summary?: string;
   reason?: string;
+  recoveryDiagnostic?: Record<string, unknown>;
   now?: number;
 }): DurableRuntimeStep {
   const now = params.now ?? Date.now();
@@ -95,6 +96,7 @@ export function upsertDurableChildResultMailbox(params: {
         error: params.error,
         summary: params.summary,
         reason: params.reason,
+        recoveryDiagnostic: params.recoveryDiagnostic,
       },
       ack: {
         status: "pending",
@@ -136,6 +138,7 @@ export function upsertDurableChildResultMailbox(params: {
           error: params.error,
           summary: params.summary,
           reason: params.reason,
+          recoveryDiagnostic: params.recoveryDiagnostic,
         },
         ack: isRecord(existingMetadata.ack) ? existingMetadata.ack : { status: "pending" },
         receivedAt: numberFrom(existingMetadata.receivedAt) ?? now,

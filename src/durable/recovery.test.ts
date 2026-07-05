@@ -280,8 +280,11 @@ describe("durable runtime recovery", () => {
           recoveryDiagnostic: expect.objectContaining({
             state: "lost",
             reportable: true,
-            retryable: true,
+            retryable: false,
             reason: "gateway_startup_reconciliation",
+            recoveryReason: "unknown_after_restart",
+            retrySafety: "inspect_first",
+            requiredAction: "inspect_timeline_before_retry",
             nextAction: "inspect_timeline_then_retry_or_resume",
             processInstanceId: "process-after-restart",
             input: {
@@ -311,6 +314,7 @@ describe("durable runtime recovery", () => {
             recoveryDiagnostic: expect.objectContaining({
               state: "lost",
               reason: "gateway_startup_reconciliation",
+              recoveryReason: "unknown_after_restart",
             }),
           },
         },
@@ -481,7 +485,10 @@ describe("durable runtime recovery", () => {
           recoveryDiagnostic: expect.objectContaining({
             state: "lost",
             reason: "gateway_startup_reconciliation",
+            recoveryReason: "unknown_after_restart",
             nextAction: "inspect_timeline_then_retry_child_or_continue_parent",
+            retrySafety: "unsafe_without_parent_decision",
+            requiredAction: "parent_reconcile_child_result",
           }),
         },
       });
@@ -539,6 +546,10 @@ describe("durable runtime recovery", () => {
               linkStatus: "lost",
               terminalOutcome: "lost",
               reason: "gateway_startup_reconciliation",
+              recoveryDiagnostic: expect.objectContaining({
+                recoveryReason: "unknown_after_restart",
+                retrySafety: "unsafe_without_parent_decision",
+              }),
             }),
             ack: expect.objectContaining({
               status: "pending",

@@ -130,11 +130,49 @@ describe("subagent-orphan-recovery", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.clearAllMocks();
+    vi.unstubAllEnvs();
+    vi.stubEnv("OPENCLAW_DURABLE_RUNTIME", "0");
+    vi.stubEnv("OPENCLAW_LEGACY_SUBAGENT_AUTO_RESUME", "");
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllEnvs();
     vi.restoreAllMocks();
+  });
+
+  it("does not synthesize child resume when Durable Core is enabled", async () => {
+    vi.stubEnv("OPENCLAW_DURABLE_RUNTIME", "1");
+    mockSingleAbortedSession();
+
+    const result = await recoverOrphanedSubagentSessions({
+      getActiveRuns: () => createActiveRuns(createTestRunRecord()),
+    });
+
+    expect(result).toEqual({
+      recovered: 0,
+      failed: 0,
+      skipped: 1,
+      failedRuns: [],
+    });
+    expect(sessions.loadSessionStore).not.toHaveBeenCalled();
+    expect(gateway.callGateway).not.toHaveBeenCalled();
+    expect(subagentRegistrySteerRuntime.replaceSubagentRunAfterSteer).not.toHaveBeenCalled();
+  });
+
+  it("allows legacy child auto-resume under Durable Core only with the compatibility flag", async () => {
+    vi.stubEnv("OPENCLAW_DURABLE_RUNTIME", "1");
+    vi.stubEnv("OPENCLAW_LEGACY_SUBAGENT_AUTO_RESUME", "1");
+    mockSingleAbortedSession();
+
+    const result = await recoverOrphanedSubagentSessions({
+      getActiveRuns: () => createActiveRuns(createTestRunRecord()),
+    });
+
+    expect(result.recovered).toBe(1);
+    expect(result.failed).toBe(0);
+    expect(gateway.callGateway).toHaveBeenCalledOnce();
+    expect(subagentRegistrySteerRuntime.replaceSubagentRunAfterSteer).toHaveBeenCalledOnce();
   });
 
   it("recovers orphaned sessions with abortedLastRun=true", async () => {

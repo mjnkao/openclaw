@@ -19,6 +19,7 @@ import {
   updateSessionStore,
   type SessionEntry,
 } from "../config/sessions.js";
+import { isDurableRuntimesEnabled } from "../durable/config.js";
 import { callGateway } from "../gateway/call.js";
 import { readSessionMessagesAsync } from "../gateway/session-transcript-readers.js";
 import { formatErrorMessage } from "../infra/errors.js";
@@ -39,6 +40,18 @@ const log = createSubsystemLogger("subagent-interrupted-resume");
 
 /** Delay before attempting recovery to let the gateway finish bootstrapping. */
 const DEFAULT_RECOVERY_DELAY_MS = 5_000;
+const LEGACY_DURABLE_SUBAGENT_AUTO_RESUME_FLAG = "OPENCLAW_LEGACY_SUBAGENT_AUTO_RESUME";
+
+function isTruthyEnvValue(value: string | undefined): boolean {
+  return ["1", "true", "yes", "on"].includes((value ?? "").trim().toLowerCase());
+}
+
+function shouldUseLegacySubagentAutoResume(env: NodeJS.ProcessEnv = process.env): boolean {
+  if (!isDurableRuntimesEnabled(env)) {
+    return true;
+  }
+  return isTruthyEnvValue(env[LEGACY_DURABLE_SUBAGENT_AUTO_RESUME_FLAG]);
+}
 
 function isLegacyRestartInterruptedTimeout(
   runRecord: SubagentRunRecord,
@@ -209,7 +222,18 @@ export async function recoverOrphanedSubagentSessions(params: {
     if (activeRuns.size === 0) {
       return result;
     }
-
+    if (!shouldUseLegacySubagentAutoResume()) {
+      log.warn(
+        "skipping legacy subagent auto-resume because Durable Core is enabled; parent-led durable reconciliation will surface interrupted children",
+      );
+      result.skipped = activeRuns.size;
+      return result;
+    }
+    if (isDurableRuntimesEnabled()) {
+      log.warn(
+        `${LEGACY_DURABLE_SUBAGENT_AUTO_RESUME_FLAG}=1 is deprecated; legacy subagent auto-resume can create child runs without a recorded parent coordinator decision`,
+      );
+    }
     const cfg = getRuntimeConfig();
     const storeCache = new Map<string, Record<string, SessionEntry>>();
 

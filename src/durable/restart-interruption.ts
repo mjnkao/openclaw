@@ -1,6 +1,10 @@
 // Durable restart interruption reconciliation for approved gateway restarts.
 import { isDurableRuntimesEnabled } from "./config.js";
 import { reconcileDurableFanIn, type DurableFanInPolicy } from "./fan-in.js";
+import {
+  isDurableResultMailboxAcknowledged,
+  upsertDurableChildResultMailbox,
+} from "./result-mailbox.js";
 import { DURABLE_SUBAGENT_RUN_OPERATION_KIND } from "./runtime-ids.js";
 import { openDurableRuntimeStore } from "./store-factory.js";
 import type {
@@ -64,11 +68,15 @@ function compactRestartMetadata(params: {
     severity: "warning",
     reportable: true,
     retryable: false,
+    recoveryReason: "unknown_after_side_effect",
+    retrySafety: "unsafe_without_parent_decision",
+    requiredAction: "parent_reconcile_side_effect_boundary",
+    sideEffectBoundarySeen: true,
     reason: params.reason ?? "planned_gateway_restart",
     message:
       "Runtime run was interrupted by an approved gateway restart; side effects may have completed and should be reconciled before retry.",
-    nextAction: "inspect_timeline_then_resume_or_reconcile",
-    safeRecoveryActions: ["inspect_timeline", "resume_parent", "reconcile_side_effects"],
+    nextAction: "inspect_timeline_then_record_parent_decision",
+    safeRecoveryActions: ["inspect_timeline", "record_coordinator_decision"],
     restartRuntimeRunId: params.restartRuntimeRunId,
     ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
     detectedAt: params.now,
@@ -168,6 +176,40 @@ function markParentLinksInterrupted(params: {
         recoveryDiagnostic: params.interruption,
       },
     });
+    const mailbox = upsertDurableChildResultMailbox({
+      store: params.store,
+      parentRuntimeRunId: link.parentRuntimeRunId,
+      parentStepId: link.parentStepId,
+      childRuntimeRunId: link.childRuntimeRunId,
+      childSessionKey:
+        typeof params.run.metadata?.childSessionKey === "string"
+          ? params.run.metadata.childSessionKey
+          : params.run.sourceRef,
+      agentInvocationId: params.run.idempotencyKey,
+      linkStatus: "lost",
+      terminalStatus: "unknown_after_side_effect",
+      terminalOutcome: "unknown_after_side_effect",
+      reason: "unknown_after_side_effect",
+      summary: "Subagent run was interrupted across a side-effect boundary.",
+      recoveryDiagnostic: params.interruption,
+      now: params.now,
+    });
+    if (!isDurableResultMailboxAcknowledged(mailbox)) {
+      params.store.appendEvent({
+        runtimeRunId: link.parentRuntimeRunId,
+        eventType: "subagent.child.result_mailbox_queued",
+        eventTime: params.now,
+        stepId: link.parentStepId,
+        agentInvocationId: params.run.idempotencyKey,
+        correlationId: params.run.sourceRef,
+        payload: {
+          childRuntimeRunId: params.run.runtimeRunId,
+          status: "unknown_after_side_effect",
+          reason: "unknown_after_side_effect",
+          recoveryDiagnostic: params.interruption,
+        },
+      });
+    }
     reconcileDurableFanIn({
       store: params.store,
       parentRuntimeRunId: link.parentRuntimeRunId,

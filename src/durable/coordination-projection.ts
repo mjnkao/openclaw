@@ -1,6 +1,8 @@
 // Builds stable coordination projections for task, TaskFlow, and Workboard surfaces.
 import type {
   DurableRecoveryState,
+  DurableRecoveryReason,
+  DurableRecoveryRetrySafety,
   DurableRuntimeLink,
   DurableRuntimeRef,
   DurableRuntimeRun,
@@ -64,6 +66,11 @@ export type DurableCoordinationRecoveryDiagnostic = {
   severity: "warning" | "error";
   reportable: boolean;
   retryable: boolean;
+  recoveryReason?: DurableRecoveryReason;
+  retrySafety?: DurableRecoveryRetrySafety;
+  requiredAction?: string;
+  sideEffectBoundarySeen?: boolean;
+  evidenceRefs?: string[];
   reason?: string;
   message: string;
   nextAction: string;
@@ -340,6 +347,19 @@ function extractRecoveryDiagnostic(
         severity: rawSeverity === "warning" ? "warning" : "error",
         reportable: firstBoolean(raw.reportable) ?? true,
         retryable: firstBoolean(raw.retryable) ?? state === "lost",
+        ...(firstString(raw.recoveryReason)
+          ? { recoveryReason: firstString(raw.recoveryReason) as DurableRecoveryReason }
+          : {}),
+        ...(firstString(raw.retrySafety)
+          ? { retrySafety: firstString(raw.retrySafety) as DurableRecoveryRetrySafety }
+          : {}),
+        ...(firstString(raw.requiredAction)
+          ? { requiredAction: firstString(raw.requiredAction) }
+          : {}),
+        ...(firstBoolean(raw.sideEffectBoundarySeen) !== undefined
+          ? { sideEffectBoundarySeen: firstBoolean(raw.sideEffectBoundarySeen) }
+          : {}),
+        ...(stringArray(raw.evidenceRefs) ? { evidenceRefs: stringArray(raw.evidenceRefs) } : {}),
         ...(firstString(raw.reason) ? { reason: firstString(raw.reason) } : {}),
         message:
           firstString(raw.message) ??
@@ -365,7 +385,10 @@ function extractRecoveryDiagnostic(
       state: "lost",
       severity: "error",
       reportable: true,
-      retryable: true,
+      retryable: false,
+      recoveryReason: "needs_parent_reconciliation",
+      retrySafety: "inspect_first",
+      requiredAction: "inspect_timeline_before_retry",
       message: "Runtime run was marked lost during durable recovery.",
       nextAction: "inspect_timeline_then_retry",
       ...(run.completedAt ? { detectedAt: run.completedAt } : {}),
@@ -377,6 +400,10 @@ function extractRecoveryDiagnostic(
       severity: "warning",
       reportable: true,
       retryable: false,
+      recoveryReason: "unknown_after_side_effect",
+      retrySafety: "unsafe_without_parent_decision",
+      requiredAction: "parent_reconcile_side_effect_boundary",
+      sideEffectBoundarySeen: true,
       message: "Runtime run may have completed side effects and needs operator reconciliation.",
       nextAction: "inspect_timeline_then_reconcile",
     };
@@ -393,6 +420,10 @@ export function buildDurableCoordinationProjection(
   const waitingReason = inferWaitingReason({ run: input.run, currentStep });
   const terminal = isTerminalRun(input.run.status);
   const recovery = extractRecoveryDiagnostic(input.run);
+  const canRetry =
+    recovery !== undefined
+      ? recovery.retryable === true && recovery.retrySafety === "safe_to_retry"
+      : terminal && input.run.status !== "lost" && input.run.recoveryState !== "lost";
   return {
     runtimeRunId: input.run.runtimeRunId,
     operationKind: input.run.operationKind,
@@ -415,7 +446,7 @@ export function buildDurableCoordinationProjection(
     children: childCounts(childLinks),
     controls: {
       canCancel: !terminal,
-      canRetry: terminal || input.run.recoveryState === "unknown_after_side_effect",
+      canRetry,
       canResume:
         !terminal &&
         (input.run.status === "waiting" ||
