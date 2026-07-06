@@ -56,6 +56,31 @@ describe("task status snapshot", () => {
     expect(snapshot.totalCount).toBe(0);
     expect(snapshot.focus).toBeUndefined();
   });
+
+  it("keeps terminal tasks with pending delivery visible beyond the recent window", () => {
+    const pendingDelivery = makeTask({
+      status: "succeeded",
+      deliveryStatus: "pending",
+      endedAt: NOW - 30 * 60_000,
+      lastEventAt: NOW - 30 * 60_000,
+      error: "GatewayDrainingError: Gateway is draining for restart",
+    });
+    const delivered = makeTask({
+      taskId: "task-delivered",
+      status: "succeeded",
+      deliveryStatus: "delivered",
+      endedAt: NOW - 30 * 60_000,
+      lastEventAt: NOW - 30 * 60_000,
+    });
+
+    const snapshot = buildTaskStatusSnapshot([pendingDelivery, delivered], { now: NOW });
+
+    expect(snapshot.activeCount).toBe(0);
+    expect(snapshot.pendingDeliveryCount).toBe(1);
+    expect(snapshot.totalCount).toBe(1);
+    expect(snapshot.focus?.taskId).toBe("task-1");
+    expect(formatTaskStatusDetail(snapshot.focus!)).toContain("Gateway is draining");
+  });
 });
 
 describe("task status formatting", () => {

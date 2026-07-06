@@ -22,6 +22,7 @@ import {
   resolveRequiredCompletionDeliveryFailureTerminalResult,
   resolveRequiredCompletionTerminalResult,
 } from "../tasks/task-completion-contract.js";
+import type { TaskDeliveryStatus } from "../tasks/task-registry.types.js";
 import { normalizeDeliveryContext } from "../utils/delivery-context.shared.js";
 import { retireSessionMcpRuntimeForSessionKey } from "./agent-bundle-mcp-tools.js";
 import {
@@ -43,6 +44,7 @@ import {
   type SubagentLifecycleEndedReason,
 } from "./subagent-lifecycle-events.js";
 import {
+  isRestartDrainingDeliveryError,
   resolveCleanupCompletionReason,
   resolveDeferredCleanupDecision,
 } from "./subagent-registry-cleanup.js";
@@ -294,7 +296,7 @@ export function createSubagentRegistryLifecycleController(params: {
   const safeSetSubagentTaskDeliveryStatus = (args: {
     runId: string;
     childSessionKey: string;
-    deliveryStatus: "delivered" | "failed";
+    deliveryStatus: TaskDeliveryStatus;
     deliveryError?: string;
   }) => {
     try {
@@ -303,7 +305,10 @@ export function createSubagentRegistryLifecycleController(params: {
         runtime: "subagent",
         sessionKey: args.childSessionKey,
         deliveryStatus: args.deliveryStatus,
-        error: args.deliveryStatus === "failed" ? args.deliveryError : undefined,
+        error:
+          args.deliveryStatus === "failed" || args.deliveryStatus === "pending"
+            ? args.deliveryError
+            : undefined,
       });
     } catch (err) {
       params.warn("failed to update subagent background task delivery state", {
@@ -1102,6 +1107,14 @@ export function createSubagentRegistryLifecycleController(params: {
           latestDeliveryError = formatAnnounceDeliveryError(delivery);
           if (ensureDeliveryState(entry).lastError !== latestDeliveryError) {
             ensureDeliveryState(entry).lastError = latestDeliveryError;
+            if (isRestartDrainingDeliveryError(latestDeliveryError)) {
+              safeSetSubagentTaskDeliveryStatus({
+                runId,
+                childSessionKey: entry.childSessionKey,
+                deliveryStatus: "pending",
+                deliveryError: latestDeliveryError,
+              });
+            }
             params.persist();
           }
         },

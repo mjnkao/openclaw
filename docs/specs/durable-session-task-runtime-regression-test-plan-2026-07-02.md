@@ -1026,3 +1026,52 @@ Architecture conclusion for this loop:
   first-class inspect/reconcile decision surface and historical-open-run
   retention/reconciliation policy so operators and parent agents can resolve old
   debt without unsafe hidden replay.
+
+## 2026-07-07 Regression Addendum: Gateway Startup Failed With Pending Child Delivery
+
+Observed local-A incident:
+
+- Parent Bơ delegated a Discord `/pair`/iOS pairing fix to a subagent.
+- The child/subagent task succeeded, but the parent completion announce hit
+  `GatewayDrainingError: Gateway is draining for restart; new tasks are not accepted`.
+- The gateway then entered a startup-failed state: launchd still had a process,
+  but port `37101` was not listening.
+- The child task stayed `succeeded` with `delivery=pending`, so the work was not
+  lost, but the parent/user-facing surface could still look silent.
+
+Root-cause coverage:
+
+- FC8: gateway/restart lifecycle interruption.
+- FC6/FC9: pending delivery/fan-in obligation not visible enough.
+- FC16: no-silence SLA diagnostic missing when gateway process is alive but not
+  serving.
+- FC0/FC12: configuration/lifecycle mismatch can make restart safety look like
+  an agent failure.
+
+Required regression proof:
+
+- A terminal task with `deliveryStatus=pending` must remain visible in
+  `session_status` even after the recent-terminal window expires.
+- A restart-draining child announce failure must keep delivery pending, must not
+  spend the retry budget, must not mark the task delivery failed, and must mirror
+  a pending-delivery diagnostic onto the detached task state.
+- The runtime must not auto-resume or re-run the agent work. It only preserves
+  enough durable facts for the parent/operator to decide whether to retry,
+  inspect, or repair the gateway.
+
+Automated tests added/updated:
+
+- `src/tasks/task-status.test.ts`: terminal pending-delivery tasks stay visible.
+- `src/agents/openclaw-tools.session-status.test.ts`: parent-visible
+  `session_status` shows `pending delivery` and the gateway-draining diagnostic.
+- `src/agents/subagent-registry-lifecycle.test.ts`: restart-draining announce
+  failures are pending-with-error, not failed, and retry budget is preserved.
+
+Live test to run after code changes:
+
+1. Start local A/E with Workboard and Work Module disabled.
+2. Run a delegation request where child completion is forced to collide with a
+   gateway restart or simulated gateway-draining rejection.
+3. Verify `session_status` on the parent reports the pending delivery diagnostic.
+4. Restore gateway readiness and verify the pending delivery can retry/settle
+   without duplicate child work.

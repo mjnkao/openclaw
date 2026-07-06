@@ -88,6 +88,13 @@ vi.mock("./subagent-announce.js", () => ({
 }));
 
 vi.mock("./subagent-registry-cleanup.js", () => ({
+  isRestartDrainingDeliveryError: (error?: string | null) =>
+    Boolean(
+      error &&
+      (error.includes("GatewayDrainingError") ||
+        error.includes("Gateway is draining for restart") ||
+        error.includes("gateway_draining")),
+    ),
   resolveCleanupCompletionReason: () => SUBAGENT_ENDED_REASON_COMPLETE,
   resolveDeferredCleanupDecision: cleanupMocks.resolveDeferredCleanupDecision,
 }));
@@ -701,6 +708,13 @@ describe("subagent registry lifecycle hardening", () => {
       expect.objectContaining({
         runId: entry.runId,
         deliveryStatus: "failed",
+      }),
+    );
+    expect(taskExecutorMocks.setDetachedTaskDeliveryStatusByRunId).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: entry.runId,
+        deliveryStatus: "pending",
+        error: expect.stringContaining("GatewayDrainingError"),
       }),
     );
     await vi.waitFor(() => expect(resumeSubagentRun).toHaveBeenCalledWith(entry.runId));

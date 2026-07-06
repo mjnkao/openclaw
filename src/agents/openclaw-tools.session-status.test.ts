@@ -1392,6 +1392,39 @@ describe("session_status tool", () => {
     expect(text).toContain("Indexing the latest threads");
   });
 
+  it("keeps terminal tasks with pending delivery visible in session_status output", async () => {
+    resetSessionStore({
+      "agent:main:main": {
+        sessionId: "sess-main",
+        updatedAt: Date.now(),
+      },
+    });
+    listTasksForRelatedSessionKeyForOwnerMock.mockReturnValue([
+      {
+        taskId: "task-pending-delivery",
+        runtime: "subagent",
+        requesterSessionKey: "agent:main:main",
+        task: "Report child completion",
+        status: "succeeded",
+        deliveryStatus: "pending",
+        notifyPolicy: "done_only",
+        createdAt: Date.now() - 40 * 60_000,
+        endedAt: Date.now() - 35 * 60_000,
+        lastEventAt: Date.now() - 35 * 60_000,
+        error: "GatewayDrainingError: Gateway is draining for restart; new tasks are not accepted",
+      },
+    ]);
+
+    const tool = createSessionStatusTool({ agentSessionKey: "agent:main:main" });
+    const result = await tool.execute("tc-pending-delivery", { sessionKey: "agent:main:main" });
+    const firstContent = result.content?.[0];
+    const text = (firstContent as { text: string } | undefined)?.text ?? "";
+
+    expect(text).toContain("📌 Tasks: 1 pending delivery");
+    expect(text).toContain("Report child completion");
+    expect(text).toContain("Gateway is draining");
+  });
+
   it("hides stale completed task rows from session_status output", async () => {
     resetSessionStore({
       "agent:main:main": {

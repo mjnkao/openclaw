@@ -9,6 +9,7 @@ import type { TaskRecord } from "./task-registry.types.js";
 
 const ACTIVE_TASK_STATUSES = new Set(["queued", "running"]);
 const FAILURE_TASK_STATUSES = new Set(["failed", "timed_out", "lost"]);
+const PENDING_DELIVERY_TASK_STATUSES = new Set(["pending", "session_queued", "parent_missing"]);
 /** Window for showing recently completed tasks in compact status output. */
 const TASK_STATUS_RECENT_WINDOW_MS = 5 * 60_000;
 const TASK_STATUS_TITLE_MAX_CHARS = 80;
@@ -16,6 +17,10 @@ export const TASK_STATUS_DETAIL_MAX_CHARS = 120;
 
 function isActiveTask(task: TaskRecord): boolean {
   return ACTIVE_TASK_STATUSES.has(task.status);
+}
+
+function hasPendingTerminalDelivery(task: TaskRecord): boolean {
+  return task.status === "succeeded" && PENDING_DELIVERY_TASK_STATUSES.has(task.deliveryStatus);
 }
 
 function isFailureTask(task: TaskRecord): boolean {
@@ -156,8 +161,10 @@ type TaskStatusSnapshot = {
   focus?: TaskRecord;
   visible: TaskRecord[];
   active: TaskRecord[];
+  pendingDelivery: TaskRecord[];
   recentTerminal: TaskRecord[];
   activeCount: number;
+  pendingDeliveryCount: number;
   totalCount: number;
   recentFailureCount: number;
 };
@@ -169,17 +176,30 @@ export function buildTaskStatusSnapshot(
   const now = opts?.now ?? Date.now();
   const visibleCandidates = tasks.filter((task) => !isExpiredTask(task, now));
   const active = visibleCandidates.filter(isActiveTask);
+  const pendingDelivery = visibleCandidates.filter(hasPendingTerminalDelivery);
   const recentTerminal = visibleCandidates.filter((task) => isRecentTerminalTask(task, now));
-  const visible = active.length > 0 ? [...active, ...recentTerminal] : recentTerminal;
+  const pendingDeliveryIds = new Set(pendingDelivery.map((task) => task.taskId));
+  const visible =
+    active.length > 0
+      ? [...active, ...recentTerminal]
+      : [
+          ...pendingDelivery,
+          ...recentTerminal.filter((task) => !pendingDeliveryIds.has(task.taskId)),
+        ];
   const focus =
-    active[0] ?? recentTerminal.find((task) => isFailureTask(task)) ?? recentTerminal[0];
+    active[0] ??
+    pendingDelivery[0] ??
+    recentTerminal.find((task) => isFailureTask(task)) ??
+    recentTerminal[0];
   return {
-    latest: active[0] ?? recentTerminal[0],
+    latest: active[0] ?? pendingDelivery[0] ?? recentTerminal[0],
     focus,
     visible,
     active,
+    pendingDelivery,
     recentTerminal,
     activeCount: active.length,
+    pendingDeliveryCount: pendingDelivery.length,
     totalCount: visible.length,
     recentFailureCount: recentTerminal.filter(isFailureTask).length,
   };
