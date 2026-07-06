@@ -1,11 +1,15 @@
 /**
  * Post-restart interrupted-run resume for subagent sessions.
  *
- * After a SIGUSR1 gateway reload aborts in-flight subagent LLM calls,
- * this module scans for interrupted sessions (those with `abortedLastRun: true`
- * that are still tracked as active in the subagent registry) and sends a
- * synthetic resume message to restart their work. Parent notification is handled
- * separately by completion delivery after the child reaches a terminal result.
+ * Legacy/compatibility recovery for interrupted subagent sessions.
+ *
+ * After a SIGUSR1 gateway reload aborts in-flight subagent LLM calls, this
+ * module can scan for interrupted sessions (those with `abortedLastRun: true`
+ * that are still tracked as active in the subagent registry) and send a
+ * synthetic resume message to restart their work. Under Durable Core this path
+ * is disabled by default; parent-led durable reconciliation is the default
+ * safety model, and synthetic child resume is available only through the
+ * explicit legacy compatibility flag.
  *
  * @see https://github.com/openclaw/openclaw/issues/47711
  */

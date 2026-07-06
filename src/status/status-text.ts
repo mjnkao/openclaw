@@ -312,10 +312,22 @@ function formatStatusUptimeDuration(ms: number): string {
   return formatDurationCompact(ms, { spaced: true }) ?? "0s";
 }
 
+function readSystemUptimeMs(): number | undefined {
+  try {
+    return Math.max(0, Math.round(os.uptime() * 1000));
+  } catch {
+    return undefined;
+  }
+}
+
 function buildStatusUptimeLine(): string {
   const gatewayUptimeMs = Math.max(0, Math.round(process.uptime() * 1000));
-  const systemUptimeMs = Math.max(0, Math.round(os.uptime() * 1000));
-  return `⏱️ Uptime: gateway ${formatStatusUptimeDuration(gatewayUptimeMs)} · system ${formatStatusUptimeDuration(systemUptimeMs)}`;
+  const systemUptimeMs = readSystemUptimeMs();
+  const systemPart =
+    systemUptimeMs === undefined
+      ? "system unavailable"
+      : `system ${formatStatusUptimeDuration(systemUptimeMs)}`;
+  return `⏱️ Uptime: gateway ${formatStatusUptimeDuration(gatewayUptimeMs)} · ${systemPart}`;
 }
 
 async function resolveRuntimePluginHealthLine(): Promise<string> {

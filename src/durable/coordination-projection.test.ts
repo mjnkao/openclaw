@@ -306,6 +306,49 @@ describe("durable coordination projection", () => {
     });
   });
 
+  it("does not treat legacy lost recovery diagnostics as retry-safe without retry safety metadata", () => {
+    const run: DurableRuntimeRun = {
+      runtimeRunId: "wfr_legacy_lost_raw_diagnostic",
+      operationKind: "openclaw.subagent.run",
+      operationVersion: "1",
+      status: "lost",
+      recoveryState: "lost",
+      sourceType: "subagent",
+      sourceRef: "agent:bo-engineer:subagent:missing-parent",
+      metadata: {
+        childSessionKey: "agent:bo-engineer:subagent:missing-parent",
+        recoveryDiagnostic: {
+          state: "lost",
+          severity: "error",
+          reportable: true,
+          retryable: true,
+          message: "Runtime run was marked lost during durable recovery.",
+        },
+      },
+      createdAt: 100,
+      updatedAt: 200,
+      completedAt: 200,
+    };
+
+    const projection = buildDurableCoordinationProjection({ run });
+
+    expect(projection).toMatchObject({
+      status: "lost",
+      recoveryState: "lost",
+      controls: {
+        canRetry: false,
+        canOpenTimeline: true,
+      },
+      recovery: {
+        state: "lost",
+        retryable: false,
+        recoveryReason: "needs_parent_reconciliation",
+        retrySafety: "inspect_first",
+        requiredAction: "inspect_timeline_before_retry",
+      },
+    });
+  });
+
   it("does not expose retry controls for unknown-after-side-effect fallback records", () => {
     const run: DurableRuntimeRun = {
       runtimeRunId: "wfr_legacy_unknown",

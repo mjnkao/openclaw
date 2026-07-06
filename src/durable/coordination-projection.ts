@@ -322,6 +322,16 @@ function extractRecoveryDiagnostic(
       rawState === "lost" || rawState === "unknown_after_side_effect" ? rawState : undefined;
     if (state) {
       const rawSeverity = firstString(raw.severity);
+      const retrySafety = firstString(raw.retrySafety) as DurableRecoveryRetrySafety | undefined;
+      const retryable = retrySafety === "safe_to_retry" && firstBoolean(raw.retryable) !== false;
+      const recoveryReason =
+        (firstString(raw.recoveryReason) as DurableRecoveryReason | undefined) ??
+        (state === "lost" ? "needs_parent_reconciliation" : "unknown_after_side_effect");
+      const requiredAction =
+        firstString(raw.requiredAction) ??
+        (state === "lost"
+          ? "inspect_timeline_before_retry"
+          : "parent_reconcile_side_effect_boundary");
       const input = isRecord(raw.input)
         ? {
             ...(firstString(raw.input.inputRef)
@@ -346,16 +356,11 @@ function extractRecoveryDiagnostic(
         state,
         severity: rawSeverity === "warning" ? "warning" : "error",
         reportable: firstBoolean(raw.reportable) ?? true,
-        retryable: firstBoolean(raw.retryable) ?? state === "lost",
-        ...(firstString(raw.recoveryReason)
-          ? { recoveryReason: firstString(raw.recoveryReason) as DurableRecoveryReason }
-          : {}),
-        ...(firstString(raw.retrySafety)
-          ? { retrySafety: firstString(raw.retrySafety) as DurableRecoveryRetrySafety }
-          : {}),
-        ...(firstString(raw.requiredAction)
-          ? { requiredAction: firstString(raw.requiredAction) }
-          : {}),
+        retryable,
+        recoveryReason,
+        retrySafety:
+          retrySafety ?? (state === "lost" ? "inspect_first" : "unsafe_without_parent_decision"),
+        requiredAction,
         ...(firstBoolean(raw.sideEffectBoundarySeen) !== undefined
           ? { sideEffectBoundarySeen: firstBoolean(raw.sideEffectBoundarySeen) }
           : {}),
