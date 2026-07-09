@@ -8631,13 +8631,13 @@ Do not edit it by hand; run `pnpm docs:map:gen`.
 - Route: /specs/durable-session-task-runtime-rfc
 - Headings:
   - H1: Durable Session and Task Runtime RFC
-  - H2: Problem
-  - H2: Proposed Core Model
-  - H2: Boundary With Existing Surfaces
+  - H2: Root Cause And Observed Issues
+  - H2: Durable Core Boundary
+  - H2: Proposed Core Components
+  - H2: Full 5-PR Stack
   - H2: First Review Slice
   - H2: Non-Goals
   - H2: Maintainer Decision Requested
-  - H2: Follow-Ups After The Core Slice
 
 ## start/bootstrapping.md
 
