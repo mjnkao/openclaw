@@ -8882,6 +8882,29 @@ Do not edit it by hand; run `pnpm docs:map:gen`.
   - H2: Implementation Order
   - H2: Acceptance Decision
 
+## specs/durable-core-upstream-pr-stack-plan.md
+
+- Route: /specs/durable-core-upstream-pr-stack-plan
+- Headings:
+  - H1: Durable Core Upstream PR Stack Plan
+  - H2: Decision
+  - H2: Audited Revisions
+  - H2: Why PR1 Stays
+  - H2: Why PR2 Must Be Superseded
+  - H3: Stale and oversized
+  - H3: Wrong compatibility boundary
+  - H3: Wrong ownership shape
+  - H2: Replacement Series
+  - H3: PR1/6: Residual owner-first architecture decision
+  - H3: PR2/6: Opt-in storage and execution evidence foundation
+  - H3: PR3/6: Execution authority, leases, and recovery classification
+  - H3: PR4/6: Attention outbox and canonical owner adapters
+  - H3: PR5/6: Agent, session, task, subagent, and restart front doors
+  - H3: PR6/6: Read-only operations surface and bounded owner controls
+  - H2: Independent Correctness PR
+  - H2: Submission Rules
+  - H2: Current Release Blockers
+
 ## specs/durable-runtime-agent-session-pr-proof-2026-07-01.md
 
 - Route: /specs/durable-runtime-agent-session-pr-proof-2026-07-01
