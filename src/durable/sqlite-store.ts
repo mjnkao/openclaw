@@ -1,24 +1,46 @@
 // SQLite-backed durable runtime store for the native control-plane prototype.
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import type { DatabaseSync, SQLInputValue } from "node:sqlite";
-import { requireNodeSqlite } from "../infra/node-sqlite.js";
+import type { DatabaseSync } from "node:sqlite";
+import {
+  executeSqliteQuerySync,
+  executeSqliteQueryTakeFirstSync,
+  getNodeSqliteKysely,
+} from "../infra/kysely-sync.js";
 import { runSqliteImmediateTransactionSync } from "../infra/sqlite-transaction.js";
-import { configureSqliteConnectionPragmas } from "../infra/sqlite-wal.js";
-import { ensureOpenClawStatePermissions } from "../state/openclaw-state-db.js";
+import type { DB as OpenClawStateKyselyDatabase } from "../state/openclaw-state-db.generated.js";
+import {
+  OPENCLAW_STATE_SCHEMA_VERSION,
+  acquireOpenClawStateDatabaseLease,
+  closeOpenClawStateDatabaseForPath,
+} from "../state/openclaw-state-db.js";
 import { resolveDurableRuntimeSqlitePath } from "./config.js";
 import type {
   AppendDurableRuntimeEventInput,
+  ClaimDeliveryAttemptEvidenceInput,
   ClaimDurableRuntimeRunInput,
   ClaimDurableRuntimeStepInput,
   CompactDurableRuntimeRunInput,
   CompactDurableRuntimeRunResult,
   CreateDurableRuntimeLinkInput,
+  CreateWakeObligationInput,
   CreateDurableRuntimeRefInput,
   CreateDurableRuntimeRunInput,
   CreateDurableRuntimeSignalInput,
   CreateDurableRuntimeStepInput,
   CreateDurableRuntimeTimerInput,
+  CreateUncertaintyFactInput,
+  DurableContinuationCleanupAudit,
+  DurableContinuationCleanupStatus,
+  DurableContinuationCleanupTargetKind,
+  DurableDedupeLedgerEntry,
+  DurableDedupeLedgerStatus,
+  DurableDedupeScope,
+  WakeObligation,
+  WakeObligationOwnerKind,
+  WakeObligationStatus,
+  WakeObligationTargetKind,
+  WakeObligationTargetResolutionStatus,
   DurableRuntimeLink,
   DurableRuntimeLinkStatus,
   DurableRuntimeLinkType,
@@ -37,8 +59,28 @@ import type {
   DurableRuntimeTimelineOptions,
   DurableRuntimeTimer,
   DurableRuntimeTimerStatus,
+  UncertaintyFact,
+  UncertaintyFactStatus,
+  DurableUnresolvedObligation,
+  WakeObligationControlDecision,
+  WakeObligationControlDecisionKind,
+  DeliveryAttemptEvidence,
+  DeliveryAttemptEvidenceStatus,
+  FinalizeDeliveryAttemptEvidenceInput,
+  WakeObligationInspection,
   UpdateDurableRuntimeRunInput,
   UpdateDurableRuntimeLinkInput,
+  RecordDurableContinuationCleanupInput,
+  RecordDurableDedupeLedgerInput,
+  RecordDeliveryAttemptEvidenceInput,
+  RenewDeliveryAttemptEvidenceClaimInput,
+  ResolveUncertaintyFactInput,
+  MarkWakeObligationDecisionRequiredInput,
+  SupersedeDeliveryAttemptEvidenceInput,
+  SupersedeWakeObligationInput,
+  WakeObligationControlInput,
+  UpdateWakeObligationInput,
+  UpdateDeliveryAttemptEvidenceInput,
   UpdateDurableRuntimeStepInput,
   UpdateDurableRuntimeTimerInput,
 } from "./types.js";
@@ -162,17 +204,137 @@ type DurableRuntimeSignalRow = {
   metadata_json: string | null;
 };
 
-type CountRow = { count: number | bigint };
-type DurableSchemaMigrationRow = {
-  schema_name: string;
-  version: number | bigint;
-  applied_at: number | bigint;
+type WakeObligationRow = {
+  wake_id: string;
+  parent_run_id: string | null;
+  parent_session_key: string | null;
+  target_agent: string | null;
+  target_session: string | null;
+  target_channel: string | null;
+  target_kind: WakeObligationTargetKind | null;
+  target_ref: string | null;
+  owner_kind: WakeObligationOwnerKind | null;
+  owner_ref: string | null;
+  report_route_ref: string | null;
+  target_resolution_status: WakeObligationTargetResolutionStatus | null;
+  target_resolution_reason: string | null;
+  reason: WakeObligation["reason"];
+  facts_ref: string | null;
+  source_run_id: string | null;
+  dedupe_key: string;
+  attempt_count: number | bigint;
+  last_attempt_at: number | bigint | null;
+  acked_at: number | bigint | null;
+  failed_reason: string | null;
+  status: WakeObligationStatus;
+  created_at: number | bigint;
+  updated_at: number | bigint;
   metadata_json: string | null;
 };
 
-const DURABLE_RUNTIME_SQLITE_BUSY_TIMEOUT_MS = 30_000;
-export const DURABLE_RUNTIME_SQLITE_SCHEMA_VERSION = 1;
-const DURABLE_RUNTIME_SQLITE_SCHEMA_NAME = "durable_runtime";
+type UncertaintyFactRow = {
+  fact_id: string;
+  kind: UncertaintyFact["kind"];
+  source_run_id: string | null;
+  step_id: string | null;
+  event_id: string | null;
+  ref_id: string | null;
+  facts_ref: string | null;
+  dedupe_key: string | null;
+  facts_json: string | null;
+  status: UncertaintyFactStatus;
+  resolution_kind: string | null;
+  resolution_ref: string | null;
+  resolved_at: number | bigint | null;
+  created_at: number | bigint;
+  updated_at: number | bigint;
+  metadata_json: string | null;
+};
+
+type DurableContinuationCleanupAuditRow = {
+  cleanup_id: string;
+  target_kind: DurableContinuationCleanupTargetKind;
+  target_id: string;
+  runtime_run_id: string | null;
+  step_id: string | null;
+  superseded_by_ref: string | null;
+  reason: string | null;
+  requested_by: string | null;
+  dedupe_key: string;
+  status: DurableContinuationCleanupStatus;
+  created_at: number | bigint;
+  metadata_json: string | null;
+};
+
+type DurableDedupeLedgerEntryRow = {
+  ledger_id: string;
+  scope: DurableDedupeScope;
+  dedupe_key: string;
+  subject_ref: string | null;
+  operation_kind: string | null;
+  status: DurableDedupeLedgerStatus;
+  first_seen_at: number | bigint;
+  last_seen_at: number | bigint;
+  hit_count: number | bigint;
+  metadata_json: string | null;
+};
+
+type DeliveryAttemptEvidenceRow = {
+  delivery_attempt_id: string;
+  wake_id: string;
+  dedupe_key: string;
+  replay_pass_id: string | null;
+  target_kind: WakeObligationTargetKind | null;
+  target_ref: string | null;
+  route_kind: WakeObligationTargetKind | null;
+  route_ref: string | null;
+  status: DeliveryAttemptEvidenceStatus;
+  evidence_json: string | null;
+  error_message: string | null;
+  scheduled_at: number | bigint;
+  attempted_at: number | bigint | null;
+  delivered_at: number | bigint | null;
+  failed_at: number | bigint | null;
+  unknown_at: number | bigint | null;
+  delivery_claimed_by: string | null;
+  delivery_claim_expires_at: number | bigint | null;
+  created_at: number | bigint;
+  updated_at: number | bigint;
+  metadata_json: string | null;
+};
+
+type DurableUnresolvedObligationRow = {
+  obligation_id: string;
+  kind: DurableUnresolvedObligation["kind"];
+  runtime_run_id: string | null;
+  step_id: string | null;
+  wake_id: string | null;
+  uncertainty_fact_id: string | null;
+  subject_ref: string | null;
+  reason: string | null;
+  status: string;
+  created_at: number | bigint;
+  updated_at: number | bigint;
+  metadata_json: string | null;
+};
+
+type CountRow = { count: number | bigint };
+type DurableRuntimeDatabase = Pick<
+  OpenClawStateKyselyDatabase,
+  | "durable_runtime_continuation_cleanup"
+  | "durable_runtime_dedupe_ledger"
+  | "durable_runtime_events"
+  | "durable_runtime_links"
+  | "durable_runtime_wake_obligations"
+  | "durable_runtime_refs"
+  | "durable_runtime_runs"
+  | "durable_runtime_signals"
+  | "durable_runtime_steps"
+  | "durable_runtime_timers"
+  | "durable_runtime_uncertainty_facts"
+  | "durable_runtime_delivery_attempt_evidence"
+>;
+type SyncQuery<Row> = Parameters<typeof executeSqliteQuerySync<Row>>[1];
 
 function optionalText(value: string | undefined): string | null {
   return value && value.trim() ? value : null;
@@ -196,7 +358,73 @@ function parseJsonRecord(value: string | null): Record<string, unknown> | undefi
   }
 }
 
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseMetadata(value: string | null): Record<string, unknown> {
+  return parseJsonRecord(value) ?? {};
+}
+
+function buildWakeControlDecision(
+  input: WakeObligationControlInput,
+  kind: WakeObligationControlDecisionKind,
+  now: number,
+): WakeObligationControlDecision {
+  const actorRef = optionalText(input.actorRef);
+  if (!actorRef) {
+    throw new Error("Durable wake control requires actorRef");
+  }
+  return {
+    kind,
+    actorKind: input.actorKind,
+    actorRef,
+    ...(input.reason ? { reason: input.reason } : {}),
+    ...(input.decisionRef ? { decisionRef: input.decisionRef } : {}),
+    ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+    ...(input.evidence ? { evidence: input.evidence } : {}),
+    ...(input.metadata ? { metadata: input.metadata } : {}),
+    decidedAt: now,
+  };
+}
+
+function mergeWakeControlMetadata(
+  currentMetadataJson: string | null,
+  decision: WakeObligationControlDecision,
+  extras?: Record<string, unknown>,
+): Record<string, unknown> {
+  const metadata = parseMetadata(currentMetadataJson);
+  const existingControls = Array.isArray(metadata.durableWakeControls)
+    ? metadata.durableWakeControls
+    : [];
+  return {
+    ...metadata,
+    durableWakeControl: decision,
+    durableWakeControls: [...existingControls, decision],
+    ...extras,
+  };
+}
+
+function latestWakeControl(metadataJson: string | null): Record<string, unknown> | undefined {
+  const metadata = parseJsonRecord(metadataJson);
+  const control = metadata?.durableWakeControl;
+  return isRecordValue(control) ? control : undefined;
+}
+
+function isMatchingControlNoop(
+  current: WakeObligationRow,
+  kind: WakeObligationControlDecisionKind,
+  idempotencyKey: string | undefined,
+): boolean {
+  const control = latestWakeControl(current.metadata_json);
+  if (!control || control.kind !== kind) {
+    return false;
+  }
+  return idempotencyKey ? control.idempotencyKey === idempotencyKey : true;
+}
+
 function rowToRun(row: DurableRuntimeRunRow): DurableRuntimeRun {
+  const metadata = parseMetadata(row.metadata_json);
   return {
     runtimeRunId: row.runtime_run_id,
     operationKind: row.operation_kind,
@@ -205,8 +433,9 @@ function rowToRun(row: DurableRuntimeRunRow): DurableRuntimeRun {
     recoveryState: row.recovery_state,
     ...(row.idempotency_key ? { idempotencyKey: row.idempotency_key } : {}),
     ...(row.request_hash ? { requestHash: row.request_hash } : {}),
-    ...(row.source_type ? { sourceType: row.source_type } : {}),
+    ...(row.source_type ? { sourceType: row.source_type, sourceOwner: row.source_type } : {}),
     ...(row.source_ref ? { sourceRef: row.source_ref } : {}),
+    ...(metadata.rootOperationReason ? { rootOperationReason: String(metadata.rootOperationReason) } : {}),
     ...(row.input_ref ? { inputRef: row.input_ref } : {}),
     ...(row.checkpoint_ref ? { checkpointRef: row.checkpoint_ref } : {}),
     ...(row.parent_runtime_run_id ? { parentRuntimeRunId: row.parent_runtime_run_id } : {}),
@@ -216,12 +445,12 @@ function rowToRun(row: DurableRuntimeRunRow): DurableRuntimeRun {
     ...(row.work_unit_id ? { workUnitId: row.work_unit_id } : {}),
     ...(row.report_route_id ? { reportRouteId: row.report_route_id } : {}),
     ...(row.claimed_by ? { claimedBy: row.claimed_by } : {}),
-    ...(row.claim_expires_at == null ? {} : { claimExpiresAt: Number(row.claim_expires_at) }),
-    ...(row.heartbeat_at == null ? {} : { heartbeatAt: Number(row.heartbeat_at) }),
-    ...(row.metadata_json ? { metadata: parseJsonRecord(row.metadata_json) } : {}),
-    createdAt: Number(row.created_at),
-    updatedAt: Number(row.updated_at),
-    ...(row.completed_at == null ? {} : { completedAt: Number(row.completed_at) }),
+    ...(row.claim_expires_at == null ? {} : { claimExpiresAt: row.claim_expires_at }),
+    ...(row.heartbeat_at == null ? {} : { heartbeatAt: row.heartbeat_at }),
+    ...(row.metadata_json ? { metadata } : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    ...(row.completed_at == null ? {} : { completedAt: row.completed_at }),
   };
 }
 
@@ -229,9 +458,9 @@ function rowToEvent(row: DurableRuntimeEventRow): DurableRuntimeEvent {
   return {
     eventId: row.event_id,
     runtimeRunId: row.runtime_run_id,
-    eventSeq: Number(row.event_seq),
+    eventSeq: row.event_seq,
     eventType: row.event_type,
-    eventTime: Number(row.event_time),
+    eventTime: row.event_time,
     ...(row.step_id ? { stepId: row.step_id } : {}),
     ...(row.agent_invocation_id ? { agentInvocationId: row.agent_invocation_id } : {}),
     ...(row.tool_invocation_id ? { toolInvocationId: row.tool_invocation_id } : {}),
@@ -241,7 +470,7 @@ function rowToEvent(row: DurableRuntimeEventRow): DurableRuntimeEvent {
     ...(row.checkpoint_ref ? { checkpointRef: row.checkpoint_ref } : {}),
     ...(row.causation_event_id ? { causationEventId: row.causation_event_id } : {}),
     ...(row.correlation_id ? { correlationId: row.correlation_id } : {}),
-    recordedAt: Number(row.recorded_at),
+    recordedAt: row.recorded_at,
   };
 }
 
@@ -253,21 +482,21 @@ function rowToStep(row: DurableRuntimeStepRow): DurableRuntimeStep {
     stepType: row.step_type,
     status: row.status,
     recoveryState: row.recovery_state,
-    attempt: Number(row.attempt),
-    ...(row.max_attempts == null ? {} : { maxAttempts: Number(row.max_attempts) }),
+    attempt: row.attempt,
+    ...(row.max_attempts == null ? {} : { maxAttempts: row.max_attempts }),
     ...(row.idempotency_key ? { idempotencyKey: row.idempotency_key } : {}),
     ...(row.input_ref ? { inputRef: row.input_ref } : {}),
     ...(row.output_ref ? { outputRef: row.output_ref } : {}),
     ...(row.error_ref ? { errorRef: row.error_ref } : {}),
     ...(row.checkpoint_ref ? { checkpointRef: row.checkpoint_ref } : {}),
     ...(row.claimed_by ? { claimedBy: row.claimed_by } : {}),
-    ...(row.claim_expires_at == null ? {} : { claimExpiresAt: Number(row.claim_expires_at) }),
-    ...(row.heartbeat_at == null ? {} : { heartbeatAt: Number(row.heartbeat_at) }),
+    ...(row.claim_expires_at == null ? {} : { claimExpiresAt: row.claim_expires_at }),
+    ...(row.heartbeat_at == null ? {} : { heartbeatAt: row.heartbeat_at }),
     ...(row.metadata_json ? { metadata: parseJsonRecord(row.metadata_json) } : {}),
-    createdAt: Number(row.created_at),
-    ...(row.started_at == null ? {} : { startedAt: Number(row.started_at) }),
-    updatedAt: Number(row.updated_at),
-    ...(row.completed_at == null ? {} : { completedAt: Number(row.completed_at) }),
+    createdAt: row.created_at,
+    ...(row.started_at == null ? {} : { startedAt: row.started_at }),
+    updatedAt: row.updated_at,
+    ...(row.completed_at == null ? {} : { completedAt: row.completed_at }),
   };
 }
 
@@ -282,7 +511,7 @@ function rowToRef(row: DurableRuntimeRefRow): DurableRuntimeRef {
     storageKind: row.storage_kind,
     ...(row.storage_uri ? { storageUri: row.storage_uri } : {}),
     ...(row.metadata_json ? { metadata: parseJsonRecord(row.metadata_json) } : {}),
-    createdAt: Number(row.created_at),
+    createdAt: row.created_at,
   };
 }
 
@@ -294,8 +523,8 @@ function rowToLink(row: DurableRuntimeLinkRow): DurableRuntimeLink {
     linkType: row.link_type,
     status: row.status,
     ...(row.metadata_json ? { metadata: parseJsonRecord(row.metadata_json) } : {}),
-    createdAt: Number(row.created_at),
-    updatedAt: Number(row.updated_at),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }
 
@@ -305,12 +534,12 @@ function rowToTimer(row: DurableRuntimeTimerRow): DurableRuntimeTimer {
     runtimeRunId: row.runtime_run_id,
     ...(row.step_id ? { stepId: row.step_id } : {}),
     timerType: row.timer_type,
-    dueAt: Number(row.due_at),
+    dueAt: row.due_at,
     status: row.status,
     ...(row.metadata_json ? { metadata: parseJsonRecord(row.metadata_json) } : {}),
-    createdAt: Number(row.created_at),
-    ...(row.fired_at == null ? {} : { firedAt: Number(row.fired_at) }),
-    ...(row.cancelled_at == null ? {} : { cancelledAt: Number(row.cancelled_at) }),
+    createdAt: row.created_at,
+    ...(row.fired_at == null ? {} : { firedAt: row.fired_at }),
+    ...(row.cancelled_at == null ? {} : { cancelledAt: row.cancelled_at }),
   };
 }
 
@@ -324,321 +553,164 @@ function rowToSignal(row: DurableRuntimeSignalRow): DurableRuntimeSignal {
     ...(row.payload_ref ? { payloadRef: row.payload_ref } : {}),
     ...(row.correlation_id ? { correlationId: row.correlation_id } : {}),
     ...(row.metadata_json ? { metadata: parseJsonRecord(row.metadata_json) } : {}),
-    receivedAt: Number(row.received_at),
-    ...(row.consumed_at == null ? {} : { consumedAt: Number(row.consumed_at) }),
+    receivedAt: row.received_at,
+    ...(row.consumed_at == null ? {} : { consumedAt: row.consumed_at }),
   };
 }
 
-function ensureColumn(db: DatabaseSync, tableName: string, columnDefinition: string): void {
-  try {
-    db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnDefinition}`);
-  } catch (err) {
-    if (!String(err).includes("duplicate column name")) {
-      throw err;
-    }
-  }
+function rowToWakeObligation(row: WakeObligationRow): WakeObligation {
+  return {
+    wakeId: row.wake_id,
+    ...(row.parent_run_id ? { parentRunId: row.parent_run_id } : {}),
+    ...(row.parent_session_key ? { parentSessionKey: row.parent_session_key } : {}),
+    ...(row.target_agent ? { targetAgent: row.target_agent } : {}),
+    ...(row.target_session ? { targetSession: row.target_session } : {}),
+    ...(row.target_channel ? { targetChannel: row.target_channel } : {}),
+    ...(row.target_kind ? { targetKind: row.target_kind } : {}),
+    ...(row.target_ref ? { targetRef: row.target_ref } : {}),
+    ...(row.owner_kind ? { ownerKind: row.owner_kind } : {}),
+    ...(row.owner_ref ? { ownerRef: row.owner_ref } : {}),
+    ...(row.report_route_ref ? { reportRouteRef: row.report_route_ref } : {}),
+    ...(row.target_resolution_status
+      ? { targetResolutionStatus: row.target_resolution_status }
+      : {}),
+    ...(row.target_resolution_reason
+      ? { targetResolutionReason: row.target_resolution_reason }
+      : {}),
+    reason: row.reason,
+    ...(row.facts_ref ? { factsRef: row.facts_ref } : {}),
+    ...(row.source_run_id ? { sourceRunId: row.source_run_id } : {}),
+    dedupeKey: row.dedupe_key,
+    attemptCount: Number(row.attempt_count),
+    ...(row.last_attempt_at == null ? {} : { lastAttemptAt: Number(row.last_attempt_at) }),
+    ...(row.acked_at == null ? {} : { ackedAt: Number(row.acked_at) }),
+    ...(row.failed_reason ? { failedReason: row.failed_reason } : {}),
+    status: row.status,
+    ...(row.metadata_json ? { metadata: parseJsonRecord(row.metadata_json) } : {}),
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+  };
 }
 
-function tableExists(db: DatabaseSync, tableName: string): boolean {
-  const row = db
-    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
-    .get(tableName) as { name?: string } | undefined;
-  return row?.name === tableName;
+function rowToUncertaintyFact(
+  row: UncertaintyFactRow,
+): UncertaintyFact {
+  return {
+    factId: row.fact_id,
+    kind: row.kind,
+    ...(row.source_run_id ? { sourceRunId: row.source_run_id } : {}),
+    ...(row.step_id ? { stepId: row.step_id } : {}),
+    ...(row.event_id ? { eventId: row.event_id } : {}),
+    ...(row.ref_id ? { refId: row.ref_id } : {}),
+    ...(row.facts_ref ? { factsRef: row.facts_ref } : {}),
+    ...(row.dedupe_key ? { dedupeKey: row.dedupe_key } : {}),
+    ...(row.facts_json ? { facts: parseJsonRecord(row.facts_json) } : {}),
+    status: row.status,
+    ...(row.resolution_kind ? { resolutionKind: row.resolution_kind } : {}),
+    ...(row.resolution_ref ? { resolutionRef: row.resolution_ref } : {}),
+    ...(row.resolved_at == null ? {} : { resolvedAt: Number(row.resolved_at) }),
+    ...(row.metadata_json ? { metadata: parseJsonRecord(row.metadata_json) } : {}),
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+  };
 }
 
-function ensureDurableSchemaMigrationTable(db: DatabaseSync): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS durable_schema_migrations (
-      schema_name TEXT NOT NULL PRIMARY KEY,
-      version INTEGER NOT NULL,
-      applied_at INTEGER NOT NULL,
-      metadata_json TEXT
-    );
-  `);
+function rowToContinuationCleanupAudit(
+  row: DurableContinuationCleanupAuditRow,
+): DurableContinuationCleanupAudit {
+  return {
+    cleanupId: row.cleanup_id,
+    targetKind: row.target_kind,
+    targetId: row.target_id,
+    ...(row.runtime_run_id ? { runtimeRunId: row.runtime_run_id } : {}),
+    ...(row.step_id ? { stepId: row.step_id } : {}),
+    ...(row.superseded_by_ref ? { supersededByRef: row.superseded_by_ref } : {}),
+    ...(row.reason ? { reason: row.reason } : {}),
+    ...(row.requested_by ? { requestedBy: row.requested_by } : {}),
+    dedupeKey: row.dedupe_key,
+    status: row.status,
+    ...(row.metadata_json ? { metadata: parseJsonRecord(row.metadata_json) } : {}),
+    createdAt: Number(row.created_at),
+  };
 }
 
-function ensureDurableRuntimeCompatibilityColumns(db: DatabaseSync): void {
-  if (tableExists(db, "durable_runtime_runs")) {
-    for (const column of [
-      "parent_runtime_run_id TEXT",
-      "parent_step_id TEXT",
-      "message_id TEXT",
-      "turn_id TEXT",
-      "work_unit_id TEXT",
-      "report_route_id TEXT",
-      "claimed_by TEXT",
-      "claim_expires_at INTEGER",
-      "heartbeat_at INTEGER",
-    ]) {
-      ensureColumn(db, "durable_runtime_runs", column);
-    }
-  }
-  if (tableExists(db, "durable_runtime_steps")) {
-    for (const column of ["claimed_by TEXT", "claim_expires_at INTEGER", "heartbeat_at INTEGER"]) {
-      ensureColumn(db, "durable_runtime_steps", column);
-    }
-  }
+function rowToDedupeLedgerEntry(row: DurableDedupeLedgerEntryRow): DurableDedupeLedgerEntry {
+  return {
+    ledgerId: row.ledger_id,
+    scope: row.scope,
+    dedupeKey: row.dedupe_key,
+    ...(row.subject_ref ? { subjectRef: row.subject_ref } : {}),
+    ...(row.operation_kind ? { operationKind: row.operation_kind } : {}),
+    status: row.status,
+    firstSeenAt: Number(row.first_seen_at),
+    lastSeenAt: Number(row.last_seen_at),
+    hitCount: Number(row.hit_count),
+    ...(row.metadata_json ? { metadata: parseJsonRecord(row.metadata_json) } : {}),
+  };
 }
 
-function ensureDurableRuntimeSchema(db: DatabaseSync): void {
-  ensureDurableSchemaMigrationTable(db);
-  assertDurableRuntimeSchemaVersionSupported(db);
-  ensureDurableRuntimeCompatibilityColumns(db);
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS durable_runtime_runs (
-      runtime_run_id TEXT NOT NULL PRIMARY KEY,
-      operation_kind TEXT NOT NULL,
-      operation_version TEXT NOT NULL DEFAULT '1',
-      idempotency_key TEXT,
-      request_hash TEXT,
-      status TEXT NOT NULL,
-      source_type TEXT,
-      source_ref TEXT,
-      input_ref TEXT,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      completed_at INTEGER,
-      recovery_state TEXT NOT NULL DEFAULT 'runnable',
-      checkpoint_ref TEXT,
-      parent_runtime_run_id TEXT,
-      parent_step_id TEXT,
-      message_id TEXT,
-      turn_id TEXT,
-      work_unit_id TEXT,
-      report_route_id TEXT,
-      claimed_by TEXT,
-      claim_expires_at INTEGER,
-      heartbeat_at INTEGER,
-      metadata_json TEXT
-    );
-
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_runtime_runs_idempotency
-      ON durable_runtime_runs(operation_kind, idempotency_key)
-      WHERE idempotency_key IS NOT NULL;
-
-    CREATE INDEX IF NOT EXISTS idx_durable_runtime_runs_status
-      ON durable_runtime_runs(status, updated_at, runtime_run_id);
-
-    CREATE INDEX IF NOT EXISTS idx_durable_runtime_runs_work_unit
-      ON durable_runtime_runs(work_unit_id, updated_at, runtime_run_id)
-      WHERE work_unit_id IS NOT NULL;
-
-    CREATE INDEX IF NOT EXISTS idx_durable_runtime_runs_report_route
-      ON durable_runtime_runs(report_route_id, updated_at, runtime_run_id)
-      WHERE report_route_id IS NOT NULL;
-
-    CREATE TABLE IF NOT EXISTS durable_runtime_events (
-      event_id TEXT NOT NULL UNIQUE,
-      runtime_run_id TEXT NOT NULL,
-      event_seq INTEGER NOT NULL,
-      event_type TEXT NOT NULL,
-      event_time INTEGER NOT NULL,
-      step_id TEXT,
-      agent_invocation_id TEXT,
-      tool_invocation_id TEXT,
-      idempotency_key TEXT,
-      payload_json TEXT,
-      payload_hash TEXT,
-      checkpoint_ref TEXT,
-      causation_event_id TEXT,
-      correlation_id TEXT,
-      recorded_at INTEGER NOT NULL,
-      PRIMARY KEY (runtime_run_id, event_seq),
-      FOREIGN KEY (runtime_run_id) REFERENCES durable_runtime_runs(runtime_run_id)
-        ON DELETE CASCADE
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_durable_runtime_events_type
-      ON durable_runtime_events(event_type, event_time, runtime_run_id);
-
-    CREATE TABLE IF NOT EXISTS durable_runtime_steps (
-      runtime_run_id TEXT NOT NULL,
-      step_id TEXT NOT NULL,
-      parent_step_id TEXT,
-      step_type TEXT NOT NULL,
-      status TEXT NOT NULL,
-      recovery_state TEXT NOT NULL,
-      attempt INTEGER NOT NULL DEFAULT 1,
-      max_attempts INTEGER,
-      idempotency_key TEXT,
-      input_ref TEXT,
-      output_ref TEXT,
-      error_ref TEXT,
-      checkpoint_ref TEXT,
-      claimed_by TEXT,
-      claim_expires_at INTEGER,
-      heartbeat_at INTEGER,
-      created_at INTEGER NOT NULL,
-      started_at INTEGER,
-      updated_at INTEGER NOT NULL,
-      completed_at INTEGER,
-      metadata_json TEXT,
-      PRIMARY KEY (runtime_run_id, step_id),
-      FOREIGN KEY (runtime_run_id) REFERENCES durable_runtime_runs(runtime_run_id)
-        ON DELETE CASCADE
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_durable_runtime_steps_status
-      ON durable_runtime_steps(status, updated_at, runtime_run_id, step_id);
-
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_runtime_steps_idempotency
-      ON durable_runtime_steps(runtime_run_id, idempotency_key)
-      WHERE idempotency_key IS NOT NULL;
-
-    CREATE TABLE IF NOT EXISTS durable_runtime_refs (
-      ref_id TEXT NOT NULL PRIMARY KEY,
-      runtime_run_id TEXT NOT NULL,
-      step_id TEXT,
-      ref_kind TEXT NOT NULL,
-      media_type TEXT,
-      hash TEXT,
-      storage_kind TEXT NOT NULL,
-      storage_uri TEXT,
-      created_at INTEGER NOT NULL,
-      metadata_json TEXT,
-      FOREIGN KEY (runtime_run_id) REFERENCES durable_runtime_runs(runtime_run_id)
-        ON DELETE CASCADE
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_durable_runtime_refs_run
-      ON durable_runtime_refs(runtime_run_id, ref_kind, created_at);
-
-    CREATE TABLE IF NOT EXISTS durable_runtime_links (
-      parent_runtime_run_id TEXT NOT NULL,
-      parent_step_id TEXT NOT NULL,
-      child_runtime_run_id TEXT NOT NULL,
-      link_type TEXT NOT NULL,
-      status TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      metadata_json TEXT,
-      PRIMARY KEY (parent_runtime_run_id, parent_step_id, child_runtime_run_id),
-      FOREIGN KEY (parent_runtime_run_id) REFERENCES durable_runtime_runs(runtime_run_id)
-        ON DELETE CASCADE,
-      FOREIGN KEY (child_runtime_run_id) REFERENCES durable_runtime_runs(runtime_run_id)
-        ON DELETE CASCADE
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_durable_runtime_links_child
-      ON durable_runtime_links(child_runtime_run_id, status);
-
-    CREATE TABLE IF NOT EXISTS durable_runtime_timers (
-      timer_id TEXT NOT NULL PRIMARY KEY,
-      runtime_run_id TEXT NOT NULL,
-      step_id TEXT,
-      timer_type TEXT NOT NULL,
-      due_at INTEGER NOT NULL,
-      status TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      fired_at INTEGER,
-      cancelled_at INTEGER,
-      metadata_json TEXT,
-      FOREIGN KEY (runtime_run_id) REFERENCES durable_runtime_runs(runtime_run_id)
-        ON DELETE CASCADE
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_durable_runtime_timers_due
-      ON durable_runtime_timers(status, due_at, timer_id);
-
-    CREATE TABLE IF NOT EXISTS durable_runtime_signals (
-      signal_id TEXT NOT NULL PRIMARY KEY,
-      runtime_run_id TEXT NOT NULL,
-      step_id TEXT,
-      signal_type TEXT NOT NULL,
-      idempotency_key TEXT,
-      payload_ref TEXT,
-      correlation_id TEXT,
-      received_at INTEGER NOT NULL,
-      consumed_at INTEGER,
-      metadata_json TEXT,
-      FOREIGN KEY (runtime_run_id) REFERENCES durable_runtime_runs(runtime_run_id)
-        ON DELETE CASCADE
-    );
-
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_runtime_signals_idempotency
-      ON durable_runtime_signals(runtime_run_id, idempotency_key)
-      WHERE idempotency_key IS NOT NULL;
-
-    CREATE INDEX IF NOT EXISTS idx_durable_runtime_signals_pending
-      ON durable_runtime_signals(consumed_at, received_at, signal_id);
-  `);
-  for (const column of [
-    "parent_runtime_run_id TEXT",
-    "parent_step_id TEXT",
-    "message_id TEXT",
-    "turn_id TEXT",
-    "work_unit_id TEXT",
-    "report_route_id TEXT",
-    "claimed_by TEXT",
-    "claim_expires_at INTEGER",
-    "heartbeat_at INTEGER",
-  ]) {
-    ensureColumn(db, "durable_runtime_runs", column);
-  }
-  for (const column of ["claimed_by TEXT", "claim_expires_at INTEGER", "heartbeat_at INTEGER"]) {
-    ensureColumn(db, "durable_runtime_steps", column);
-  }
-  ensureDurableRuntimeSchemaVersion(db);
+function rowToDeliveryAttemptEvidence(row: DeliveryAttemptEvidenceRow): DeliveryAttemptEvidence {
+  return {
+    deliveryAttemptId: row.delivery_attempt_id,
+    wakeId: row.wake_id,
+    dedupeKey: row.dedupe_key,
+    ...(row.replay_pass_id ? { replayPassId: row.replay_pass_id } : {}),
+    ...(row.target_kind ? { targetKind: row.target_kind } : {}),
+    ...(row.target_ref ? { targetRef: row.target_ref } : {}),
+    ...(row.route_kind ? { routeKind: row.route_kind } : {}),
+    ...(row.route_ref ? { routeRef: row.route_ref } : {}),
+    status: row.status,
+    ...(row.evidence_json ? { evidence: parseJsonRecord(row.evidence_json) } : {}),
+    ...(row.error_message ? { error: row.error_message } : {}),
+    scheduledAt: Number(row.scheduled_at),
+    ...(row.attempted_at == null ? {} : { attemptedAt: Number(row.attempted_at) }),
+    ...(row.delivered_at == null ? {} : { deliveredAt: Number(row.delivered_at) }),
+    ...(row.failed_at == null ? {} : { failedAt: Number(row.failed_at) }),
+    ...(row.unknown_at == null ? {} : { unknownAt: Number(row.unknown_at) }),
+    ...(row.delivery_claimed_by ? { deliveryClaimedBy: row.delivery_claimed_by } : {}),
+    ...(row.delivery_claim_expires_at == null
+      ? {}
+      : { deliveryClaimExpiresAt: Number(row.delivery_claim_expires_at) }),
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+    ...(row.metadata_json ? { metadata: parseJsonRecord(row.metadata_json) } : {}),
+  };
 }
 
-function readDurableRuntimeSchemaMigration(
-  db: DatabaseSync,
-): DurableSchemaMigrationRow | undefined {
-  const row = db
-    .prepare("SELECT * FROM durable_schema_migrations WHERE schema_name = ?")
-    .get(DURABLE_RUNTIME_SQLITE_SCHEMA_NAME) as DurableSchemaMigrationRow | undefined;
-  return row;
+function rowToUnresolvedObligation(
+  row: DurableUnresolvedObligationRow,
+): DurableUnresolvedObligation {
+  return {
+    obligationId: row.obligation_id,
+    kind: row.kind,
+    ...(row.runtime_run_id ? { runtimeRunId: row.runtime_run_id } : {}),
+    ...(row.step_id ? { stepId: row.step_id } : {}),
+    ...(row.wake_id ? { wakeId: row.wake_id } : {}),
+    ...(row.uncertainty_fact_id ? { uncertaintyFactId: row.uncertainty_fact_id } : {}),
+    ...(row.subject_ref ? { subjectRef: row.subject_ref } : {}),
+    ...(row.reason ? { reason: row.reason } : {}),
+    status: row.status,
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at),
+    ...(row.metadata_json ? { metadata: parseJsonRecord(row.metadata_json) } : {}),
+  };
 }
 
-function assertDurableRuntimeSchemaVersionSupported(db: DatabaseSync): void {
-  const row = readDurableRuntimeSchemaMigration(db);
-  const currentVersion = Number(row?.version ?? 0);
-  if (currentVersion > DURABLE_RUNTIME_SQLITE_SCHEMA_VERSION) {
-    throw new Error(
-      `Durable runtime schema version ${currentVersion} is newer than supported version ${DURABLE_RUNTIME_SQLITE_SCHEMA_VERSION}`,
-    );
-  }
+function queryRows<Row>(db: DatabaseSync, query: SyncQuery<Row>): Row[] {
+  return executeSqliteQuerySync(db, query).rows as Row[];
 }
 
-function ensureDurableRuntimeSchemaVersion(db: DatabaseSync): void {
-  const now = Date.now();
-  const row = readDurableRuntimeSchemaMigration(db);
-  const currentVersion = Number(row?.version ?? 0);
-  assertDurableRuntimeSchemaVersionSupported(db);
-  if (currentVersion === DURABLE_RUNTIME_SQLITE_SCHEMA_VERSION) {
-    return;
-  }
-
-  const metadata = JSON.stringify({
-    kind: currentVersion === 0 ? "fresh-install" : "schema-upgrade",
-    previousVersion: currentVersion,
-  });
-  if (row) {
-    db.prepare(
-      `UPDATE durable_schema_migrations
-          SET version = ?,
-              applied_at = ?,
-              metadata_json = ?
-        WHERE schema_name = ?`,
-    ).run(DURABLE_RUNTIME_SQLITE_SCHEMA_VERSION, now, metadata, DURABLE_RUNTIME_SQLITE_SCHEMA_NAME);
-    return;
-  }
-
-  db.prepare(
-    `INSERT INTO durable_schema_migrations (schema_name, version, applied_at, metadata_json)
-     VALUES (?, ?, ?, ?)`,
-  ).run(DURABLE_RUNTIME_SQLITE_SCHEMA_NAME, DURABLE_RUNTIME_SQLITE_SCHEMA_VERSION, now, metadata);
+function queryFirst<Row>(db: DatabaseSync, query: SyncQuery<Row>): Row | undefined {
+  return executeSqliteQueryTakeFirstSync(db, query) as Row | undefined;
 }
 
-function getDurableRuntimeSchemaVersion(db: DatabaseSync): number {
-  const row = db
-    .prepare("SELECT * FROM durable_schema_migrations WHERE schema_name = ?")
-    .get(DURABLE_RUNTIME_SQLITE_SCHEMA_NAME) as DurableSchemaMigrationRow | undefined;
-  return Number(row?.version ?? 0);
+function executeQuery(db: DatabaseSync, query: SyncQuery<unknown>): number {
+  const result = executeSqliteQuerySync(db, query);
+  return Number(result.numAffectedRows ?? 0);
 }
 
-function count(db: DatabaseSync, sql: string, values: SQLInputValue[] = []): number {
-  const row = db.prepare(sql).get(...values) as CountRow | undefined;
+function count(db: DatabaseSync, query: SyncQuery<CountRow>): number {
+  const row = queryFirst<CountRow>(db, query);
   return Number(row?.count ?? 0);
 }
 
@@ -652,51 +724,926 @@ function isTerminalRunStatus(status: DurableRuntimeRunStatus): boolean {
   );
 }
 
-export function openDurableRuntimeSqliteStore(options?: {
+function isTerminalStepStatus(status: DurableRuntimeStepStatus): boolean {
+  return (
+    status === "succeeded" ||
+    status === "failed" ||
+    status === "cancelled" ||
+    status === "lost" ||
+    status === "skipped"
+  );
+}
+
+function isTerminalRunRow(row: DurableRuntimeRunRow): boolean {
+  return (
+    isTerminalRunStatus(row.status) ||
+    row.recovery_state === "terminal" ||
+    row.completed_at !== null
+  );
+}
+
+function isTerminalStepRow(row: DurableRuntimeStepRow): boolean {
+  return (
+    isTerminalStepStatus(row.status) ||
+    row.recovery_state === "terminal" ||
+    row.completed_at !== null
+  );
+}
+
+function isTerminalWakeStatus(status: WakeObligationStatus): boolean {
+  return status === "acked" || status === "superseded";
+}
+
+function isAllowedWakeStatusTransition(
+  current: WakeObligationStatus,
+  next: WakeObligationStatus,
+): boolean {
+  if (current === next) {
+    return true;
+  }
+  if (current === "pending") {
+    return next === "delivered" || next === "acked" || next === "failed" || next === "superseded";
+  }
+  if (current === "delivered") {
+    return next === "acked" || next === "failed" || next === "superseded";
+  }
+  if (current === "failed") {
+    return next === "superseded";
+  }
+  return false;
+}
+
+function isTerminalDeliveryAttemptEvidenceStatus(status: DeliveryAttemptEvidenceStatus): boolean {
+  return status === "delivered" || status === "failed" || status === "superseded";
+}
+
+function isAllowedDeliveryAttemptEvidenceStatusTransition(
+  current: DeliveryAttemptEvidenceStatus,
+  next: DeliveryAttemptEvidenceStatus,
+): boolean {
+  if (current === next) {
+    return true;
+  }
+  if (current === "pending") {
+    return (
+      next === "attempted" ||
+      next === "delivered" ||
+      next === "failed" ||
+      next === "unknown" ||
+      next === "superseded"
+    );
+  }
+  if (current === "attempted") {
+    return next === "delivered" || next === "failed" || next === "unknown" || next === "superseded";
+  }
+  if (current === "unknown") {
+    return next === "delivered" || next === "failed" || next === "superseded";
+  }
+  return false;
+}
+
+function isSameSqlValue(
+  left: string | number | bigint | null,
+  right: string | number | bigint | null,
+): boolean {
+  return left === right;
+}
+
+export function openDurableRuntimeSqliteStore(storeOptions?: {
   path?: string;
   env?: NodeJS.ProcessEnv;
 }): DurableRuntimeStore {
-  const env = options?.env ?? process.env;
-  const pathname = path.resolve(options?.path ?? resolveDurableRuntimeSqlitePath(env));
-  ensureOpenClawStatePermissions(pathname, env);
-  const sqlite = requireNodeSqlite();
-  const db = new sqlite.DatabaseSync(pathname);
-  const walMaintenance = configureSqliteConnectionPragmas(db, {
-    busyTimeoutMs: DURABLE_RUNTIME_SQLITE_BUSY_TIMEOUT_MS,
-    databaseLabel: "openclaw-durable-runtime",
-    databasePath: pathname,
-    foreignKeys: true,
-    synchronous: "NORMAL",
-  });
-  try {
-    ensureDurableRuntimeSchema(db);
-    ensureOpenClawStatePermissions(pathname, env);
-  } catch (err) {
-    walMaintenance.close();
-    if (db.isOpen) {
-      db.close();
+  const env = storeOptions?.env ?? process.env;
+  const pathname = path.resolve(storeOptions?.path ?? resolveDurableRuntimeSqlitePath(env));
+  const stateDatabaseLease = acquireOpenClawStateDatabaseLease({ env, path: pathname });
+  const stateDatabase = stateDatabaseLease.database;
+  const db = stateDatabase.db;
+  const durableDb = (() => {
+    try {
+      return getNodeSqliteKysely<DurableRuntimeDatabase>(db);
+    } catch (err) {
+      stateDatabaseLease.release();
+      closeOpenClawStateDatabaseForPath({ env, path: pathname });
+      throw err;
     }
-    throw err;
-  }
+  })();
+  let closed = false;
+
+  const createWakeObligationRecord = (input: CreateWakeObligationInput): WakeObligation => {
+    const parentRunId = optionalText(input.parentRunId);
+    const parentSessionKey = optionalText(input.parentSessionKey);
+    const targetRef = optionalText(input.targetRef);
+    const reportRouteRef = optionalText(input.reportRouteRef);
+    const targetResolutionStatus = input.targetResolutionStatus;
+    const hasInspectableResolution =
+      targetResolutionStatus === "ambiguous" ||
+      targetResolutionStatus === "missing" ||
+      targetResolutionStatus === "unauthorized" ||
+      targetResolutionStatus === "inspect_only";
+    if (
+      !parentRunId &&
+      !parentSessionKey &&
+      !targetRef &&
+      !reportRouteRef &&
+      !hasInspectableResolution
+    ) {
+      throw new Error(
+        "Durable wake requires a parent target, generalized target, report route, or inspect-only resolution",
+      );
+    }
+    const dedupeKey = optionalText(input.dedupeKey);
+    if (!dedupeKey) {
+      throw new Error("Durable wake requires a dedupeKey");
+    }
+    const now = input.now ?? Date.now();
+    const wakeId = input.wakeId ?? `wake_${randomUUID()}`;
+    return runSqliteImmediateTransactionSync(db, () => {
+      const existing = queryFirst<WakeObligationRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_wake_obligations")
+          .selectAll()
+          .where("dedupe_key", "=", dedupeKey),
+      );
+      if (existing) {
+        return rowToWakeObligation(existing);
+      }
+      executeQuery(
+        db,
+        durableDb.insertInto("durable_runtime_wake_obligations").values({
+          wake_id: wakeId,
+          parent_run_id: parentRunId,
+          parent_session_key: parentSessionKey,
+          target_agent: optionalText(input.targetAgent),
+          target_session: optionalText(input.targetSession),
+          target_channel: optionalText(input.targetChannel),
+          target_kind: optionalText(input.targetKind),
+          target_ref: targetRef,
+          owner_kind: optionalText(input.ownerKind),
+          owner_ref: optionalText(input.ownerRef),
+          report_route_ref: reportRouteRef,
+          target_resolution_status: optionalText(input.targetResolutionStatus),
+          target_resolution_reason: optionalText(input.targetResolutionReason),
+          reason: input.reason,
+          facts_ref: optionalText(input.factsRef),
+          source_run_id: optionalText(input.sourceRunId),
+          dedupe_key: dedupeKey,
+          attempt_count: 0,
+          last_attempt_at: null,
+          acked_at: null,
+          failed_reason: null,
+          status: "pending",
+          created_at: now,
+          updated_at: now,
+          metadata_json: serializeJson(input.metadata),
+        }),
+      );
+      const row = queryFirst<WakeObligationRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_wake_obligations")
+          .selectAll()
+          .where("wake_id", "=", wakeId),
+      );
+      return rowToWakeObligation(row!);
+    });
+  };
+
+  const updateWakeObligationRecord = (
+    input: UpdateWakeObligationInput,
+  ): WakeObligation | undefined => {
+    const now = input.now ?? Date.now();
+    return runSqliteImmediateTransactionSync(db, () => {
+      const current = queryFirst<WakeObligationRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_wake_obligations")
+          .selectAll()
+          .where("wake_id", "=", input.wakeId),
+      );
+      if (!current) {
+        return undefined;
+      }
+      const nextAttemptCount = input.attemptCount ?? current.attempt_count;
+      const nextLastAttemptAt =
+        input.lastAttemptAt === undefined ? current.last_attempt_at : input.lastAttemptAt;
+      const nextAckedAt = input.ackedAt === undefined ? current.acked_at : input.ackedAt;
+      const nextFailedReason =
+        input.failedReason === undefined
+          ? current.failed_reason
+          : optionalText(input.failedReason ?? undefined);
+      const nextMetadataJson =
+        input.metadata === undefined ? current.metadata_json : serializeJson(input.metadata);
+      if (isTerminalWakeStatus(current.status)) {
+        const isNoOp =
+          input.status === current.status &&
+          isSameSqlValue(nextAttemptCount, current.attempt_count) &&
+          isSameSqlValue(nextLastAttemptAt, current.last_attempt_at) &&
+          isSameSqlValue(nextAckedAt, current.acked_at) &&
+          isSameSqlValue(nextFailedReason, current.failed_reason) &&
+          isSameSqlValue(nextMetadataJson, current.metadata_json);
+        return isNoOp ? rowToWakeObligation(current) : undefined;
+      }
+      if (!isAllowedWakeStatusTransition(current.status, input.status)) {
+        return undefined;
+      }
+      executeQuery(
+        db,
+        durableDb
+          .updateTable("durable_runtime_wake_obligations")
+          .set({
+            status: input.status,
+            attempt_count: Number(nextAttemptCount),
+            last_attempt_at: nextLastAttemptAt == null ? null : Number(nextLastAttemptAt),
+            acked_at: nextAckedAt == null ? null : Number(nextAckedAt),
+            failed_reason: nextFailedReason,
+            updated_at: now,
+            metadata_json: nextMetadataJson,
+          })
+          .where("wake_id", "=", input.wakeId),
+      );
+      const row = queryFirst<WakeObligationRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_wake_obligations")
+          .selectAll()
+          .where("wake_id", "=", input.wakeId),
+      );
+      return rowToWakeObligation(row!);
+    });
+  };
+
+  const getWakeObligationRecord = (wakeId: string): WakeObligation | undefined => {
+    const row = queryFirst<WakeObligationRow>(
+      db,
+      durableDb
+        .selectFrom("durable_runtime_wake_obligations")
+        .selectAll()
+        .where("wake_id", "=", wakeId),
+    );
+    return row ? rowToWakeObligation(row) : undefined;
+  };
+
+  const listWakeObligationRecords = (options?: {
+    parentRunId?: string;
+    parentSessionKey?: string;
+    targetKind?: WakeObligationTargetKind;
+    targetRef?: string;
+    ownerKind?: WakeObligationOwnerKind;
+    ownerRef?: string;
+    reportRouteRef?: string;
+    targetResolutionStatus?: WakeObligationTargetResolutionStatus;
+    status?: WakeObligationStatus;
+    limit?: number;
+  }): WakeObligation[] => {
+    const parentRunId = optionalText(options?.parentRunId);
+    const parentSessionKey = optionalText(options?.parentSessionKey);
+    const targetRef = optionalText(options?.targetRef);
+    const ownerRef = optionalText(options?.ownerRef);
+    const reportRouteRef = optionalText(options?.reportRouteRef);
+    const rows = queryRows<WakeObligationRow>(
+      db,
+      durableDb
+        .selectFrom("durable_runtime_wake_obligations")
+        .selectAll()
+        .$if(Boolean(parentRunId), (qb) => qb.where("parent_run_id", "=", parentRunId!))
+        .$if(Boolean(parentSessionKey), (qb) =>
+          qb.where("parent_session_key", "=", parentSessionKey!),
+        )
+        .$if(Boolean(options?.targetKind), (qb) =>
+          qb.where("target_kind", "=", options!.targetKind!),
+        )
+        .$if(Boolean(targetRef), (qb) => qb.where("target_ref", "=", targetRef!))
+        .$if(Boolean(options?.ownerKind), (qb) => qb.where("owner_kind", "=", options!.ownerKind!))
+        .$if(Boolean(ownerRef), (qb) => qb.where("owner_ref", "=", ownerRef!))
+        .$if(Boolean(reportRouteRef), (qb) => qb.where("report_route_ref", "=", reportRouteRef!))
+        .$if(Boolean(options?.targetResolutionStatus), (qb) =>
+          qb.where("target_resolution_status", "=", options!.targetResolutionStatus!),
+        )
+        .$if(Boolean(options?.status), (qb) => qb.where("status", "=", options!.status!))
+        .orderBy("updated_at", "desc")
+        .orderBy("wake_id", "desc")
+        .limit(normalizeQueryLimit(options?.limit, 500)),
+    );
+    return rows.map(rowToWakeObligation);
+  };
+
+  const storeListUncertaintyFacts = (options?: {
+    sourceRunId?: string;
+    status?: UncertaintyFactStatus;
+    limit?: number;
+  }): UncertaintyFact[] => {
+    const sourceRunId = optionalText(options?.sourceRunId);
+    const rows = queryRows<UncertaintyFactRow>(
+      db,
+      durableDb
+        .selectFrom("durable_runtime_uncertainty_facts")
+        .selectAll()
+        .$if(Boolean(sourceRunId), (qb) => qb.where("source_run_id", "=", sourceRunId!))
+        .$if(Boolean(options?.status), (qb) => qb.where("status", "=", options!.status!))
+        .orderBy("updated_at", "desc")
+        .orderBy("fact_id", "desc")
+        .limit(normalizeQueryLimit(options?.limit, 500)),
+    );
+    return rows.map(rowToUncertaintyFact);
+  };
+
+  const acknowledgeWakeObligationRecord = (
+    input: WakeObligationControlInput,
+  ): WakeObligation | undefined => {
+    const now = input.now ?? Date.now();
+    const current = queryFirst<WakeObligationRow>(
+      db,
+      durableDb
+        .selectFrom("durable_runtime_wake_obligations")
+        .selectAll()
+        .where("wake_id", "=", input.wakeId),
+    );
+    if (!current) {
+      return undefined;
+    }
+    if (current.status === "acked") {
+      return rowToWakeObligation(current);
+    }
+    if (isTerminalWakeStatus(current.status)) {
+      return undefined;
+    }
+    const decision = buildWakeControlDecision(input, "acknowledged", now);
+    return updateWakeObligationRecord({
+      wakeId: input.wakeId,
+      status: "acked",
+      ackedAt: now,
+      metadata: mergeWakeControlMetadata(current.metadata_json, decision),
+      now,
+    });
+  };
+
+  const supersedeWakeObligationRecord = (
+    input: SupersedeWakeObligationInput,
+  ): WakeObligation | undefined => {
+    const now = input.now ?? Date.now();
+    const current = queryFirst<WakeObligationRow>(
+      db,
+      durableDb
+        .selectFrom("durable_runtime_wake_obligations")
+        .selectAll()
+        .where("wake_id", "=", input.wakeId),
+    );
+    if (!current) {
+      return undefined;
+    }
+    if (current.status === "superseded") {
+      return rowToWakeObligation(current);
+    }
+    if (isTerminalWakeStatus(current.status)) {
+      return undefined;
+    }
+    const decision = buildWakeControlDecision(input, "superseded", now);
+    return updateWakeObligationRecord({
+      wakeId: input.wakeId,
+      status: "superseded",
+      failedReason: input.reason ?? "superseded",
+      metadata: mergeWakeControlMetadata(
+        current.metadata_json,
+        decision,
+        input.supersededByRef ? { supersededByRef: input.supersededByRef } : undefined,
+      ),
+      now,
+    });
+  };
+
+  const markWakeObligationDecisionRequiredRecord = (
+    input: MarkWakeObligationDecisionRequiredInput,
+  ): WakeObligation | undefined => {
+    const now = input.now ?? Date.now();
+    const current = queryFirst<WakeObligationRow>(
+      db,
+      durableDb
+        .selectFrom("durable_runtime_wake_obligations")
+        .selectAll()
+        .where("wake_id", "=", input.wakeId),
+    );
+    if (!current) {
+      return undefined;
+    }
+    if (isTerminalWakeStatus(current.status)) {
+      return isMatchingControlNoop(current, input.decisionKind, input.idempotencyKey)
+        ? rowToWakeObligation(current)
+        : undefined;
+    }
+    const decision = buildWakeControlDecision(input, input.decisionKind, now);
+    return updateWakeObligationRecord({
+      wakeId: input.wakeId,
+      status: current.status,
+      metadata: mergeWakeControlMetadata(current.metadata_json, decision),
+      now,
+    });
+  };
+
+  const getWakeObligationInspectionRecord = (wakeId: string): WakeObligationInspection | undefined => {
+    const wake = getWakeObligationRecord(wakeId);
+    if (!wake) {
+      return undefined;
+    }
+    const metadata = wake.metadata ?? {};
+    const diagnostics = isRecordValue(metadata.diagnostics) ? metadata.diagnostics : undefined;
+    const evidence = isRecordValue(metadata.evidence) ? metadata.evidence : undefined;
+    const unresolvedUncertaintyFacts = wake.sourceRunId
+      ? storeListUncertaintyFacts({
+          sourceRunId: wake.sourceRunId,
+          status: "open",
+        })
+      : [];
+    return {
+      wake,
+      targetResolution: {
+        ...(wake.targetResolutionStatus ? { status: wake.targetResolutionStatus } : {}),
+        ...(wake.targetResolutionReason ? { reason: wake.targetResolutionReason } : {}),
+        ...(wake.targetKind ? { targetKind: wake.targetKind } : {}),
+        ...(wake.targetRef ? { targetRef: wake.targetRef } : {}),
+        ...(wake.ownerKind ? { ownerKind: wake.ownerKind } : {}),
+        ...(wake.ownerRef ? { ownerRef: wake.ownerRef } : {}),
+        ...(wake.reportRouteRef ? { reportRouteRef: wake.reportRouteRef } : {}),
+        ...(wake.factsRef ? { factsRef: wake.factsRef } : {}),
+        ...(wake.sourceRunId ? { sourceRunId: wake.sourceRunId } : {}),
+        ...(diagnostics ? { diagnostics } : {}),
+        ...(evidence ? { evidence } : {}),
+      },
+      deliveryAttemptEvidence: listDeliveryAttemptEvidenceRecords({ wakeId }),
+      unresolvedUncertaintyFacts,
+      sourceRefs: {
+        ...(wake.factsRef ? { factsRef: wake.factsRef } : {}),
+        ...(wake.sourceRunId ? { sourceRunId: wake.sourceRunId } : {}),
+        dedupeKey: wake.dedupeKey,
+        ...(wake.parentRunId ? { parentRunId: wake.parentRunId } : {}),
+        ...(wake.parentSessionKey ? { parentSessionKey: wake.parentSessionKey } : {}),
+      },
+    };
+  };
+
+  const recordDeliveryAttemptEvidenceRecord = (
+    input: RecordDeliveryAttemptEvidenceInput,
+  ): DeliveryAttemptEvidence => {
+    const now = input.now ?? Date.now();
+    const deliveryAttemptId = input.deliveryAttemptId ?? `wake_delivery_${randomUUID()}`;
+    const dedupeKey = optionalText(input.dedupeKey);
+    if (!dedupeKey) {
+      throw new Error("Durable delivery attempt evidence requires a dedupeKey");
+    }
+    return runSqliteImmediateTransactionSync(db, () => {
+      const existing = queryFirst<DeliveryAttemptEvidenceRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_delivery_attempt_evidence")
+          .selectAll()
+          .where("dedupe_key", "=", dedupeKey),
+      );
+      if (existing) {
+        return rowToDeliveryAttemptEvidence(existing);
+      }
+      const wake = queryFirst<WakeObligationRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_wake_obligations")
+          .selectAll()
+          .where("wake_id", "=", input.wakeId),
+      );
+      if (!wake) {
+        throw new Error(`Durable delivery attempt evidence references unknown wake ${input.wakeId}`);
+      }
+      executeQuery(
+        db,
+        durableDb.insertInto("durable_runtime_delivery_attempt_evidence").values({
+          delivery_attempt_id: deliveryAttemptId,
+          wake_id: input.wakeId,
+          dedupe_key: dedupeKey,
+          replay_pass_id: optionalText(input.replayPassId),
+          target_kind: optionalText(input.targetKind),
+          target_ref: optionalText(input.targetRef),
+          route_kind: optionalText(input.routeKind),
+          route_ref: optionalText(input.routeRef),
+          status: input.status ?? "pending",
+          evidence_json: serializeJson(input.evidence),
+          error_message: optionalText(input.error),
+          scheduled_at: now,
+          attempted_at: input.attemptedAt ?? null,
+          delivered_at: input.deliveredAt ?? null,
+          failed_at: input.failedAt ?? null,
+          unknown_at: input.unknownAt ?? null,
+          delivery_claimed_by: null,
+          delivery_claim_expires_at: null,
+          created_at: now,
+          updated_at: now,
+          metadata_json: serializeJson(input.metadata),
+        }),
+      );
+      executeQuery(
+        db,
+        durableDb
+          .updateTable("durable_runtime_wake_obligations")
+          .set({
+            attempt_count: Number(wake.attempt_count) + 1,
+            last_attempt_at: now,
+            updated_at: now,
+          })
+          .where("wake_id", "=", input.wakeId),
+      );
+      const row = queryFirst<DeliveryAttemptEvidenceRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_delivery_attempt_evidence")
+          .selectAll()
+          .where("delivery_attempt_id", "=", deliveryAttemptId),
+      );
+      return rowToDeliveryAttemptEvidence(row!);
+    });
+  };
+
+  const updateDeliveryAttemptEvidenceRecord = (
+    input: UpdateDeliveryAttemptEvidenceInput,
+  ): DeliveryAttemptEvidence | undefined => {
+    const now = input.now ?? Date.now();
+    return runSqliteImmediateTransactionSync(db, () => {
+      const current = queryFirst<DeliveryAttemptEvidenceRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_delivery_attempt_evidence")
+          .selectAll()
+          .where("delivery_attempt_id", "=", input.deliveryAttemptId),
+      );
+      if (!current) {
+        return undefined;
+      }
+      const nextEvidenceJson =
+        input.evidence === undefined ? current.evidence_json : serializeJson(input.evidence);
+      const nextError =
+        input.error === undefined ? current.error_message : optionalText(input.error ?? undefined);
+      const nextAttemptedAt =
+        input.attemptedAt === undefined ? current.attempted_at : input.attemptedAt;
+      const nextDeliveredAt =
+        input.deliveredAt === undefined ? current.delivered_at : input.deliveredAt;
+      const nextFailedAt = input.failedAt === undefined ? current.failed_at : input.failedAt;
+      const nextUnknownAt = input.unknownAt === undefined ? current.unknown_at : input.unknownAt;
+      const nextMetadataJson =
+        input.metadata === undefined ? current.metadata_json : serializeJson(input.metadata);
+      if (isTerminalDeliveryAttemptEvidenceStatus(current.status)) {
+        const isNoOp =
+          input.status === current.status &&
+          isSameSqlValue(nextEvidenceJson, current.evidence_json) &&
+          isSameSqlValue(nextError, current.error_message) &&
+          isSameSqlValue(nextAttemptedAt, current.attempted_at) &&
+          isSameSqlValue(nextDeliveredAt, current.delivered_at) &&
+          isSameSqlValue(nextFailedAt, current.failed_at) &&
+          isSameSqlValue(nextUnknownAt, current.unknown_at) &&
+          isSameSqlValue(nextMetadataJson, current.metadata_json);
+        return isNoOp ? rowToDeliveryAttemptEvidence(current) : undefined;
+      }
+      if (!isAllowedDeliveryAttemptEvidenceStatusTransition(current.status, input.status)) {
+        return undefined;
+      }
+      const nextClaim =
+        input.status === "delivered" ||
+        input.status === "failed" ||
+        input.status === "unknown" ||
+        input.status === "superseded"
+          ? { delivery_claimed_by: null, delivery_claim_expires_at: null }
+          : {};
+      const expectedClaimedBy = optionalText(input.expectedClaimedBy);
+      const affected = executeQuery(
+        db,
+        durableDb
+          .updateTable("durable_runtime_delivery_attempt_evidence")
+          .set({
+            status: input.status,
+            evidence_json: nextEvidenceJson,
+            error_message: nextError,
+            attempted_at: nextAttemptedAt == null ? null : Number(nextAttemptedAt),
+            delivered_at: nextDeliveredAt == null ? null : Number(nextDeliveredAt),
+            failed_at: nextFailedAt == null ? null : Number(nextFailedAt),
+            unknown_at: nextUnknownAt == null ? null : Number(nextUnknownAt),
+            ...nextClaim,
+            updated_at: now,
+            metadata_json: nextMetadataJson,
+          })
+          .where("delivery_attempt_id", "=", input.deliveryAttemptId)
+          .$if(Boolean(expectedClaimedBy), (qb) =>
+            qb.where("delivery_claimed_by", "=", expectedClaimedBy!),
+          ),
+      );
+      if (affected !== 1) {
+        return undefined;
+      }
+      const row = queryFirst<DeliveryAttemptEvidenceRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_delivery_attempt_evidence")
+          .selectAll()
+          .where("delivery_attempt_id", "=", input.deliveryAttemptId),
+      );
+      return rowToDeliveryAttemptEvidence(row!);
+    });
+  };
+
+  const finalizeDeliveryAttemptEvidenceRecord = (
+    input: FinalizeDeliveryAttemptEvidenceInput,
+  ): DeliveryAttemptEvidence | undefined => {
+    const now = input.now ?? Date.now();
+    return runSqliteImmediateTransactionSync(db, () => {
+      const current = queryFirst<DeliveryAttemptEvidenceRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_delivery_attempt_evidence")
+          .selectAll()
+          .where("delivery_attempt_id", "=", input.deliveryAttemptId),
+      );
+      if (!current) {
+        return undefined;
+      }
+      if (input.status !== input.wakeStatus) {
+        return undefined;
+      }
+      const wake = queryFirst<WakeObligationRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_wake_obligations")
+          .selectAll()
+          .where("wake_id", "=", current.wake_id),
+      );
+      if (!wake) {
+        return undefined;
+      }
+      const nextWakeAttemptCount = input.wakeAttemptCount ?? wake.attempt_count;
+      const nextWakeLastAttemptAt =
+        input.wakeLastAttemptAt === undefined ? wake.last_attempt_at : input.wakeLastAttemptAt;
+      const nextWakeFailedReason =
+        input.wakeFailedReason === undefined
+          ? wake.failed_reason
+          : optionalText(input.wakeFailedReason ?? undefined);
+      if (isTerminalWakeStatus(wake.status)) {
+        const isNoOp =
+          input.wakeStatus === wake.status &&
+          isSameSqlValue(nextWakeAttemptCount, wake.attempt_count) &&
+          isSameSqlValue(nextWakeLastAttemptAt, wake.last_attempt_at) &&
+          isSameSqlValue(nextWakeFailedReason, wake.failed_reason);
+        if (!isNoOp) {
+          return undefined;
+        }
+      } else if (!isAllowedWakeStatusTransition(wake.status, input.wakeStatus)) {
+        return undefined;
+      }
+
+      const nextEvidenceJson =
+        input.evidence === undefined ? current.evidence_json : serializeJson(input.evidence);
+      const nextError =
+        input.error === undefined ? current.error_message : optionalText(input.error ?? undefined);
+      const nextAttemptedAt =
+        input.attemptedAt === undefined ? current.attempted_at : input.attemptedAt;
+      const nextDeliveredAt =
+        input.deliveredAt === undefined ? current.delivered_at : input.deliveredAt;
+      const nextFailedAt = input.failedAt === undefined ? current.failed_at : input.failedAt;
+      const nextUnknownAt = input.unknownAt === undefined ? current.unknown_at : input.unknownAt;
+      const nextMetadataJson =
+        input.metadata === undefined ? current.metadata_json : serializeJson(input.metadata);
+      const expectedClaimedBy = optionalText(input.expectedClaimedBy);
+      const affected = executeQuery(
+        db,
+        durableDb
+          .updateTable("durable_runtime_delivery_attempt_evidence")
+          .set({
+            status: input.status,
+            evidence_json: nextEvidenceJson,
+            error_message: nextError,
+            attempted_at: nextAttemptedAt == null ? null : Number(nextAttemptedAt),
+            delivered_at: nextDeliveredAt == null ? null : Number(nextDeliveredAt),
+            failed_at: nextFailedAt == null ? null : Number(nextFailedAt),
+            unknown_at: nextUnknownAt == null ? null : Number(nextUnknownAt),
+            delivery_claimed_by: null,
+            delivery_claim_expires_at: null,
+            updated_at: now,
+            metadata_json: nextMetadataJson,
+          })
+          .where("delivery_attempt_id", "=", input.deliveryAttemptId)
+          .$if(Boolean(expectedClaimedBy), (qb) =>
+            qb.where("delivery_claimed_by", "=", expectedClaimedBy!),
+          ),
+      );
+      if (affected !== 1) {
+        return undefined;
+      }
+      executeQuery(
+        db,
+        durableDb
+          .updateTable("durable_runtime_wake_obligations")
+          .set({
+            status: input.wakeStatus,
+            attempt_count: Number(nextWakeAttemptCount),
+            last_attempt_at: nextWakeLastAttemptAt == null ? null : Number(nextWakeLastAttemptAt),
+            failed_reason: nextWakeFailedReason,
+            updated_at: now,
+          })
+          .where("wake_id", "=", current.wake_id),
+      );
+      const row = queryFirst<DeliveryAttemptEvidenceRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_delivery_attempt_evidence")
+          .selectAll()
+          .where("delivery_attempt_id", "=", input.deliveryAttemptId),
+      );
+      return rowToDeliveryAttemptEvidence(row!);
+    });
+  };
+
+  const renewDeliveryAttemptEvidenceClaimRecord = (
+    input: RenewDeliveryAttemptEvidenceClaimInput,
+  ): DeliveryAttemptEvidence | undefined => {
+    const now = input.now ?? Date.now();
+    const claimExpiresAt = now + input.claimTtlMs;
+    const replayPassId = optionalText(input.replayPassId);
+    if (!replayPassId) {
+      return undefined;
+    }
+    return runSqliteImmediateTransactionSync(db, () => {
+      const affected = executeQuery(
+        db,
+        durableDb
+          .updateTable("durable_runtime_delivery_attempt_evidence")
+          .set({
+            delivery_claim_expires_at: claimExpiresAt,
+            updated_at: now,
+          })
+          .where("delivery_attempt_id", "=", input.deliveryAttemptId)
+          .where("status", "=", "attempted")
+          .where("delivery_claimed_by", "=", replayPassId),
+      );
+      if (affected !== 1) {
+        return undefined;
+      }
+      const row = queryFirst<DeliveryAttemptEvidenceRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_delivery_attempt_evidence")
+          .selectAll()
+          .where("delivery_attempt_id", "=", input.deliveryAttemptId),
+      );
+      return row ? rowToDeliveryAttemptEvidence(row) : undefined;
+    });
+  };
+
+  const claimDeliveryAttemptEvidenceRecord = (
+    input: ClaimDeliveryAttemptEvidenceInput,
+  ): DeliveryAttemptEvidence | undefined => {
+    const now = input.now ?? Date.now();
+    const claimExpiresAt = now + input.claimTtlMs;
+    return runSqliteImmediateTransactionSync(db, () => {
+      const affected = executeQuery(
+        db,
+        durableDb
+          .updateTable("durable_runtime_delivery_attempt_evidence")
+          .set({
+            replay_pass_id: optionalText(input.replayPassId),
+            status: "attempted",
+            evidence_json: input.evidence === undefined ? undefined : serializeJson(input.evidence),
+            attempted_at: now,
+            delivery_claimed_by: optionalText(input.replayPassId),
+            delivery_claim_expires_at: claimExpiresAt,
+            updated_at: now,
+            metadata_json: input.metadata === undefined ? undefined : serializeJson(input.metadata),
+          })
+          .where("delivery_attempt_id", "=", input.deliveryAttemptId)
+          .where((eb) =>
+            eb.or([
+              eb("status", "=", "pending"),
+              eb.and([
+                eb("status", "=", "attempted"),
+                eb.or([
+                  eb("delivery_claim_expires_at", "is", null),
+                  eb("delivery_claim_expires_at", "<=", now),
+                ]),
+              ]),
+            ]),
+          ),
+      );
+      if (affected !== 1) {
+        return undefined;
+      }
+      const row = queryFirst<DeliveryAttemptEvidenceRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_delivery_attempt_evidence")
+          .selectAll()
+          .where("delivery_attempt_id", "=", input.deliveryAttemptId),
+      );
+      return row ? rowToDeliveryAttemptEvidence(row) : undefined;
+    });
+  };
+
+  const getDeliveryAttemptEvidenceRecord = (
+    deliveryAttemptId: string,
+  ): DeliveryAttemptEvidence | undefined => {
+    const row = queryFirst<DeliveryAttemptEvidenceRow>(
+      db,
+      durableDb
+        .selectFrom("durable_runtime_delivery_attempt_evidence")
+        .selectAll()
+        .where("delivery_attempt_id", "=", deliveryAttemptId),
+    );
+    return row ? rowToDeliveryAttemptEvidence(row) : undefined;
+  };
+
+  const listDeliveryAttemptEvidenceRecords = (options?: {
+    wakeId?: string;
+    dedupeKey?: string;
+    status?: DeliveryAttemptEvidenceStatus;
+    limit?: number;
+  }): DeliveryAttemptEvidence[] => {
+    const wakeId = optionalText(options?.wakeId);
+    const dedupeKey = optionalText(options?.dedupeKey);
+    const rows = queryRows<DeliveryAttemptEvidenceRow>(
+      db,
+      durableDb
+        .selectFrom("durable_runtime_delivery_attempt_evidence")
+        .selectAll()
+        .$if(Boolean(wakeId), (qb) => qb.where("wake_id", "=", wakeId!))
+        .$if(Boolean(dedupeKey), (qb) => qb.where("dedupe_key", "=", dedupeKey!))
+        .$if(Boolean(options?.status), (qb) => qb.where("status", "=", options!.status!))
+        .orderBy("scheduled_at", "desc")
+        .orderBy("delivery_attempt_id", "desc")
+        .limit(normalizeQueryLimit(options?.limit, 500)),
+    );
+    return rows.map(rowToDeliveryAttemptEvidence);
+  };
+
+  const supersedeDeliveryAttemptEvidenceRecord = (
+    input: SupersedeDeliveryAttemptEvidenceInput,
+  ): DeliveryAttemptEvidence | undefined => {
+    const now = input.now ?? Date.now();
+    const current = queryFirst<DeliveryAttemptEvidenceRow>(
+      db,
+      durableDb
+        .selectFrom("durable_runtime_delivery_attempt_evidence")
+        .selectAll()
+        .where("delivery_attempt_id", "=", input.deliveryAttemptId),
+    );
+    if (!current || current.wake_id !== input.wakeId) {
+      return undefined;
+    }
+    if (current.status === "superseded") {
+      return rowToDeliveryAttemptEvidence(current);
+    }
+    const decision = buildWakeControlDecision(input, "superseded", now);
+    const currentMetadata = parseMetadata(current.metadata_json);
+    return updateDeliveryAttemptEvidenceRecord({
+      deliveryAttemptId: input.deliveryAttemptId,
+      status: "superseded",
+      evidence: {
+        kind: "wake_delivery_attempt_superseded",
+        ...(input.supersededByRef ? { supersededByRef: input.supersededByRef } : {}),
+        control: decision,
+      },
+      error: input.reason ?? null,
+      metadata: {
+        ...currentMetadata,
+        durableDeliveryAttemptEvidenceControl: decision,
+        ...(input.supersededByRef ? { supersededByRef: input.supersededByRef } : {}),
+      },
+      now,
+    });
+  };
 
   return {
     createRun(input: CreateDurableRuntimeRunInput): DurableRuntimeRun {
+      const sourceOwner = optionalText(input.sourceOwner ?? input.sourceType);
+      const sourceRef = optionalText(input.sourceRef);
+      const rootOperationReason = optionalText(input.rootOperationReason);
+      if ((sourceOwner && !sourceRef) || (!sourceOwner && sourceRef)) {
+        throw new Error("Durable execution record sourceOwner and sourceRef must be provided together");
+      }
+      if ((!sourceOwner || !sourceRef) && !rootOperationReason) {
+        throw new Error(
+          "Durable execution record requires sourceOwner/sourceRef or rootOperationReason",
+        );
+      }
       const now = input.now ?? Date.now();
       const runtimeRunId = input.runtimeRunId ?? `run_${randomUUID()}`;
       const operationVersion = input.operationVersion ?? "1";
       const status = input.status ?? "received";
       const recoveryState = input.recoveryState ?? "runnable";
+      const metadata = {
+        ...(input.metadata ?? {}),
+        ...(rootOperationReason ? { rootOperationReason } : {}),
+      };
       return runSqliteImmediateTransactionSync(db, () => {
         const existing =
           input.idempotencyKey &&
-          (db
-            .prepare(
-              `SELECT *
-                 FROM durable_runtime_runs
-                WHERE operation_kind = ?
-                  AND idempotency_key = ?`,
-            )
-            .get(input.operationKind, input.idempotencyKey) as DurableRuntimeRunRow | undefined);
+          queryFirst<DurableRuntimeRunRow>(
+            db,
+            durableDb
+              .selectFrom("durable_runtime_runs")
+              .selectAll()
+              .where("operation_kind", "=", input.operationKind)
+              .where("idempotency_key", "=", input.idempotencyKey),
+          );
         if (existing) {
           if (
             input.requestHash &&
@@ -709,60 +1656,67 @@ export function openDurableRuntimeSqliteStore(options?: {
           }
           return rowToRun(existing);
         }
-        db.prepare(
-          `INSERT INTO durable_runtime_runs (
-             runtime_run_id, operation_kind, operation_version, idempotency_key, request_hash,
-             status, source_type, source_ref, input_ref, created_at, updated_at, completed_at,
-             recovery_state, checkpoint_ref, parent_runtime_run_id, parent_step_id, message_id,
-             turn_id, work_unit_id, report_route_id, claimed_by, claim_expires_at, heartbeat_at,
-             metadata_json
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).run(
-          runtimeRunId,
-          input.operationKind,
-          operationVersion,
-          optionalText(input.idempotencyKey),
-          optionalText(input.requestHash),
-          status,
-          optionalText(input.sourceType),
-          optionalText(input.sourceRef),
-          optionalText(input.inputRef),
-          now,
-          now,
-          input.completedAt ?? null,
-          recoveryState,
-          optionalText(input.checkpointRef),
-          optionalText(input.parentRuntimeRunId),
-          optionalText(input.parentStepId),
-          optionalText(input.messageId),
-          optionalText(input.turnId),
-          optionalText(input.workUnitId),
-          optionalText(input.reportRouteId),
-          null,
-          null,
-          null,
-          serializeJson(input.metadata),
+        executeQuery(
+          db,
+          durableDb.insertInto("durable_runtime_runs").values({
+            runtime_run_id: runtimeRunId,
+            operation_kind: input.operationKind,
+            operation_version: operationVersion,
+            idempotency_key: optionalText(input.idempotencyKey),
+            request_hash: optionalText(input.requestHash),
+            status,
+            source_type: sourceOwner,
+            source_ref: sourceRef,
+            input_ref: optionalText(input.inputRef),
+            created_at: now,
+            updated_at: now,
+            completed_at: input.completedAt ?? null,
+            recovery_state: recoveryState,
+            checkpoint_ref: optionalText(input.checkpointRef),
+            parent_runtime_run_id: optionalText(input.parentRuntimeRunId),
+            parent_step_id: optionalText(input.parentStepId),
+            message_id: optionalText(input.messageId),
+            turn_id: optionalText(input.turnId),
+            work_unit_id: optionalText(input.workUnitId),
+            report_route_id: optionalText(input.reportRouteId),
+            claimed_by: null,
+            claim_expires_at: null,
+            heartbeat_at: null,
+            metadata_json: serializeJson(metadata),
+          }),
         );
-        const row = db
-          .prepare("SELECT * FROM durable_runtime_runs WHERE runtime_run_id = ?")
-          .get(runtimeRunId) as DurableRuntimeRunRow;
-        return rowToRun(row);
+        const row = queryFirst<DurableRuntimeRunRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_runs")
+            .selectAll()
+            .where("runtime_run_id", "=", runtimeRunId),
+        );
+        return rowToRun(row!);
       });
     },
 
     getRun(runtimeRunId: string): DurableRuntimeRun | undefined {
-      const row = db
-        .prepare("SELECT * FROM durable_runtime_runs WHERE runtime_run_id = ?")
-        .get(runtimeRunId) as DurableRuntimeRunRow | undefined;
+      const row = queryFirst<DurableRuntimeRunRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_runs")
+          .selectAll()
+          .where("runtime_run_id", "=", runtimeRunId),
+      );
       return row ? rowToRun(row) : undefined;
     },
 
     updateRun(input: UpdateDurableRuntimeRunInput): DurableRuntimeRun | undefined {
       const now = input.now ?? Date.now();
       return runSqliteImmediateTransactionSync(db, () => {
-        const current = db
-          .prepare("SELECT * FROM durable_runtime_runs WHERE runtime_run_id = ?")
-          .get(input.runtimeRunId) as DurableRuntimeRunRow | undefined;
+        const current = queryFirst<DurableRuntimeRunRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_runs")
+            .selectAll()
+            .where("runtime_run_id", "=", input.runtimeRunId),
+        );
         if (!current) {
           return undefined;
         }
@@ -772,46 +1726,71 @@ export function openDurableRuntimeSqliteStore(options?: {
             : input.completedAt === null
               ? null
               : input.completedAt;
-        db.prepare(
-          `UPDATE durable_runtime_runs
-              SET status = ?,
-                  recovery_state = ?,
-                  updated_at = ?,
-                  completed_at = ?,
-                  checkpoint_ref = ?,
-                  work_unit_id = ?,
-                  report_route_id = ?,
-                  claimed_by = ?,
-                  claim_expires_at = ?,
-                  heartbeat_at = ?,
-                  metadata_json = ?
-            WHERE runtime_run_id = ?`,
-        ).run(
-          input.status ?? current.status,
-          input.recoveryState ?? current.recovery_state,
-          now,
-          completedAt,
+        const nextStatus = input.status ?? current.status;
+        const nextRecoveryState = input.recoveryState ?? current.recovery_state;
+        const nextCheckpointRef =
           input.checkpointRef === undefined
             ? current.checkpoint_ref
-            : optionalText(input.checkpointRef ?? undefined),
+            : optionalText(input.checkpointRef ?? undefined);
+        const nextWorkUnitId =
           input.workUnitId === undefined
             ? current.work_unit_id
-            : optionalText(input.workUnitId ?? undefined),
+            : optionalText(input.workUnitId ?? undefined);
+        const nextReportRouteId =
           input.reportRouteId === undefined
             ? current.report_route_id
-            : optionalText(input.reportRouteId ?? undefined),
+            : optionalText(input.reportRouteId ?? undefined);
+        const nextClaimedBy =
           input.claimedBy === undefined
             ? current.claimed_by
-            : optionalText(input.claimedBy ?? undefined),
-          input.claimExpiresAt === undefined ? current.claim_expires_at : input.claimExpiresAt,
-          input.heartbeatAt === undefined ? current.heartbeat_at : input.heartbeatAt,
-          input.metadata === undefined ? current.metadata_json : serializeJson(input.metadata),
-          input.runtimeRunId,
+            : optionalText(input.claimedBy ?? undefined);
+        const nextClaimExpiresAt =
+          input.claimExpiresAt === undefined ? current.claim_expires_at : input.claimExpiresAt;
+        const nextHeartbeatAt =
+          input.heartbeatAt === undefined ? current.heartbeat_at : input.heartbeatAt;
+        const nextMetadataJson =
+          input.metadata === undefined ? current.metadata_json : serializeJson(input.metadata);
+        if (isTerminalRunRow(current)) {
+          const isNoOp =
+            nextStatus === current.status &&
+            nextRecoveryState === current.recovery_state &&
+            isSameSqlValue(completedAt, current.completed_at) &&
+            isSameSqlValue(nextCheckpointRef, current.checkpoint_ref) &&
+            isSameSqlValue(nextWorkUnitId, current.work_unit_id) &&
+            isSameSqlValue(nextReportRouteId, current.report_route_id) &&
+            isSameSqlValue(nextClaimedBy, current.claimed_by) &&
+            isSameSqlValue(nextClaimExpiresAt, current.claim_expires_at) &&
+            isSameSqlValue(nextHeartbeatAt, current.heartbeat_at) &&
+            isSameSqlValue(nextMetadataJson, current.metadata_json);
+          return isNoOp ? rowToRun(current) : undefined;
+        }
+        executeQuery(
+          db,
+          durableDb
+            .updateTable("durable_runtime_runs")
+            .set({
+              status: nextStatus,
+              recovery_state: nextRecoveryState,
+              updated_at: now,
+              completed_at: completedAt,
+              checkpoint_ref: nextCheckpointRef,
+              work_unit_id: nextWorkUnitId,
+              report_route_id: nextReportRouteId,
+              claimed_by: nextClaimedBy,
+              claim_expires_at: nextClaimExpiresAt,
+              heartbeat_at: nextHeartbeatAt,
+              metadata_json: nextMetadataJson,
+            })
+            .where("runtime_run_id", "=", input.runtimeRunId),
         );
-        const row = db
-          .prepare("SELECT * FROM durable_runtime_runs WHERE runtime_run_id = ?")
-          .get(input.runtimeRunId) as DurableRuntimeRunRow;
-        return rowToRun(row);
+        const row = queryFirst<DurableRuntimeRunRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_runs")
+            .selectAll()
+            .where("runtime_run_id", "=", input.runtimeRunId),
+        );
+        return rowToRun(row!);
       });
     },
 
@@ -820,88 +1799,81 @@ export function openDurableRuntimeSqliteStore(options?: {
       const recordedAt = Date.now();
       const eventId = input.eventId ?? `evt_${randomUUID()}`;
       return runSqliteImmediateTransactionSync(db, () => {
-        const nextSeq = count(
+        const latestEvent = queryFirst<Pick<DurableRuntimeEventRow, "event_seq">>(
           db,
-          "SELECT COALESCE(MAX(event_seq), 0) + 1 AS count FROM durable_runtime_events WHERE runtime_run_id = ?",
-          [input.runtimeRunId],
+          durableDb
+            .selectFrom("durable_runtime_events")
+            .select("event_seq")
+            .where("runtime_run_id", "=", input.runtimeRunId)
+            .orderBy("event_seq", "desc")
+            .limit(1),
         );
-        db.prepare(
-          `INSERT INTO durable_runtime_events (
-             event_id, runtime_run_id, event_seq, event_type, event_time, step_id,
-             agent_invocation_id, tool_invocation_id, idempotency_key, payload_json,
-             payload_hash, checkpoint_ref, causation_event_id, correlation_id, recorded_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).run(
-          eventId,
-          input.runtimeRunId,
-          nextSeq,
-          input.eventType,
-          now,
-          optionalText(input.stepId),
-          optionalText(input.agentInvocationId),
-          optionalText(input.toolInvocationId),
-          optionalText(input.idempotencyKey),
-          serializeJson(input.payload),
-          optionalText(input.payloadHash),
-          optionalText(input.checkpointRef),
-          optionalText(input.causationEventId),
-          optionalText(input.correlationId),
-          recordedAt,
+        const nextSeq = (latestEvent?.event_seq ?? 0) + 1;
+        executeQuery(
+          db,
+          durableDb.insertInto("durable_runtime_events").values({
+            event_id: eventId,
+            runtime_run_id: input.runtimeRunId,
+            event_seq: nextSeq,
+            event_type: input.eventType,
+            event_time: now,
+            step_id: optionalText(input.stepId),
+            agent_invocation_id: optionalText(input.agentInvocationId),
+            tool_invocation_id: optionalText(input.toolInvocationId),
+            idempotency_key: optionalText(input.idempotencyKey),
+            payload_json: serializeJson(input.payload),
+            payload_hash: optionalText(input.payloadHash),
+            checkpoint_ref: optionalText(input.checkpointRef),
+            causation_event_id: optionalText(input.causationEventId),
+            correlation_id: optionalText(input.correlationId),
+            recorded_at: recordedAt,
+          }),
         );
-        db.prepare(
-          `UPDATE durable_runtime_runs
-              SET updated_at = ?
-            WHERE runtime_run_id = ?`,
-        ).run(recordedAt, input.runtimeRunId);
-        const row = db
-          .prepare(
-            `SELECT *
-               FROM durable_runtime_events
-              WHERE runtime_run_id = ?
-                AND event_seq = ?`,
-          )
-          .get(input.runtimeRunId, nextSeq) as DurableRuntimeEventRow;
-        return rowToEvent(row);
+        executeQuery(
+          db,
+          durableDb
+            .updateTable("durable_runtime_runs")
+            .set({ updated_at: recordedAt })
+            .where("runtime_run_id", "=", input.runtimeRunId),
+        );
+        const row = queryFirst<DurableRuntimeEventRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_events")
+            .selectAll()
+            .where("runtime_run_id", "=", input.runtimeRunId)
+            .where("event_seq", "=", nextSeq),
+        );
+        return rowToEvent(row!);
       });
     },
 
     listRuns(options?: { limit?: number }): DurableRuntimeRun[] {
       const limit = Math.max(1, Math.min(500, Math.trunc(options?.limit ?? 50)));
-      const rows = db
-        .prepare(
-          `SELECT *
-             FROM durable_runtime_runs
-            ORDER BY updated_at DESC, runtime_run_id DESC
-            LIMIT ?`,
-        )
-        .all(limit) as DurableRuntimeRunRow[];
+      const rows = queryRows<DurableRuntimeRunRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_runs")
+          .selectAll()
+          .orderBy("updated_at", "desc")
+          .orderBy("runtime_run_id", "desc")
+          .limit(limit),
+      );
       return rows.map(rowToRun);
     },
 
     listOpenRuns(options?: { operationKind?: string; limit?: number }): DurableRuntimeRun[] {
       const limit = Math.max(1, Math.min(5000, Math.trunc(options?.limit ?? 500)));
       const operationKind = optionalText(options?.operationKind);
-      const rows = operationKind
-        ? (db
-            .prepare(
-              `SELECT *
-                 FROM durable_runtime_runs
-                WHERE operation_kind = ?
-                  AND status NOT IN ('succeeded', 'failed', 'cancelled', 'lost')
-                ORDER BY updated_at ASC, runtime_run_id ASC
-                LIMIT ?`,
-            )
-            .all(operationKind, limit) as DurableRuntimeRunRow[])
-        : (db
-            .prepare(
-              `SELECT *
-                 FROM durable_runtime_runs
-                WHERE status NOT IN ('succeeded', 'failed', 'cancelled', 'lost')
-                ORDER BY updated_at ASC, runtime_run_id ASC
-                LIMIT ?`,
-            )
-            .all(limit) as DurableRuntimeRunRow[]);
-      return rows.map(rowToRun);
+      const query = durableDb
+        .selectFrom("durable_runtime_runs")
+        .selectAll()
+        .where("status", "not in", ["succeeded", "failed", "cancelled", "lost"])
+        .$if(Boolean(operationKind), (qb) => qb.where("operation_kind", "=", operationKind!))
+        .orderBy("updated_at", "asc")
+        .orderBy("runtime_run_id", "asc")
+        .limit(limit);
+      return queryRows<DurableRuntimeRunRow>(db, query).map(rowToRun);
     },
 
     claimNextRunnableRun(input: ClaimDurableRuntimeRunInput): DurableRuntimeRun | undefined {
@@ -909,47 +1881,50 @@ export function openDurableRuntimeSqliteStore(options?: {
       const claimExpiresAt = now + input.claimTtlMs;
       return runSqliteImmediateTransactionSync(db, () => {
         const operationKind = optionalText(input.operationKind);
-        const row = operationKind
-          ? (db
-              .prepare(
-                `SELECT *
-                  FROM durable_runtime_runs
-                 WHERE operation_kind = ?
-                   AND status IN ('received', 'queued')
-                    AND recovery_state IN ('runnable', 'claimed')
-                    AND (claimed_by IS NULL OR claim_expires_at IS NULL OR claim_expires_at <= ?)
-                  ORDER BY updated_at ASC, runtime_run_id ASC
-                  LIMIT 1`,
-              )
-              .get(operationKind, now) as DurableRuntimeRunRow | undefined)
-          : (db
-              .prepare(
-                `SELECT *
-                  FROM durable_runtime_runs
-                  WHERE status IN ('received', 'queued')
-                    AND recovery_state IN ('runnable', 'claimed')
-                    AND (claimed_by IS NULL OR claim_expires_at IS NULL OR claim_expires_at <= ?)
-                  ORDER BY updated_at ASC, runtime_run_id ASC
-                  LIMIT 1`,
-              )
-              .get(now) as DurableRuntimeRunRow | undefined);
+        const row = queryFirst<DurableRuntimeRunRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_runs")
+            .selectAll()
+            .$if(Boolean(operationKind), (qb) => qb.where("operation_kind", "=", operationKind!))
+            .where("status", "in", ["received", "queued"])
+            .where("recovery_state", "in", ["runnable", "claimed"])
+            .where((eb) =>
+              eb.or([
+                eb("claimed_by", "is", null),
+                eb("claim_expires_at", "is", null),
+                eb("claim_expires_at", "<=", now),
+              ]),
+            )
+            .orderBy("updated_at", "asc")
+            .orderBy("runtime_run_id", "asc")
+            .limit(1),
+        );
         if (!row) {
           return undefined;
         }
-        db.prepare(
-          `UPDATE durable_runtime_runs
-              SET status = 'queued',
-                  recovery_state = 'claimed',
-                  claimed_by = ?,
-                  claim_expires_at = ?,
-                  heartbeat_at = ?,
-                  updated_at = ?
-            WHERE runtime_run_id = ?`,
-        ).run(input.workerId, claimExpiresAt, now, now, row.runtime_run_id);
-        const claimed = db
-          .prepare("SELECT * FROM durable_runtime_runs WHERE runtime_run_id = ?")
-          .get(row.runtime_run_id) as DurableRuntimeRunRow;
-        return rowToRun(claimed);
+        executeQuery(
+          db,
+          durableDb
+            .updateTable("durable_runtime_runs")
+            .set({
+              status: "queued",
+              recovery_state: "claimed",
+              claimed_by: input.workerId,
+              claim_expires_at: claimExpiresAt,
+              heartbeat_at: now,
+              updated_at: now,
+            })
+            .where("runtime_run_id", "=", row.runtime_run_id),
+        );
+        const claimed = queryFirst<DurableRuntimeRunRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_runs")
+            .selectAll()
+            .where("runtime_run_id", "=", row.runtime_run_id),
+        );
+        return rowToRun(claimed!);
       });
     },
 
@@ -960,23 +1935,40 @@ export function openDurableRuntimeSqliteStore(options?: {
     }): DurableRuntimeRun | undefined {
       const now = input.now ?? Date.now();
       return runSqliteImmediateTransactionSync(db, () => {
-        const updateResult = db.prepare(
-          `UPDATE durable_runtime_runs
-              SET recovery_state = 'runnable',
-                  claimed_by = NULL,
-                  claim_expires_at = NULL,
-                  heartbeat_at = NULL,
-                  updated_at = ?
-            WHERE runtime_run_id = ?
-              AND claimed_by = ?`,
+        const current = queryFirst<DurableRuntimeRunRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_runs")
+            .selectAll()
+            .where("runtime_run_id", "=", input.runtimeRunId)
+            .where("claimed_by", "=", input.workerId)
+            .where("status", "not in", ["succeeded", "failed", "cancelled", "lost"])
+            .where("recovery_state", "!=", "terminal")
+            .where("completed_at", "is", null),
         );
-        const update = updateResult.run(now, input.runtimeRunId, input.workerId);
-        if (Number(update.changes ?? 0) === 0) {
+        if (!current) {
           return undefined;
         }
-        const row = db
-          .prepare("SELECT * FROM durable_runtime_runs WHERE runtime_run_id = ?")
-          .get(input.runtimeRunId) as DurableRuntimeRunRow | undefined;
+        executeQuery(
+          db,
+          durableDb
+            .updateTable("durable_runtime_runs")
+            .set({
+              recovery_state: "runnable",
+              claimed_by: null,
+              claim_expires_at: null,
+              heartbeat_at: null,
+              updated_at: now,
+            })
+            .where("runtime_run_id", "=", input.runtimeRunId),
+        );
+        const row = queryFirst<DurableRuntimeRunRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_runs")
+            .selectAll()
+            .where("runtime_run_id", "=", input.runtimeRunId),
+        );
         return row ? rowToRun(row) : undefined;
       });
     },
@@ -990,133 +1982,170 @@ export function openDurableRuntimeSqliteStore(options?: {
       return runSqliteImmediateTransactionSync(db, () => {
         const existing =
           input.idempotencyKey &&
-          (db
-            .prepare(
-              `SELECT *
-                 FROM durable_runtime_steps
-                WHERE runtime_run_id = ?
-                  AND idempotency_key = ?`,
-            )
-            .get(input.runtimeRunId, input.idempotencyKey) as DurableRuntimeStepRow | undefined);
+          queryFirst<DurableRuntimeStepRow>(
+            db,
+            durableDb
+              .selectFrom("durable_runtime_steps")
+              .selectAll()
+              .where("runtime_run_id", "=", input.runtimeRunId)
+              .where("idempotency_key", "=", input.idempotencyKey),
+          );
         if (existing) {
           return rowToStep(existing);
         }
-        db.prepare(
-          `INSERT INTO durable_runtime_steps (
-             runtime_run_id, step_id, parent_step_id, step_type, status, recovery_state,
-             attempt, max_attempts, idempotency_key, input_ref, output_ref, error_ref,
-             checkpoint_ref, claimed_by, claim_expires_at, heartbeat_at, created_at,
-             started_at, updated_at, completed_at, metadata_json
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).run(
-          input.runtimeRunId,
-          stepId,
-          optionalText(input.parentStepId),
-          input.stepType,
-          status,
-          recoveryState,
-          attempt,
-          input.maxAttempts ?? null,
-          optionalText(input.idempotencyKey),
-          optionalText(input.inputRef),
-          optionalText(input.outputRef),
-          optionalText(input.errorRef),
-          optionalText(input.checkpointRef),
-          null,
-          null,
-          null,
-          now,
-          status === "running" ? now : null,
-          now,
-          null,
-          serializeJson(input.metadata),
+        executeQuery(
+          db,
+          durableDb.insertInto("durable_runtime_steps").values({
+            runtime_run_id: input.runtimeRunId,
+            step_id: stepId,
+            parent_step_id: optionalText(input.parentStepId),
+            step_type: input.stepType,
+            status,
+            recovery_state: recoveryState,
+            attempt,
+            max_attempts: input.maxAttempts ?? null,
+            idempotency_key: optionalText(input.idempotencyKey),
+            input_ref: optionalText(input.inputRef),
+            output_ref: optionalText(input.outputRef),
+            error_ref: optionalText(input.errorRef),
+            checkpoint_ref: optionalText(input.checkpointRef),
+            claimed_by: null,
+            claim_expires_at: null,
+            heartbeat_at: null,
+            created_at: now,
+            started_at: status === "running" ? now : null,
+            updated_at: now,
+            completed_at: null,
+            metadata_json: serializeJson(input.metadata),
+          }),
         );
-        const row = db
-          .prepare("SELECT * FROM durable_runtime_steps WHERE runtime_run_id = ? AND step_id = ?")
-          .get(input.runtimeRunId, stepId) as DurableRuntimeStepRow;
-        return rowToStep(row);
+        const row = queryFirst<DurableRuntimeStepRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_steps")
+            .selectAll()
+            .where("runtime_run_id", "=", input.runtimeRunId)
+            .where("step_id", "=", stepId),
+        );
+        return rowToStep(row!);
       });
     },
 
     updateStep(input: UpdateDurableRuntimeStepInput): DurableRuntimeStep | undefined {
       const now = input.now ?? Date.now();
       return runSqliteImmediateTransactionSync(db, () => {
-        const current = db
-          .prepare("SELECT * FROM durable_runtime_steps WHERE runtime_run_id = ? AND step_id = ?")
-          .get(input.runtimeRunId, input.stepId) as DurableRuntimeStepRow | undefined;
+        const current = queryFirst<DurableRuntimeStepRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_steps")
+            .selectAll()
+            .where("runtime_run_id", "=", input.runtimeRunId)
+            .where("step_id", "=", input.stepId),
+        );
         if (!current) {
           return undefined;
         }
         const expectedClaimedBy = optionalText(input.expectedClaimedBy);
-        const updateValues: SQLInputValue[] = [
-          input.status ?? current.status,
-          input.recoveryState ?? current.recovery_state,
-          input.attempt ?? current.attempt,
-          input.maxAttempts === undefined ? current.max_attempts : input.maxAttempts,
+        const nextStatus = input.status ?? current.status;
+        const nextRecoveryState = input.recoveryState ?? current.recovery_state;
+        const nextAttempt = input.attempt ?? current.attempt;
+        const nextMaxAttempts =
+          input.maxAttempts === undefined ? current.max_attempts : input.maxAttempts;
+        const nextInputRef =
           input.inputRef === undefined
             ? current.input_ref
-            : optionalText(input.inputRef ?? undefined),
+            : optionalText(input.inputRef ?? undefined);
+        const nextOutputRef =
           input.outputRef === undefined
             ? current.output_ref
-            : optionalText(input.outputRef ?? undefined),
+            : optionalText(input.outputRef ?? undefined);
+        const nextErrorRef =
           input.errorRef === undefined
             ? current.error_ref
-            : optionalText(input.errorRef ?? undefined),
+            : optionalText(input.errorRef ?? undefined);
+        const nextCheckpointRef =
           input.checkpointRef === undefined
             ? current.checkpoint_ref
-            : optionalText(input.checkpointRef ?? undefined),
+            : optionalText(input.checkpointRef ?? undefined);
+        const nextClaimedBy =
           input.claimedBy === undefined
             ? current.claimed_by
-            : optionalText(input.claimedBy ?? undefined),
-          input.claimExpiresAt === undefined ? current.claim_expires_at : input.claimExpiresAt,
-          input.heartbeatAt === undefined ? current.heartbeat_at : input.heartbeatAt,
+            : optionalText(input.claimedBy ?? undefined);
+        const nextClaimExpiresAt =
+          input.claimExpiresAt === undefined ? current.claim_expires_at : input.claimExpiresAt;
+        const nextHeartbeatAt =
+          input.heartbeatAt === undefined ? current.heartbeat_at : input.heartbeatAt;
+        const nextStartedAt =
           input.startedAt === undefined
             ? current.started_at
             : input.startedAt === null
               ? null
-              : input.startedAt,
+              : input.startedAt;
+        const nextCompletedAt =
           input.completedAt === undefined
             ? current.completed_at
             : input.completedAt === null
               ? null
-              : input.completedAt,
-          now,
-          input.metadata === undefined ? current.metadata_json : serializeJson(input.metadata),
-          input.runtimeRunId,
-          input.stepId,
-        ];
-        if (expectedClaimedBy) {
-          updateValues.push(expectedClaimedBy);
+              : input.completedAt;
+        const nextMetadataJson =
+          input.metadata === undefined ? current.metadata_json : serializeJson(input.metadata);
+        if (isTerminalStepRow(current) && !input.allowTerminalReopen) {
+          if (expectedClaimedBy && current.claimed_by !== expectedClaimedBy) {
+            return undefined;
+          }
+          const isNoOp =
+            nextStatus === current.status &&
+            nextRecoveryState === current.recovery_state &&
+            isSameSqlValue(nextAttempt, current.attempt) &&
+            isSameSqlValue(nextMaxAttempts, current.max_attempts) &&
+            isSameSqlValue(nextInputRef, current.input_ref) &&
+            isSameSqlValue(nextOutputRef, current.output_ref) &&
+            isSameSqlValue(nextErrorRef, current.error_ref) &&
+            isSameSqlValue(nextCheckpointRef, current.checkpoint_ref) &&
+            isSameSqlValue(nextClaimedBy, current.claimed_by) &&
+            isSameSqlValue(nextClaimExpiresAt, current.claim_expires_at) &&
+            isSameSqlValue(nextHeartbeatAt, current.heartbeat_at) &&
+            isSameSqlValue(nextStartedAt, current.started_at) &&
+            isSameSqlValue(nextCompletedAt, current.completed_at) &&
+            isSameSqlValue(nextMetadataJson, current.metadata_json);
+          return isNoOp ? rowToStep(current) : undefined;
         }
-        const updateResult = db.prepare(
-          `UPDATE durable_runtime_steps
-              SET status = ?,
-                  recovery_state = ?,
-                  attempt = ?,
-                  max_attempts = ?,
-                  input_ref = ?,
-                  output_ref = ?,
-                  error_ref = ?,
-                  checkpoint_ref = ?,
-                  claimed_by = ?,
-                  claim_expires_at = ?,
-                  heartbeat_at = ?,
-                  started_at = ?,
-                  completed_at = ?,
-                  updated_at = ?,
-                  metadata_json = ?
-            WHERE runtime_run_id = ?
-              AND step_id = ?
-              ${expectedClaimedBy ? "AND claimed_by = ?" : ""}`,
-        );
-        const update = updateResult.run(...updateValues);
-        if (expectedClaimedBy && Number(update.changes ?? 0) === 0) {
+        if (expectedClaimedBy && current.claimed_by !== expectedClaimedBy) {
           return undefined;
         }
-        const row = db
-          .prepare("SELECT * FROM durable_runtime_steps WHERE runtime_run_id = ? AND step_id = ?")
-          .get(input.runtimeRunId, input.stepId) as DurableRuntimeStepRow;
-        return rowToStep(row);
+        executeQuery(
+          db,
+          durableDb
+            .updateTable("durable_runtime_steps")
+            .set({
+              status: nextStatus,
+              recovery_state: nextRecoveryState,
+              attempt: nextAttempt,
+              max_attempts: nextMaxAttempts,
+              input_ref: nextInputRef,
+              output_ref: nextOutputRef,
+              error_ref: nextErrorRef,
+              checkpoint_ref: nextCheckpointRef,
+              claimed_by: nextClaimedBy,
+              claim_expires_at: nextClaimExpiresAt,
+              heartbeat_at: nextHeartbeatAt,
+              started_at: nextStartedAt,
+              completed_at: nextCompletedAt,
+              updated_at: now,
+              metadata_json: nextMetadataJson,
+            })
+            .where("runtime_run_id", "=", input.runtimeRunId)
+            .where("step_id", "=", input.stepId),
+        );
+        const row = queryFirst<DurableRuntimeStepRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_steps")
+            .selectAll()
+            .where("runtime_run_id", "=", input.runtimeRunId)
+            .where("step_id", "=", input.stepId),
+        );
+        return rowToStep(row!);
       });
     },
 
@@ -1124,51 +2153,57 @@ export function openDurableRuntimeSqliteStore(options?: {
       const now = input.now ?? Date.now();
       const claimExpiresAt = now + input.claimTtlMs;
       return runSqliteImmediateTransactionSync(db, () => {
-        const filters: string[] = [
-          "s.status IN ('pending', 'queued')",
-          "s.recovery_state IN ('runnable', 'claimed')",
-          "(s.claimed_by IS NULL OR s.claim_expires_at IS NULL OR s.claim_expires_at <= ?)",
-          "r.status NOT IN ('succeeded', 'failed', 'cancelled', 'lost')",
-        ];
-        const values: SQLInputValue[] = [now];
         const operationKind = optionalText(input.operationKind);
-        if (operationKind) {
-          filters.push("r.operation_kind = ?");
-          values.push(operationKind);
-        }
-        if (input.stepType) {
-          filters.push("s.step_type = ?");
-          values.push(input.stepType);
-        }
-        const row = db
-          .prepare(
-            `SELECT s.*
-               FROM durable_runtime_steps s
-               JOIN durable_runtime_runs r
-                 ON r.runtime_run_id = s.runtime_run_id
-              WHERE ${filters.join(" AND ")}
-              ORDER BY s.updated_at ASC, s.runtime_run_id ASC, s.step_id ASC
-              LIMIT 1`,
-          )
-          .get(...values) as DurableRuntimeStepRow | undefined;
+        const row = queryFirst<DurableRuntimeStepRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_steps as s")
+            .innerJoin("durable_runtime_runs as r", "r.runtime_run_id", "s.runtime_run_id")
+            .selectAll("s")
+            .where("s.status", "in", ["pending", "queued"])
+            .where("s.recovery_state", "in", ["runnable", "claimed"])
+            .where((eb) =>
+              eb.or([
+                eb("s.claimed_by", "is", null),
+                eb("s.claim_expires_at", "is", null),
+                eb("s.claim_expires_at", "<=", now),
+              ]),
+            )
+            .where("r.status", "not in", ["succeeded", "failed", "cancelled", "lost"])
+            .$if(Boolean(operationKind), (qb) => qb.where("r.operation_kind", "=", operationKind!))
+            .$if(Boolean(input.stepType), (qb) => qb.where("s.step_type", "=", input.stepType!))
+            .orderBy("s.updated_at", "asc")
+            .orderBy("s.runtime_run_id", "asc")
+            .orderBy("s.step_id", "asc")
+            .limit(1),
+        );
         if (!row) {
           return undefined;
         }
-        db.prepare(
-          `UPDATE durable_runtime_steps
-              SET status = 'queued',
-                  recovery_state = 'claimed',
-                  claimed_by = ?,
-                  claim_expires_at = ?,
-                  heartbeat_at = ?,
-                  updated_at = ?
-            WHERE runtime_run_id = ?
-              AND step_id = ?`,
-        ).run(input.workerId, claimExpiresAt, now, now, row.runtime_run_id, row.step_id);
-        const claimed = db
-          .prepare("SELECT * FROM durable_runtime_steps WHERE runtime_run_id = ? AND step_id = ?")
-          .get(row.runtime_run_id, row.step_id) as DurableRuntimeStepRow;
-        return rowToStep(claimed);
+        executeQuery(
+          db,
+          durableDb
+            .updateTable("durable_runtime_steps")
+            .set({
+              status: "queued",
+              recovery_state: "claimed",
+              claimed_by: input.workerId,
+              claim_expires_at: claimExpiresAt,
+              heartbeat_at: now,
+              updated_at: now,
+            })
+            .where("runtime_run_id", "=", row.runtime_run_id)
+            .where("step_id", "=", row.step_id),
+        );
+        const claimed = queryFirst<DurableRuntimeStepRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_steps")
+            .selectAll()
+            .where("runtime_run_id", "=", row.runtime_run_id)
+            .where("step_id", "=", row.step_id),
+        );
+        return rowToStep(claimed!);
       });
     },
 
@@ -1180,287 +2215,301 @@ export function openDurableRuntimeSqliteStore(options?: {
     }): DurableRuntimeStep | undefined {
       const now = input.now ?? Date.now();
       return runSqliteImmediateTransactionSync(db, () => {
-        const updateResult = db.prepare(
-          `UPDATE durable_runtime_steps
-              SET status = CASE WHEN status = 'running' THEN 'queued' ELSE status END,
-                  recovery_state = 'runnable',
-                  claimed_by = NULL,
-                  claim_expires_at = NULL,
-                  heartbeat_at = NULL,
-                  updated_at = ?
-            WHERE runtime_run_id = ?
-              AND step_id = ?
-              AND claimed_by = ?`,
+        const current = queryFirst<DurableRuntimeStepRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_steps")
+            .selectAll()
+            .where("runtime_run_id", "=", input.runtimeRunId)
+            .where("step_id", "=", input.stepId)
+            .where("claimed_by", "=", input.workerId)
+            .where("status", "not in", ["succeeded", "failed", "cancelled", "lost", "skipped"])
+            .where("recovery_state", "!=", "terminal")
+            .where("completed_at", "is", null),
         );
-        const update = updateResult.run(now, input.runtimeRunId, input.stepId, input.workerId);
-        if (Number(update.changes ?? 0) === 0) {
+        if (!current) {
           return undefined;
         }
-        const row = db
-          .prepare("SELECT * FROM durable_runtime_steps WHERE runtime_run_id = ? AND step_id = ?")
-          .get(input.runtimeRunId, input.stepId) as DurableRuntimeStepRow | undefined;
+        executeQuery(
+          db,
+          durableDb
+            .updateTable("durable_runtime_steps")
+            .set({
+              status: current.status === "running" ? "queued" : current.status,
+              recovery_state: "runnable",
+              claimed_by: null,
+              claim_expires_at: null,
+              heartbeat_at: null,
+              updated_at: now,
+            })
+            .where("runtime_run_id", "=", input.runtimeRunId)
+            .where("step_id", "=", input.stepId),
+        );
+        const row = queryFirst<DurableRuntimeStepRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_steps")
+            .selectAll()
+            .where("runtime_run_id", "=", input.runtimeRunId)
+            .where("step_id", "=", input.stepId),
+        );
         return row ? rowToStep(row) : undefined;
       });
     },
 
     listSteps(runtimeRunId: string): DurableRuntimeStep[] {
-      const rows = db
-        .prepare(
-          `SELECT *
-             FROM durable_runtime_steps
-            WHERE runtime_run_id = ?
-            ORDER BY created_at ASC, step_id ASC`,
-        )
-        .all(runtimeRunId) as DurableRuntimeStepRow[];
+      const rows = queryRows<DurableRuntimeStepRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_steps")
+          .selectAll()
+          .where("runtime_run_id", "=", runtimeRunId)
+          .orderBy("created_at", "asc")
+          .orderBy("step_id", "asc"),
+      );
       return rows.map(rowToStep);
     },
 
     createRef(input: CreateDurableRuntimeRefInput): DurableRuntimeRef {
       const now = input.now ?? Date.now();
       const refId = input.refId ?? `ref_${randomUUID()}`;
-      db.prepare(
-        `INSERT INTO durable_runtime_refs (
-           ref_id, runtime_run_id, step_id, ref_kind, media_type, hash, storage_kind,
-           storage_uri, created_at, metadata_json
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(
-        refId,
-        input.runtimeRunId,
-        optionalText(input.stepId),
-        input.refKind,
-        optionalText(input.mediaType),
-        optionalText(input.hash),
-        input.storageKind ?? "external",
-        optionalText(input.storageUri),
-        now,
-        serializeJson(input.metadata),
+      executeQuery(
+        db,
+        durableDb.insertInto("durable_runtime_refs").values({
+          ref_id: refId,
+          runtime_run_id: input.runtimeRunId,
+          step_id: optionalText(input.stepId),
+          ref_kind: input.refKind,
+          media_type: optionalText(input.mediaType),
+          hash: optionalText(input.hash),
+          storage_kind: input.storageKind ?? "external",
+          storage_uri: optionalText(input.storageUri),
+          created_at: now,
+          metadata_json: serializeJson(input.metadata),
+        }),
       );
-      const row = db
-        .prepare("SELECT * FROM durable_runtime_refs WHERE ref_id = ?")
-        .get(refId) as DurableRuntimeRefRow;
-      return rowToRef(row);
+      const row = queryFirst<DurableRuntimeRefRow>(
+        db,
+        durableDb.selectFrom("durable_runtime_refs").selectAll().where("ref_id", "=", refId),
+      );
+      return rowToRef(row!);
     },
 
     getRef(refId: string): DurableRuntimeRef | undefined {
-      const row = db.prepare("SELECT * FROM durable_runtime_refs WHERE ref_id = ?").get(refId) as
-        | DurableRuntimeRefRow
-        | undefined;
+      const row = queryFirst<DurableRuntimeRefRow>(
+        db,
+        durableDb.selectFrom("durable_runtime_refs").selectAll().where("ref_id", "=", refId),
+      );
       return row ? rowToRef(row) : undefined;
     },
 
     listRefs(runtimeRunId: string): DurableRuntimeRef[] {
-      const rows = db
-        .prepare(
-          `SELECT *
-             FROM durable_runtime_refs
-            WHERE runtime_run_id = ?
-            ORDER BY created_at ASC, ref_id ASC`,
-        )
-        .all(runtimeRunId) as DurableRuntimeRefRow[];
+      const rows = queryRows<DurableRuntimeRefRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_refs")
+          .selectAll()
+          .where("runtime_run_id", "=", runtimeRunId)
+          .orderBy("created_at", "asc")
+          .orderBy("ref_id", "asc"),
+      );
       return rows.map(rowToRef);
     },
 
     createLink(input: CreateDurableRuntimeLinkInput): DurableRuntimeLink {
       const now = input.now ?? Date.now();
-      db.prepare(
-        `INSERT INTO durable_runtime_links (
-           parent_runtime_run_id, parent_step_id, child_runtime_run_id, link_type,
-           status, created_at, updated_at, metadata_json
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(
-        input.parentRuntimeRunId,
-        input.parentStepId,
-        input.childRuntimeRunId,
-        input.linkType,
-        input.status ?? "pending",
-        now,
-        now,
-        serializeJson(input.metadata),
+      executeQuery(
+        db,
+        durableDb.insertInto("durable_runtime_links").values({
+          parent_runtime_run_id: input.parentRuntimeRunId,
+          parent_step_id: input.parentStepId,
+          child_runtime_run_id: input.childRuntimeRunId,
+          link_type: input.linkType,
+          status: input.status ?? "pending",
+          created_at: now,
+          updated_at: now,
+          metadata_json: serializeJson(input.metadata),
+        }),
       );
-      const row = db
-        .prepare(
-          `SELECT *
-             FROM durable_runtime_links
-            WHERE parent_runtime_run_id = ?
-              AND parent_step_id = ?
-              AND child_runtime_run_id = ?`,
-        )
-        .get(
-          input.parentRuntimeRunId,
-          input.parentStepId,
-          input.childRuntimeRunId,
-        ) as DurableRuntimeLinkRow;
-      return rowToLink(row);
+      const row = queryFirst<DurableRuntimeLinkRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_links")
+          .selectAll()
+          .where("parent_runtime_run_id", "=", input.parentRuntimeRunId)
+          .where("parent_step_id", "=", input.parentStepId)
+          .where("child_runtime_run_id", "=", input.childRuntimeRunId),
+      );
+      return rowToLink(row!);
     },
 
     updateLink(input: UpdateDurableRuntimeLinkInput): DurableRuntimeLink | undefined {
       const now = input.now ?? Date.now();
       return runSqliteImmediateTransactionSync(db, () => {
-        const current = db
-          .prepare(
-            `SELECT *
-               FROM durable_runtime_links
-              WHERE parent_runtime_run_id = ?
-                AND parent_step_id = ?
-                AND child_runtime_run_id = ?`,
-          )
-          .get(input.parentRuntimeRunId, input.parentStepId, input.childRuntimeRunId) as
-          | DurableRuntimeLinkRow
-          | undefined;
+        const current = queryFirst<DurableRuntimeLinkRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_links")
+            .selectAll()
+            .where("parent_runtime_run_id", "=", input.parentRuntimeRunId)
+            .where("parent_step_id", "=", input.parentStepId)
+            .where("child_runtime_run_id", "=", input.childRuntimeRunId),
+        );
         if (!current) {
           return undefined;
         }
-        db.prepare(
-          `UPDATE durable_runtime_links
-              SET status = ?,
-                  updated_at = ?,
-                  metadata_json = ?
-            WHERE parent_runtime_run_id = ?
-              AND parent_step_id = ?
-              AND child_runtime_run_id = ?`,
-        ).run(
-          input.status ?? current.status,
-          now,
-          input.metadata === undefined ? current.metadata_json : serializeJson(input.metadata),
-          input.parentRuntimeRunId,
-          input.parentStepId,
-          input.childRuntimeRunId,
+        executeQuery(
+          db,
+          durableDb
+            .updateTable("durable_runtime_links")
+            .set({
+              status: input.status ?? current.status,
+              updated_at: now,
+              metadata_json:
+                input.metadata === undefined
+                  ? current.metadata_json
+                  : serializeJson(input.metadata),
+            })
+            .where("parent_runtime_run_id", "=", input.parentRuntimeRunId)
+            .where("parent_step_id", "=", input.parentStepId)
+            .where("child_runtime_run_id", "=", input.childRuntimeRunId),
         );
-        const row = db
-          .prepare(
-            `SELECT *
-               FROM durable_runtime_links
-              WHERE parent_runtime_run_id = ?
-                AND parent_step_id = ?
-                AND child_runtime_run_id = ?`,
-          )
-          .get(
-            input.parentRuntimeRunId,
-            input.parentStepId,
-            input.childRuntimeRunId,
-          ) as DurableRuntimeLinkRow;
-        return rowToLink(row);
+        const row = queryFirst<DurableRuntimeLinkRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_links")
+            .selectAll()
+            .where("parent_runtime_run_id", "=", input.parentRuntimeRunId)
+            .where("parent_step_id", "=", input.parentStepId)
+            .where("child_runtime_run_id", "=", input.childRuntimeRunId),
+        );
+        return rowToLink(row!);
       });
     },
 
     listChildLinks(parentRuntimeRunId: string): DurableRuntimeLink[] {
-      const rows = db
-        .prepare(
-          `SELECT *
-             FROM durable_runtime_links
-            WHERE parent_runtime_run_id = ?
-            ORDER BY created_at ASC, child_runtime_run_id ASC`,
-        )
-        .all(parentRuntimeRunId) as DurableRuntimeLinkRow[];
+      const rows = queryRows<DurableRuntimeLinkRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_links")
+          .selectAll()
+          .where("parent_runtime_run_id", "=", parentRuntimeRunId)
+          .orderBy("created_at", "asc")
+          .orderBy("child_runtime_run_id", "asc"),
+      );
       return rows.map(rowToLink);
     },
 
     listParentLinks(childRuntimeRunId: string): DurableRuntimeLink[] {
-      const rows = db
-        .prepare(
-          `SELECT *
-             FROM durable_runtime_links
-            WHERE child_runtime_run_id = ?
-            ORDER BY created_at ASC, parent_runtime_run_id ASC, parent_step_id ASC`,
-        )
-        .all(childRuntimeRunId) as DurableRuntimeLinkRow[];
+      const rows = queryRows<DurableRuntimeLinkRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_links")
+          .selectAll()
+          .where("child_runtime_run_id", "=", childRuntimeRunId)
+          .orderBy("created_at", "asc")
+          .orderBy("parent_runtime_run_id", "asc")
+          .orderBy("parent_step_id", "asc"),
+      );
       return rows.map(rowToLink);
     },
 
     createTimer(input: CreateDurableRuntimeTimerInput): DurableRuntimeTimer {
       const now = input.now ?? Date.now();
       const timerId = input.timerId ?? `timer_${randomUUID()}`;
-      db.prepare(
-        `INSERT INTO durable_runtime_timers (
-           timer_id, runtime_run_id, step_id, timer_type, due_at, status, created_at,
-           fired_at, cancelled_at, metadata_json
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(
-        timerId,
-        input.runtimeRunId,
-        optionalText(input.stepId),
-        input.timerType,
-        input.dueAt,
-        "pending",
-        now,
-        null,
-        null,
-        serializeJson(input.metadata),
+      executeQuery(
+        db,
+        durableDb.insertInto("durable_runtime_timers").values({
+          timer_id: timerId,
+          runtime_run_id: input.runtimeRunId,
+          step_id: optionalText(input.stepId),
+          timer_type: input.timerType,
+          due_at: input.dueAt,
+          status: "pending",
+          created_at: now,
+          fired_at: null,
+          cancelled_at: null,
+          metadata_json: serializeJson(input.metadata),
+        }),
       );
-      const row = db
-        .prepare("SELECT * FROM durable_runtime_timers WHERE timer_id = ?")
-        .get(timerId) as DurableRuntimeTimerRow;
-      return rowToTimer(row);
+      const row = queryFirst<DurableRuntimeTimerRow>(
+        db,
+        durableDb.selectFrom("durable_runtime_timers").selectAll().where("timer_id", "=", timerId),
+      );
+      return rowToTimer(row!);
     },
 
     updateTimer(input: UpdateDurableRuntimeTimerInput): DurableRuntimeTimer | undefined {
       const now = input.now ?? Date.now();
       return runSqliteImmediateTransactionSync(db, () => {
-        const current = db
-          .prepare("SELECT * FROM durable_runtime_timers WHERE timer_id = ?")
-          .get(input.timerId) as DurableRuntimeTimerRow | undefined;
+        const current = queryFirst<DurableRuntimeTimerRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_timers")
+            .selectAll()
+            .where("timer_id", "=", input.timerId),
+        );
         if (!current) {
           return undefined;
         }
-        db.prepare(
-          `UPDATE durable_runtime_timers
-              SET status = ?,
-                  fired_at = ?,
-                  cancelled_at = ?
-            WHERE timer_id = ?`,
-        ).run(
-          input.status,
-          input.firedAt === undefined
-            ? input.status === "fired"
-              ? now
-              : current.fired_at
-            : input.firedAt,
-          input.cancelledAt === undefined
-            ? input.status === "cancelled"
-              ? now
-              : current.cancelled_at
-            : input.cancelledAt,
-          input.timerId,
+        executeQuery(
+          db,
+          durableDb
+            .updateTable("durable_runtime_timers")
+            .set({
+              status: input.status,
+              fired_at:
+                input.firedAt === undefined
+                  ? input.status === "fired"
+                    ? now
+                    : current.fired_at
+                  : input.firedAt,
+              cancelled_at:
+                input.cancelledAt === undefined
+                  ? input.status === "cancelled"
+                    ? now
+                    : current.cancelled_at
+                  : input.cancelledAt,
+            })
+            .where("timer_id", "=", input.timerId),
         );
-        const row = db
-          .prepare("SELECT * FROM durable_runtime_timers WHERE timer_id = ?")
-          .get(input.timerId) as DurableRuntimeTimerRow;
-        return rowToTimer(row);
+        const row = queryFirst<DurableRuntimeTimerRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_timers")
+            .selectAll()
+            .where("timer_id", "=", input.timerId),
+        );
+        return rowToTimer(row!);
       });
     },
 
     listTimers(runtimeRunId?: string): DurableRuntimeTimer[] {
-      const rows = runtimeRunId
-        ? (db
-            .prepare(
-              `SELECT *
-                 FROM durable_runtime_timers
-                WHERE runtime_run_id = ?
-                ORDER BY due_at ASC, timer_id ASC`,
-            )
-            .all(runtimeRunId) as DurableRuntimeTimerRow[])
-        : (db
-            .prepare(
-              `SELECT *
-                 FROM durable_runtime_timers
-                ORDER BY due_at ASC, timer_id ASC`,
-            )
-            .all() as DurableRuntimeTimerRow[]);
+      const rows = queryRows<DurableRuntimeTimerRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_timers")
+          .selectAll()
+          .$if(Boolean(runtimeRunId), (qb) => qb.where("runtime_run_id", "=", runtimeRunId!))
+          .orderBy("due_at", "asc")
+          .orderBy("timer_id", "asc"),
+      );
       return rows.map(rowToTimer);
     },
 
     listDueTimers(now: number, options?: { limit?: number }): DurableRuntimeTimer[] {
       const limit = Math.max(1, Math.min(5000, Math.trunc(options?.limit ?? 500)));
-      const rows = db
-        .prepare(
-          `SELECT *
-             FROM durable_runtime_timers
-            WHERE status = 'pending'
-              AND due_at <= ?
-            ORDER BY due_at ASC, timer_id ASC
-            LIMIT ?`,
-        )
-        .all(now, limit) as DurableRuntimeTimerRow[];
+      const rows = queryRows<DurableRuntimeTimerRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_timers")
+          .selectAll()
+          .where("status", "=", "pending")
+          .where("due_at", "<=", now)
+          .orderBy("due_at", "asc")
+          .orderBy("timer_id", "asc")
+          .limit(limit),
+      );
       return rows.map(rowToTimer);
     },
 
@@ -1469,81 +2518,652 @@ export function openDurableRuntimeSqliteStore(options?: {
       return runSqliteImmediateTransactionSync(db, () => {
         const existing =
           input.idempotencyKey &&
-          (db
-            .prepare(
-              `SELECT *
-                 FROM durable_runtime_signals
-                WHERE runtime_run_id = ?
-                  AND idempotency_key = ?`,
-            )
-            .get(input.runtimeRunId, input.idempotencyKey) as DurableRuntimeSignalRow | undefined);
+          queryFirst<DurableRuntimeSignalRow>(
+            db,
+            durableDb
+              .selectFrom("durable_runtime_signals")
+              .selectAll()
+              .where("runtime_run_id", "=", input.runtimeRunId)
+              .where("idempotency_key", "=", input.idempotencyKey),
+          );
         if (existing) {
           return rowToSignal(existing);
         }
         const signalId = input.signalId ?? `sig_${randomUUID()}`;
-        db.prepare(
-          `INSERT INTO durable_runtime_signals (
-             signal_id, runtime_run_id, step_id, signal_type, idempotency_key, payload_ref,
-             correlation_id, received_at, consumed_at, metadata_json
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).run(
-          signalId,
-          input.runtimeRunId,
-          optionalText(input.stepId),
-          input.signalType,
-          optionalText(input.idempotencyKey),
-          optionalText(input.payloadRef),
-          optionalText(input.correlationId),
-          now,
-          null,
-          serializeJson(input.metadata),
+        executeQuery(
+          db,
+          durableDb.insertInto("durable_runtime_signals").values({
+            signal_id: signalId,
+            runtime_run_id: input.runtimeRunId,
+            step_id: optionalText(input.stepId),
+            signal_type: input.signalType,
+            idempotency_key: optionalText(input.idempotencyKey),
+            payload_ref: optionalText(input.payloadRef),
+            correlation_id: optionalText(input.correlationId),
+            received_at: now,
+            consumed_at: null,
+            metadata_json: serializeJson(input.metadata),
+          }),
         );
-        const row = db
-          .prepare("SELECT * FROM durable_runtime_signals WHERE signal_id = ?")
-          .get(signalId) as DurableRuntimeSignalRow;
-        return rowToSignal(row);
+        const row = queryFirst<DurableRuntimeSignalRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_signals")
+            .selectAll()
+            .where("signal_id", "=", signalId),
+        );
+        return rowToSignal(row!);
       });
     },
 
     consumeSignal(input: { signalId: string; now?: number }): DurableRuntimeSignal | undefined {
       const now = input.now ?? Date.now();
       return runSqliteImmediateTransactionSync(db, () => {
-        db.prepare(
-          `UPDATE durable_runtime_signals
-              SET consumed_at = COALESCE(consumed_at, ?)
-            WHERE signal_id = ?`,
-        ).run(now, input.signalId);
-        const row = db
-          .prepare("SELECT * FROM durable_runtime_signals WHERE signal_id = ?")
-          .get(input.signalId) as DurableRuntimeSignalRow | undefined;
+        const current = queryFirst<DurableRuntimeSignalRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_signals")
+            .selectAll()
+            .where("signal_id", "=", input.signalId),
+        );
+        if (!current) {
+          return undefined;
+        }
+        executeQuery(
+          db,
+          durableDb
+            .updateTable("durable_runtime_signals")
+            .set({ consumed_at: current.consumed_at ?? now })
+            .where("signal_id", "=", input.signalId),
+        );
+        const row = queryFirst<DurableRuntimeSignalRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_signals")
+            .selectAll()
+            .where("signal_id", "=", input.signalId),
+        );
         return row ? rowToSignal(row) : undefined;
       });
     },
 
     listPendingSignals(options?: { limit?: number }): DurableRuntimeSignal[] {
       const limit = Math.max(1, Math.min(5000, Math.trunc(options?.limit ?? 500)));
-      const rows = db
-        .prepare(
-          `SELECT *
-             FROM durable_runtime_signals
-            WHERE consumed_at IS NULL
-            ORDER BY received_at ASC, signal_id ASC
-            LIMIT ?`,
-        )
-        .all(limit) as DurableRuntimeSignalRow[];
+      const rows = queryRows<DurableRuntimeSignalRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_signals")
+          .selectAll()
+          .where("consumed_at", "is", null)
+          .orderBy("received_at", "asc")
+          .orderBy("signal_id", "asc")
+          .limit(limit),
+      );
       return rows.map(rowToSignal);
     },
 
     listSignals(runtimeRunId: string): DurableRuntimeSignal[] {
-      const rows = db
-        .prepare(
-          `SELECT *
-             FROM durable_runtime_signals
-            WHERE runtime_run_id = ?
-            ORDER BY received_at ASC, signal_id ASC`,
-        )
-        .all(runtimeRunId) as DurableRuntimeSignalRow[];
+      const rows = queryRows<DurableRuntimeSignalRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_signals")
+          .selectAll()
+          .where("runtime_run_id", "=", runtimeRunId)
+          .orderBy("received_at", "asc")
+          .orderBy("signal_id", "asc"),
+      );
       return rows.map(rowToSignal);
+    },
+
+    createWakeObligation(input: CreateWakeObligationInput): WakeObligation {
+      return createWakeObligationRecord(input);
+    },
+
+    updateWakeObligation(input: UpdateWakeObligationInput): WakeObligation | undefined {
+      return updateWakeObligationRecord(input);
+    },
+
+    acknowledgeWakeObligation(input: WakeObligationControlInput): WakeObligation | undefined {
+      return acknowledgeWakeObligationRecord(input);
+    },
+
+    supersedeWakeObligation(input: SupersedeWakeObligationInput): WakeObligation | undefined {
+      return supersedeWakeObligationRecord(input);
+    },
+
+    markWakeObligationDecisionRequired(
+      input: MarkWakeObligationDecisionRequiredInput,
+    ): WakeObligation | undefined {
+      return markWakeObligationDecisionRequiredRecord(input);
+    },
+
+    getWakeObligation(wakeId: string): WakeObligation | undefined {
+      return getWakeObligationRecord(wakeId);
+    },
+
+    getWakeObligationInspection(wakeId: string): WakeObligationInspection | undefined {
+      return getWakeObligationInspectionRecord(wakeId);
+    },
+
+    listWakeObligations(options?: {
+      parentRunId?: string;
+      parentSessionKey?: string;
+      targetKind?: WakeObligationTargetKind;
+      targetRef?: string;
+      ownerKind?: WakeObligationOwnerKind;
+      ownerRef?: string;
+      reportRouteRef?: string;
+      targetResolutionStatus?: WakeObligationTargetResolutionStatus;
+      status?: WakeObligationStatus;
+      limit?: number;
+    }): WakeObligation[] {
+      return listWakeObligationRecords(options);
+    },
+
+    recordUncertaintyFact(
+      input: CreateUncertaintyFactInput,
+    ): UncertaintyFact {
+      const now = input.now ?? Date.now();
+      const factId = input.factId ?? `uncertain_${randomUUID()}`;
+      const dedupeKey = optionalText(input.dedupeKey);
+      return runSqliteImmediateTransactionSync(db, () => {
+        const existing =
+          dedupeKey &&
+          queryFirst<UncertaintyFactRow>(
+            db,
+            durableDb
+              .selectFrom("durable_runtime_uncertainty_facts")
+              .selectAll()
+              .where("dedupe_key", "=", dedupeKey),
+          );
+        if (existing) {
+          return rowToUncertaintyFact(existing);
+        }
+        executeQuery(
+          db,
+          durableDb.insertInto("durable_runtime_uncertainty_facts").values({
+            fact_id: factId,
+            kind: input.kind,
+            source_run_id: optionalText(input.sourceRunId),
+            step_id: optionalText(input.stepId),
+            event_id: optionalText(input.eventId),
+            ref_id: optionalText(input.refId),
+            facts_ref: optionalText(input.factsRef),
+            dedupe_key: dedupeKey,
+            facts_json: serializeJson(input.facts),
+            status: "open",
+            resolution_kind: null,
+            resolution_ref: null,
+            resolved_at: null,
+            created_at: now,
+            updated_at: now,
+            metadata_json: serializeJson(input.metadata),
+          }),
+        );
+        const row = queryFirst<UncertaintyFactRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_uncertainty_facts")
+            .selectAll()
+            .where("fact_id", "=", factId),
+        );
+        return rowToUncertaintyFact(row!);
+      });
+    },
+
+    resolveUncertaintyFact(
+      input: ResolveUncertaintyFactInput,
+    ): UncertaintyFact | undefined {
+      const now = input.now ?? Date.now();
+      return runSqliteImmediateTransactionSync(db, () => {
+        const current = queryFirst<UncertaintyFactRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_uncertainty_facts")
+            .selectAll()
+            .where("fact_id", "=", input.factId),
+        );
+        if (!current) {
+          return undefined;
+        }
+        if (current.status !== "open") {
+          const isNoOp =
+            input.status === current.status &&
+            isSameSqlValue(optionalText(input.resolutionKind), current.resolution_kind) &&
+            isSameSqlValue(optionalText(input.resolutionRef), current.resolution_ref) &&
+            isSameSqlValue(
+              input.metadata === undefined ? current.metadata_json : serializeJson(input.metadata),
+              current.metadata_json,
+            );
+          return isNoOp ? rowToUncertaintyFact(current) : undefined;
+        }
+        executeQuery(
+          db,
+          durableDb
+            .updateTable("durable_runtime_uncertainty_facts")
+            .set({
+              status: input.status,
+              resolution_kind: optionalText(input.resolutionKind),
+              resolution_ref: optionalText(input.resolutionRef),
+              resolved_at: now,
+              updated_at: now,
+              metadata_json:
+                input.metadata === undefined
+                  ? current.metadata_json
+                  : serializeJson(input.metadata),
+            })
+            .where("fact_id", "=", input.factId),
+        );
+        const row = queryFirst<UncertaintyFactRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_uncertainty_facts")
+            .selectAll()
+            .where("fact_id", "=", input.factId),
+        );
+        return rowToUncertaintyFact(row!);
+      });
+    },
+
+    listUncertaintyFacts(options?: {
+      sourceRunId?: string;
+      status?: UncertaintyFactStatus;
+      limit?: number;
+    }): UncertaintyFact[] {
+      return storeListUncertaintyFacts(options);
+    },
+
+    recordContinuationCleanup(
+      input: RecordDurableContinuationCleanupInput,
+    ): DurableContinuationCleanupAudit {
+      const now = input.now ?? Date.now();
+      const cleanupId = input.cleanupId ?? `cleanup_${randomUUID()}`;
+      const dedupeKey = optionalText(input.dedupeKey);
+      if (!dedupeKey) {
+        throw new Error("Durable continuation cleanup requires a dedupeKey");
+      }
+      return runSqliteImmediateTransactionSync(db, () => {
+        const existing = queryFirst<DurableContinuationCleanupAuditRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_continuation_cleanup")
+            .selectAll()
+            .where("dedupe_key", "=", dedupeKey),
+        );
+        if (existing) {
+          return rowToContinuationCleanupAudit(existing);
+        }
+        executeQuery(
+          db,
+          durableDb.insertInto("durable_runtime_continuation_cleanup").values({
+            cleanup_id: cleanupId,
+            target_kind: input.targetKind,
+            target_id: input.targetId,
+            runtime_run_id: optionalText(input.runtimeRunId),
+            step_id: optionalText(input.stepId),
+            superseded_by_ref: optionalText(input.supersededByRef),
+            reason: optionalText(input.reason),
+            requested_by: optionalText(input.requestedBy),
+            dedupe_key: dedupeKey,
+            status: input.status ?? "superseded",
+            created_at: now,
+            metadata_json: serializeJson(input.metadata),
+          }),
+        );
+        const row = queryFirst<DurableContinuationCleanupAuditRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_continuation_cleanup")
+            .selectAll()
+            .where("cleanup_id", "=", cleanupId),
+        );
+        return rowToContinuationCleanupAudit(row!);
+      });
+    },
+
+    listContinuationCleanupAudit(options?: {
+      runtimeRunId?: string;
+      targetKind?: DurableContinuationCleanupTargetKind;
+      limit?: number;
+    }): DurableContinuationCleanupAudit[] {
+      const runtimeRunId = optionalText(options?.runtimeRunId);
+      const rows = queryRows<DurableContinuationCleanupAuditRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_continuation_cleanup")
+          .selectAll()
+          .$if(Boolean(runtimeRunId), (qb) => qb.where("runtime_run_id", "=", runtimeRunId!))
+          .$if(Boolean(options?.targetKind), (qb) =>
+            qb.where("target_kind", "=", options!.targetKind!),
+          )
+          .orderBy("created_at", "desc")
+          .orderBy("cleanup_id", "desc")
+          .limit(normalizeQueryLimit(options?.limit, 500)),
+      );
+      return rows.map(rowToContinuationCleanupAudit);
+    },
+
+    recordDedupeLedgerEntry(input: RecordDurableDedupeLedgerInput): DurableDedupeLedgerEntry {
+      const now = input.now ?? Date.now();
+      const ledgerId = input.ledgerId ?? `dedupe_${randomUUID()}`;
+      const dedupeKey = optionalText(input.dedupeKey);
+      if (!dedupeKey) {
+        throw new Error("Durable dedupe ledger requires a dedupeKey");
+      }
+      return runSqliteImmediateTransactionSync(db, () => {
+        const existing = queryFirst<DurableDedupeLedgerEntryRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_dedupe_ledger")
+            .selectAll()
+            .where("scope", "=", input.scope)
+            .where("dedupe_key", "=", dedupeKey),
+        );
+        if (existing) {
+          executeQuery(
+            db,
+            durableDb
+              .updateTable("durable_runtime_dedupe_ledger")
+              .set({ last_seen_at: now, hit_count: Number(existing.hit_count) + 1 })
+              .where("ledger_id", "=", existing.ledger_id),
+          );
+          const row = queryFirst<DurableDedupeLedgerEntryRow>(
+            db,
+            durableDb
+              .selectFrom("durable_runtime_dedupe_ledger")
+              .selectAll()
+              .where("ledger_id", "=", existing.ledger_id),
+          );
+          return rowToDedupeLedgerEntry(row!);
+        }
+        executeQuery(
+          db,
+          durableDb.insertInto("durable_runtime_dedupe_ledger").values({
+            ledger_id: ledgerId,
+            scope: input.scope,
+            dedupe_key: dedupeKey,
+            subject_ref: optionalText(input.subjectRef),
+            operation_kind: optionalText(input.operationKind),
+            status: input.status ?? "recorded",
+            first_seen_at: now,
+            last_seen_at: now,
+            hit_count: 1,
+            metadata_json: serializeJson(input.metadata),
+          }),
+        );
+        const row = queryFirst<DurableDedupeLedgerEntryRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_dedupe_ledger")
+            .selectAll()
+            .where("ledger_id", "=", ledgerId),
+        );
+        return rowToDedupeLedgerEntry(row!);
+      });
+    },
+
+    listDedupeLedgerEntries(options?: {
+      scope?: DurableDedupeScope;
+      status?: DurableDedupeLedgerStatus;
+      limit?: number;
+    }): DurableDedupeLedgerEntry[] {
+      const rows = queryRows<DurableDedupeLedgerEntryRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_dedupe_ledger")
+          .selectAll()
+          .$if(Boolean(options?.scope), (qb) => qb.where("scope", "=", options!.scope!))
+          .$if(Boolean(options?.status), (qb) => qb.where("status", "=", options!.status!))
+          .orderBy("last_seen_at", "desc")
+          .orderBy("ledger_id", "desc")
+          .limit(normalizeQueryLimit(options?.limit, 500)),
+      );
+      return rows.map(rowToDedupeLedgerEntry);
+    },
+
+    recordDeliveryAttemptEvidence(
+      input: RecordDeliveryAttemptEvidenceInput,
+    ): DeliveryAttemptEvidence {
+      return recordDeliveryAttemptEvidenceRecord(input);
+    },
+
+    claimDeliveryAttemptEvidence(
+      input: ClaimDeliveryAttemptEvidenceInput,
+    ): DeliveryAttemptEvidence | undefined {
+      return claimDeliveryAttemptEvidenceRecord(input);
+    },
+
+    renewDeliveryAttemptEvidenceClaim(
+      input: RenewDeliveryAttemptEvidenceClaimInput,
+    ): DeliveryAttemptEvidence | undefined {
+      return renewDeliveryAttemptEvidenceClaimRecord(input);
+    },
+
+    updateDeliveryAttemptEvidence(
+      input: UpdateDeliveryAttemptEvidenceInput,
+    ): DeliveryAttemptEvidence | undefined {
+      return updateDeliveryAttemptEvidenceRecord(input);
+    },
+
+    finalizeDeliveryAttemptEvidence(
+      input: FinalizeDeliveryAttemptEvidenceInput,
+    ): DeliveryAttemptEvidence | undefined {
+      return finalizeDeliveryAttemptEvidenceRecord(input);
+    },
+
+    supersedeDeliveryAttemptEvidence(
+      input: SupersedeDeliveryAttemptEvidenceInput,
+    ): DeliveryAttemptEvidence | undefined {
+      return supersedeDeliveryAttemptEvidenceRecord(input);
+    },
+
+    getDeliveryAttemptEvidence(deliveryAttemptId: string): DeliveryAttemptEvidence | undefined {
+      return getDeliveryAttemptEvidenceRecord(deliveryAttemptId);
+    },
+
+    listDeliveryAttemptEvidence(options?: {
+      wakeId?: string;
+      dedupeKey?: string;
+      status?: DeliveryAttemptEvidenceStatus;
+      limit?: number;
+    }): DeliveryAttemptEvidence[] {
+      return listDeliveryAttemptEvidenceRecords(options);
+    },
+
+    listPendingWakeObligations(options?: { limit?: number }): WakeObligation[] {
+      return listWakeObligationRecords({ status: "pending", limit: options?.limit });
+    },
+
+    listUnresolvedUncertaintyFacts(options?: {
+      sourceRunId?: string;
+      limit?: number;
+    }): UncertaintyFact[] {
+      return storeListUncertaintyFacts({
+        sourceRunId: options?.sourceRunId,
+        status: "open",
+        limit: options?.limit,
+      });
+    },
+
+    listUnresolvedObligations(options?: {
+      now?: number;
+      limit?: number;
+    }): DurableUnresolvedObligation[] {
+      const now = options?.now ?? Date.now();
+      const limit = normalizeQueryLimit(options?.limit, 500);
+      const wakeRows = queryRows<WakeObligationRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_wake_obligations")
+          .selectAll()
+          .where("status", "in", ["pending", "delivered", "failed"])
+          .orderBy("updated_at", "desc")
+          .orderBy("wake_id", "desc")
+          .limit(limit),
+      ).map(
+        (row): DurableUnresolvedObligationRow => ({
+          obligation_id: `wake:${row.wake_id}`,
+          kind: "pending_wake",
+          runtime_run_id: row.source_run_id,
+          step_id: null,
+          wake_id: row.wake_id,
+          uncertainty_fact_id: null,
+          subject_ref: row.facts_ref ?? row.dedupe_key,
+          reason: row.reason,
+          status: row.status,
+          created_at: row.created_at,
+          updated_at: row.updated_at,
+          metadata_json: row.metadata_json,
+        }),
+      );
+      const uncertaintyRows = queryRows<UncertaintyFactRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_uncertainty_facts")
+          .selectAll()
+          .where("status", "=", "open")
+          .orderBy("updated_at", "desc")
+          .orderBy("fact_id", "desc")
+          .limit(limit),
+      ).map(
+        (row): DurableUnresolvedObligationRow => ({
+          obligation_id: `uncertainty:${row.fact_id}`,
+          kind: "unresolved_uncertainty",
+          runtime_run_id: row.source_run_id,
+          step_id: row.step_id,
+          wake_id: null,
+          uncertainty_fact_id: row.fact_id,
+          subject_ref: row.facts_ref ?? row.ref_id ?? row.event_id ?? row.dedupe_key,
+          reason: row.kind,
+          status: row.status,
+          created_at: row.created_at,
+          updated_at: row.updated_at,
+          metadata_json: row.metadata_json,
+        }),
+      );
+      const childRows = queryRows<DurableRuntimeLinkRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_links")
+          .selectAll()
+          .where("status", "in", ["pending", "running"])
+          .orderBy("updated_at", "desc")
+          .orderBy("child_runtime_run_id", "desc")
+          .limit(limit),
+      ).map(
+        (row): DurableUnresolvedObligationRow => ({
+          obligation_id: `child:${row.parent_runtime_run_id}:${row.parent_step_id}:${row.child_runtime_run_id}`,
+          kind: "open_child",
+          runtime_run_id: row.parent_runtime_run_id,
+          step_id: row.parent_step_id,
+          wake_id: null,
+          uncertainty_fact_id: null,
+          subject_ref: row.child_runtime_run_id,
+          reason: row.link_type,
+          status: row.status,
+          created_at: row.created_at,
+          updated_at: row.updated_at,
+          metadata_json: row.metadata_json,
+        }),
+      );
+      const expiredRunClaimRows = queryRows<DurableRuntimeRunRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_runs")
+          .selectAll()
+          .where("claimed_by", "is not", null)
+          .where("claim_expires_at", "is not", null)
+          .where("claim_expires_at", "<=", now)
+          .where("status", "not in", ["succeeded", "failed", "cancelled", "lost"])
+          .orderBy("updated_at", "desc")
+          .orderBy("runtime_run_id", "desc")
+          .limit(limit),
+      ).map(
+        (row): DurableUnresolvedObligationRow => ({
+          obligation_id: `run-claim:${row.runtime_run_id}`,
+          kind: "expired_run_claim",
+          runtime_run_id: row.runtime_run_id,
+          step_id: null,
+          wake_id: null,
+          uncertainty_fact_id: null,
+          subject_ref: row.claimed_by,
+          reason: row.recovery_state,
+          status: row.status,
+          created_at: row.created_at,
+          updated_at: row.updated_at,
+          metadata_json: row.metadata_json,
+        }),
+      );
+      const expiredStepClaimRows = queryRows<DurableRuntimeStepRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_steps")
+          .selectAll()
+          .where("claimed_by", "is not", null)
+          .where("claim_expires_at", "is not", null)
+          .where("claim_expires_at", "<=", now)
+          .where("status", "not in", ["succeeded", "failed", "cancelled", "lost", "skipped"])
+          .orderBy("updated_at", "desc")
+          .orderBy("runtime_run_id", "desc")
+          .orderBy("step_id", "desc")
+          .limit(limit),
+      ).map(
+        (row): DurableUnresolvedObligationRow => ({
+          obligation_id: `step-claim:${row.runtime_run_id}:${row.step_id}`,
+          kind: "expired_step_claim",
+          runtime_run_id: row.runtime_run_id,
+          step_id: row.step_id,
+          wake_id: null,
+          uncertainty_fact_id: null,
+          subject_ref: row.claimed_by,
+          reason: row.recovery_state,
+          status: row.status,
+          created_at: row.created_at,
+          updated_at: row.updated_at,
+          metadata_json: row.metadata_json,
+        }),
+      );
+      const resultMailboxRows = queryRows<DurableRuntimeStepRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_steps")
+          .selectAll()
+          .where("step_type", "=", "result_mailbox")
+          .where("status", "not in", ["succeeded", "failed", "cancelled", "lost", "skipped"])
+          .orderBy("updated_at", "desc")
+          .orderBy("runtime_run_id", "desc")
+          .orderBy("step_id", "desc")
+          .limit(limit),
+      ).map(
+        (row): DurableUnresolvedObligationRow => ({
+          obligation_id: `result-mailbox:${row.runtime_run_id}:${row.step_id}`,
+          kind: "pending_result_mailbox",
+          runtime_run_id: row.runtime_run_id,
+          step_id: row.step_id,
+          wake_id: null,
+          uncertainty_fact_id: null,
+          subject_ref: row.idempotency_key,
+          reason: row.step_type,
+          status: row.status,
+          created_at: row.created_at,
+          updated_at: row.updated_at,
+          metadata_json: row.metadata_json,
+        }),
+      );
+      return [
+        ...wakeRows,
+        ...uncertaintyRows,
+        ...childRows,
+        ...expiredRunClaimRows,
+        ...expiredStepClaimRows,
+        ...resultMailboxRows,
+      ]
+        .toSorted((left, right) => {
+          const updated = Number(right.updated_at) - Number(left.updated_at);
+          return updated === 0 ? right.obligation_id.localeCompare(left.obligation_id) : updated;
+        })
+        .slice(0, limit)
+        .map(rowToUnresolvedObligation);
     },
 
     getTimeline(
@@ -1551,30 +3171,17 @@ export function openDurableRuntimeSqliteStore(options?: {
       timelineOptions?: DurableRuntimeTimelineOptions,
     ): DurableRuntimeEvent[] {
       const afterEventSeq = Math.max(0, Math.trunc(timelineOptions?.afterEventSeq ?? 0));
-      const rows =
-        timelineOptions?.limit === undefined && afterEventSeq === 0
-          ? (db
-              .prepare(
-                `SELECT *
-                   FROM durable_runtime_events
-                  WHERE runtime_run_id = ?
-                  ORDER BY event_seq ASC`,
-              )
-              .all(runtimeRunId) as DurableRuntimeEventRow[])
-          : (db
-              .prepare(
-                `SELECT *
-                   FROM durable_runtime_events
-                  WHERE runtime_run_id = ?
-                    AND event_seq > ?
-                  ORDER BY event_seq ASC
-                  LIMIT ?`,
-              )
-              .all(
-                runtimeRunId,
-                afterEventSeq,
-                normalizeQueryLimit(timelineOptions?.limit, 500),
-              ) as DurableRuntimeEventRow[]);
+      const shouldLimit = timelineOptions?.limit !== undefined || afterEventSeq !== 0;
+      const rows = queryRows<DurableRuntimeEventRow>(
+        db,
+        durableDb
+          .selectFrom("durable_runtime_events")
+          .selectAll()
+          .where("runtime_run_id", "=", runtimeRunId)
+          .$if(afterEventSeq !== 0, (qb) => qb.where("event_seq", ">", afterEventSeq))
+          .orderBy("event_seq", "asc")
+          .$if(shouldLimit, (qb) => qb.limit(normalizeQueryLimit(timelineOptions?.limit, 500))),
+      );
       return rows.map(rowToEvent);
     },
 
@@ -1582,9 +3189,13 @@ export function openDurableRuntimeSqliteStore(options?: {
       const keepLastEvents = normalizeQueryLimit(input.keepLastEvents, 200);
       const now = input.now ?? Date.now();
       return runSqliteImmediateTransactionSync(db, () => {
-        const run = db
-          .prepare("SELECT * FROM durable_runtime_runs WHERE runtime_run_id = ?")
-          .get(input.runtimeRunId) as DurableRuntimeRunRow | undefined;
+        const run = queryFirst<DurableRuntimeRunRow>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_runs")
+            .selectAll()
+            .where("runtime_run_id", "=", input.runtimeRunId),
+        );
         if (!run || !isTerminalRunStatus(run.status)) {
           return {
             runtimeRunId: input.runtimeRunId,
@@ -1594,8 +3205,10 @@ export function openDurableRuntimeSqliteStore(options?: {
         }
         const totalEvents = count(
           db,
-          "SELECT COUNT(*) AS count FROM durable_runtime_events WHERE runtime_run_id = ?",
-          [input.runtimeRunId],
+          durableDb
+            .selectFrom("durable_runtime_events")
+            .select((eb) => eb.fn.countAll<number>().as("count"))
+            .where("runtime_run_id", "=", input.runtimeRunId),
         );
         if (totalEvents <= keepLastEvents) {
           return {
@@ -1604,17 +3217,16 @@ export function openDurableRuntimeSqliteStore(options?: {
             removedEvents: 0,
           };
         }
-        const cutoff = db
-          .prepare(
-            `SELECT event_seq
-               FROM durable_runtime_events
-              WHERE runtime_run_id = ?
-              ORDER BY event_seq DESC
-              LIMIT 1 OFFSET ?`,
-          )
-          .get(input.runtimeRunId, keepLastEvents - 1) as
-          | { event_seq: number | bigint }
-          | undefined;
+        const cutoff = queryFirst<{ event_seq: number | bigint }>(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_events")
+            .select("event_seq")
+            .where("runtime_run_id", "=", input.runtimeRunId)
+            .orderBy("event_seq", "desc")
+            .limit(1)
+            .offset(keepLastEvents - 1),
+        );
         const cutoffSeq = Number(cutoff?.event_seq ?? 0);
         if (cutoffSeq <= 1) {
           return {
@@ -1623,14 +3235,13 @@ export function openDurableRuntimeSqliteStore(options?: {
             removedEvents: 0,
           };
         }
-        const deleteResult = db
-          .prepare(
-            `DELETE FROM durable_runtime_events
-              WHERE runtime_run_id = ?
-                AND event_seq < ?`,
-          )
-          .run(input.runtimeRunId, cutoffSeq);
-        const removedEvents = Number(deleteResult.changes ?? 0);
+        const removedEvents = executeQuery(
+          db,
+          durableDb
+            .deleteFrom("durable_runtime_events")
+            .where("runtime_run_id", "=", input.runtimeRunId)
+            .where("event_seq", "<", cutoffSeq),
+        );
         if (removedEvents <= 0) {
           return {
             runtimeRunId: input.runtimeRunId,
@@ -1639,37 +3250,38 @@ export function openDurableRuntimeSqliteStore(options?: {
           };
         }
         const nextSeq =
-          count(
+          (queryFirst<Pick<DurableRuntimeEventRow, "event_seq">>(
             db,
-            "SELECT COALESCE(MAX(event_seq), 0) AS count FROM durable_runtime_events WHERE runtime_run_id = ?",
-            [input.runtimeRunId],
-          ) + 1;
-        db.prepare(
-          `INSERT INTO durable_runtime_events (
-             event_id, runtime_run_id, event_seq, event_type, event_time, step_id,
-             agent_invocation_id, tool_invocation_id, idempotency_key, payload_json,
-             payload_hash, checkpoint_ref, causation_event_id, correlation_id, recorded_at
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).run(
-          `evt_${randomUUID()}`,
-          input.runtimeRunId,
-          nextSeq,
-          "runtime.history.compacted",
-          now,
-          null,
-          null,
-          null,
-          null,
-          serializeJson({
-            removedEvents,
-            keptLastEvents: keepLastEvents,
-            compactedBeforeEventSeq: cutoffSeq,
+            durableDb
+              .selectFrom("durable_runtime_events")
+              .select("event_seq")
+              .where("runtime_run_id", "=", input.runtimeRunId)
+              .orderBy("event_seq", "desc")
+              .limit(1),
+          )?.event_seq ?? 0) + 1;
+        executeQuery(
+          db,
+          durableDb.insertInto("durable_runtime_events").values({
+            event_id: `evt_${randomUUID()}`,
+            runtime_run_id: input.runtimeRunId,
+            event_seq: nextSeq,
+            event_type: "runtime.history.compacted",
+            event_time: now,
+            step_id: null,
+            agent_invocation_id: null,
+            tool_invocation_id: null,
+            idempotency_key: null,
+            payload_json: serializeJson({
+              removedEvents,
+              keptLastEvents: keepLastEvents,
+              compactedBeforeEventSeq: cutoffSeq,
+            }),
+            payload_hash: null,
+            checkpoint_ref: null,
+            causation_event_id: null,
+            correlation_id: null,
+            recorded_at: now,
           }),
-          null,
-          null,
-          null,
-          null,
-          now,
         );
         return {
           runtimeRunId: input.runtimeRunId,
@@ -1682,22 +3294,56 @@ export function openDurableRuntimeSqliteStore(options?: {
     getStats(): DurableRuntimeStoreStats {
       return {
         path: pathname,
-        schemaVersion: getDurableRuntimeSchemaVersion(db),
-        runs: count(db, "SELECT COUNT(*) AS count FROM durable_runtime_runs"),
-        events: count(db, "SELECT COUNT(*) AS count FROM durable_runtime_events"),
-        steps: count(db, "SELECT COUNT(*) AS count FROM durable_runtime_steps"),
+        schemaVersion: OPENCLAW_STATE_SCHEMA_VERSION,
+        runs: count(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_runs")
+            .select((eb) => eb.fn.countAll<number>().as("count")),
+        ),
+        events: count(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_events")
+            .select((eb) => eb.fn.countAll<number>().as("count")),
+        ),
+        steps: count(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_steps")
+            .select((eb) => eb.fn.countAll<number>().as("count")),
+        ),
         openRuns: count(
           db,
-          "SELECT COUNT(*) AS count FROM durable_runtime_runs WHERE status NOT IN ('succeeded', 'failed', 'cancelled', 'lost')",
+          durableDb
+            .selectFrom("durable_runtime_runs")
+            .select((eb) => eb.fn.countAll<number>().as("count"))
+            .where("status", "not in", ["succeeded", "failed", "cancelled", "lost"]),
+        ),
+        pendingWakes: count(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_wake_obligations")
+            .select((eb) => eb.fn.countAll<number>().as("count"))
+            .where("status", "in", ["pending", "delivered", "failed"]),
+        ),
+        unresolvedUncertaintyFacts: count(
+          db,
+          durableDb
+            .selectFrom("durable_runtime_uncertainty_facts")
+            .select((eb) => eb.fn.countAll<number>().as("count"))
+            .where("status", "=", "open"),
         ),
       };
     },
 
     close(): void {
-      walMaintenance.close();
-      if (db.isOpen) {
-        db.close();
+      if (closed) {
+        return;
       }
+      closed = true;
+      stateDatabaseLease.release();
+      closeOpenClawStateDatabaseForPath({ env, path: pathname });
     },
   };
 }
