@@ -63,10 +63,71 @@ Observed results:
 Review follow-up validation after restoring the pairing QR sensitive-display
 path:
 
+- Reviewer follow-up validation after restoring default `sessions_spawn`
+  prompt guidance, rerun on 2026-07-03:
+  - Addressed reviewer P2: ordinary durable-disabled prompts again include the
+    current-main line ``Larger work: use `sessions_spawn`; completion is
+push-based.``
+  - Durable-specific `Sub-agent orchestration` wording remains gated behind an
+    explicit durable orchestration policy or durable runtime enablement.
+  - Regression proof: `src/agents/system-prompt.test.ts` asserts the default
+    prompt contains the larger-work `sessions_spawn` guidance, while existing
+    tests continue to assert durable orchestration guidance appears only for the
+    enabled paths.
+  - `node scripts/run-vitest.mjs run --config test/vitest/vitest.agents-core.config.ts src/agents/system-prompt.test.ts`
+    - 1 file, 92 tests passed.
+  - `git diff --check`
+    - passed.
+- Reviewer follow-up validation after restoring current-main ACP task ownership
+  and terminal session cleanup invariants, rerun on 2026-07-02:
+  - Addressed reviewer P1: confirmed backend ACP manual-spawn child turns no
+    longer create duplicate Gateway CLI task rows when ACP metadata proves the
+    spawn control plane already owns the requester-visible task.
+  - Addressed reviewer P2: visible requests that reuse recoverable terminal
+    `failed`, `timeout`, or `killed` sessions now clear stale status, timing,
+    runtime, and abort fields without rotating the valid session id.
+  - Regression proof: `src/gateway/server-methods/agent.test.ts` covers
+    confirmed ACP suppression, fallback tracking for unsafe ACP-shaped cases,
+    plugin-subagent precedence, and terminal reuse cleanup for all three
+    recoverable terminal statuses.
+  - `node scripts/run-vitest.mjs run --config test/vitest/vitest.gateway.config.ts src/gateway/server-methods/agent.test.ts`
+    - 2 files, 350 tests passed.
+  - `node scripts/run-vitest.mjs run --config test/vitest/vitest.gateway.config.ts src/gateway/server-chat.agent-events.test.ts`
+    - 1 file, 99 tests passed.
+  - `node scripts/run-vitest.mjs run --config test/vitest/vitest.gateway.config.ts src/gateway/server-methods/durable.test.ts src/gateway/server-methods/chat-history-omission-logging.test.ts src/gateway/session-utils.fs.test.ts`
+    - 7 files, 293 tests passed.
+  - `node scripts/run-vitest.mjs run --config test/vitest/vitest.agents-core.config.ts src/agents/system-prompt.test.ts`
+    - 1 file, 92 tests passed.
+  - `git diff --check`
+    - passed.
+- Reviewer follow-up validation after gating durable orchestration prompt
+  guidance, rerun on 2026-07-02 after rebasing onto PR2 foundation commit
+  `cb0a5b5a9b`:
+  - Addressed reviewer P1: default subagent prompt guidance no longer changes
+    on ordinary upgrade. Durable orchestration wording is rendered only when
+    `durableOrchestrationPolicy` is explicitly passed, when
+    `OPENCLAW_DURABLE_ORCHESTRATION_POLICY` is set, or when
+    `OPENCLAW_DURABLE_RUNTIME=1`.
+  - Regression proof: `src/agents/system-prompt.test.ts` verifies the default
+    prompt omits the durable `Sub-agent orchestration` guidance, explicit policy
+    renders it, and enabling durable runtime renders it with `sessions_yield`
+    guidance when that tool is available.
+  - `node scripts/run-vitest.mjs run --config test/vitest/vitest.agents-core.config.ts src/agents/system-prompt.test.ts`
+    - 1 file, 92 tests passed.
+  - `node scripts/run-vitest.mjs run --config test/vitest/vitest.gateway.config.ts src/gateway/server-methods/durable.test.ts src/gateway/server-methods/chat-history-omission-logging.test.ts src/gateway/session-utils.fs.test.ts`
+    - 7 files, 293 tests passed.
+  - `node scripts/run-vitest.mjs run --config test/vitest/vitest.unit.config.ts src/durable/fan-in.test.ts src/durable/subagent.test.ts src/durable/agent-turn.test.ts src/durable/startup.test.ts`
+    - 4 files, 16 tests passed.
+  - `npm run tsgo:core`
+    - passed.
+  - `node scripts/generate-docs-map.mjs --check`
+    - passed with `docs/docs_map.md is up to date`.
+  - `git diff --check`
+    - passed.
 - Reviewer follow-up validation after preserving oversized-history
   `idempotencyKey`, rerun on 2026-07-02 after rebasing onto the refreshed PR2
   foundation branch:
-  - Code fix commit: `62057d4654` (`fix(gateway): preserve oversized history
+  - Code fix commit after latest rebase: `6b90e27a00` (`fix(gateway): preserve oversized history
 idempotency keys`). Later proof-doc updates are docs-only.
   - Addressed reviewer P2: `buildOversizedHistoryPlaceholder` now carries
     `__openclaw.idempotencyKey` into the oversized placeholder metadata along
@@ -88,6 +149,29 @@ idempotency keys`). Later proof-doc updates are docs-only.
   - 2 files, 262 tests passed.
 - `node scripts/run-vitest.mjs run --config test/vitest/vitest.unit.config.ts src/durable/fan-in.test.ts src/durable/subagent.test.ts src/durable/agent-turn.test.ts`
   - 3 files, 14 tests passed.
+- Reviewer follow-up validation after restoring current-main ACP and terminal
+  session invariants, rerun on 2026-07-03:
+  - ACP manual-spawn CLI task suppression is now limited to the trusted
+    in-process `gateway-client` backend caller, excludes device-token auth, and
+    still requires persisted ACP child metadata. Device-token backend and
+    operator-write ACP-shaped calls keep CLI task tracking.
+  - Reused failed/timeout/killed terminal session state is cleared only for
+    visible user requests. Heartbeat internal reuse preserves terminal status,
+    timing, and abort markers.
+  - `node scripts/run-vitest.mjs run --config test/vitest/vitest.gateway.config.ts src/gateway/server-methods/agent.test.ts`
+    - 2 files, 358 tests passed.
+  - `node scripts/run-vitest.mjs run --config test/vitest/vitest.gateway.config.ts src/gateway/server-chat.agent-events.test.ts`
+    - 1 file, 99 tests passed.
+  - `node scripts/run-vitest.mjs run --config test/vitest/vitest.gateway.config.ts src/gateway/server-methods/durable.test.ts src/gateway/server-methods/chat-history-omission-logging.test.ts src/gateway/session-utils.fs.test.ts`
+    - 7 files, 293 tests passed.
+  - `node scripts/run-vitest.mjs run --config test/vitest/vitest.agents-core.config.ts src/agents/system-prompt.test.ts`
+    - 1 file, 92 tests passed.
+  - `node scripts/generate-docs-map.mjs --check`
+    - passed with `docs/docs_map.md is up to date`.
+  - `./node_modules/.bin/oxfmt --check --threads=1 src/gateway/server-methods/agent.ts src/gateway/server-methods/agent.test.ts`
+    - passed.
+  - `git diff --check`
+    - passed.
 
 ## Typecheck and Schema Proof
 
