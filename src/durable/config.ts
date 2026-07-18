@@ -26,6 +26,14 @@ export function isDurableWorkerEnabled(env: NodeJS.ProcessEnv = process.env): bo
   );
 }
 
+export function isDurableAuthorityEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return isDurableWorkerEnabled(env);
+}
+
+export function isDurableObservationEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return isDurableRuntimesEnabled(env) && !isDurableAuthorityEnabled(env);
+}
+
 export function resolveDurableWorkerPollIntervalMs(env: NodeJS.ProcessEnv = process.env): number {
   return (
     parsePositiveInteger(env.OPENCLAW_DURABLE_WORKER_POLL_INTERVAL_MS) ??

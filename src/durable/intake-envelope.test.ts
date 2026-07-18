@@ -6,7 +6,8 @@ describe("durable intake envelope", () => {
     const envelope = buildDurableIntakeEnvelope({
       operationKind: "openclaw.agent.turn",
       runId: "run-1",
-      sourceType: "agent.turn",
+      sourceOwner: "session_store",
+      sourceRef: "agent:bo:main",
       sessionKey: "agent:bo:main",
       message: "hello durable world",
       messageHash: "hash-1",
@@ -37,7 +38,8 @@ describe("durable intake envelope", () => {
     const envelope = buildDurableIntakeEnvelope({
       operationKind: "openclaw.chat.send",
       runId: "run-2",
-      sourceType: "chat.send",
+      sourceOwner: "session_store",
+      sourceRef: "agent:bo:main",
       sessionKey: "agent:bo:main",
       message: "please continue",
       messageHash: "hash-2",
@@ -58,7 +60,8 @@ describe("durable intake envelope", () => {
     const envelope = buildDurableIntakeEnvelope({
       operationKind: "openclaw.agent.turn",
       runId: "run-3",
-      sourceType: "agent.turn",
+      sourceOwner: "session_store",
+      sourceRef: "agent:bo:main",
       sessionKey: "agent:bo:main",
       message: "summarize the linked task",
       messageHash: "hash-3",

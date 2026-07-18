@@ -18,6 +18,7 @@ create, or migrate the shared state database.
 
 ```bash
 OPENCLAW_DURABLE_RUNTIME=1 openclaw durable stats
+OPENCLAW_DURABLE_RUNTIME=1 openclaw durable health
 OPENCLAW_DURABLE_RUNTIME=1 openclaw durable runs
 OPENCLAW_DURABLE_RUNTIME=1 openclaw durable runs --limit 25 --json
 OPENCLAW_DURABLE_RUNTIME=1 openclaw durable show <runtimeRunId>
@@ -30,11 +31,22 @@ OPENCLAW_DURABLE_RUNTIME=1 openclaw durable signals <runtimeRunId>
 OPENCLAW_DURABLE_RUNTIME=1 openclaw durable refs <runtimeRunId>
 OPENCLAW_DURABLE_RUNTIME=1 openclaw durable timers <runtimeRunId>
 OPENCLAW_DURABLE_RUNTIME=1 openclaw durable coordination <runtimeRunId>
+OPENCLAW_DURABLE_RUNTIME=1 openclaw durable obligations list --limit 50
+OPENCLAW_DURABLE_RUNTIME=1 openclaw durable wakes list --limit 50
+OPENCLAW_DURABLE_RUNTIME=1 openclaw durable wakes inspect <wakeId>
+OPENCLAW_DURABLE_RUNTIME=1 openclaw durable wakes acknowledge <wakeId> --reason <text>
+OPENCLAW_DURABLE_RUNTIME=1 openclaw durable wakes resume <wakeId> --reason <text>
+OPENCLAW_DURABLE_RUNTIME=1 openclaw durable wakes supersede <wakeId> --reason <text>
+OPENCLAW_DURABLE_RUNTIME=1 openclaw durable uncertainty list --limit 50
+OPENCLAW_DURABLE_RUNTIME=1 openclaw durable uncertainty resolve <factId> --kind <kind>
+OPENCLAW_DURABLE_RUNTIME=1 openclaw durable delivery-attempts list <wakeId> --limit 50
 ```
 
 ## Commands
 
 - `stats`: show the durable runtime store path and row counts.
+- `health`: show enablement, authority mode, process health, and bounded store
+  health counters.
 - `runs`: list recent runtime runs.
 - `show`: show one run with steps, links, signals, and timeline.
 - `timeline`: show ordered durable runtime events for one run.
@@ -48,8 +60,25 @@ OPENCLAW_DURABLE_RUNTIME=1 openclaw durable coordination <runtimeRunId>
 - `timers`: show timers for one run.
 - `coordination`: show a bounded coordination projection for task or session
   runtime consumers.
+- `obligations list`: list unresolved work projected from canonical source owners,
+  wake obligations, uncertainty facts, child correlations, and expired leases.
+- `wakes list`: list wake obligations with source owner and source reference.
+- `wakes inspect`: inspect one wake, including target resolution, delivery
+  attempts, and unresolved uncertainty.
+- `wakes acknowledge`: record that the target consumed a wake.
+- `wakes resume`: return an explicitly suspended wake to pending dispatch.
+- `wakes supersede`: close a wake with an explicit operator decision.
+- `uncertainty list`: list unresolved uncertainty facts.
+- `uncertainty resolve`: resolve or supersede one uncertainty fact with a
+  required resolution kind and optional evidence reference.
+- `delivery-attempts list`: list delivery evidence for one wake obligation.
 
-All commands support `--json`. `runs` also supports `--limit <count>`.
+All commands support `--json`. `runs` and the new `list` commands also support
+`--limit <count>`.
+
+Wake controls accept `--expected-source-revision <revision>`, and uncertainty
+resolution accepts `--expected-updated-at <timestamp>`, to reject stale
+operator decisions after the inspected source changes.
 
 ## Enablement And Storage
 
@@ -70,24 +99,17 @@ queries.
 
 ## Environment Variables
 
-| Variable                                     | Default    | Purpose                                                                                                        |
-| -------------------------------------------- | ---------- | -------------------------------------------------------------------------------------------------------------- |
-| `OPENCLAW_DURABLE_RUNTIME`                   | disabled   | Enables the durable runtime when set to `1`, `true`, `yes`, or `on`.                                           |
-| `OPENCLAW_DURABLE_RUNTIME_STORE`             | `sqlite`   | Selects the durable store backend. Only `sqlite` is supported in this slice.                                   |
-| `OPENCLAW_DURABLE_WORKER`                    | disabled   | Starts the recovery worker only when the durable runtime is also enabled.                                      |
-| `OPENCLAW_DURABLE_WORKER_POLL_INTERVAL_MS`   | `1000`     | Worker poll interval.                                                                                          |
-| `OPENCLAW_DURABLE_WORKER_CLAIM_TTL_MS`       | `300000`   | Claim lease time for worker-owned runs or steps.                                                               |
-| `OPENCLAW_DURABLE_WORKER_MAX_CONCURRENCY`    | `1`        | Maximum worker concurrency for this local-first slice.                                                         |
-| `OPENCLAW_DURABLE_RECOVERY_INTERVAL_MS`      | `60000`    | Recovery reconciliation interval.                                                                              |
-| `OPENCLAW_DURABLE_STALE_AGENT_TURN_AFTER_MS` | `21600000` | Age after which an unfinished agent turn can be marked lost by recovery.                                       |
-| `OPENCLAW_DURABLE_AGENT_TURN_HEARTBEAT_MS`   | `30000`    | Agent turn heartbeat interval. Set `0` to disable the heartbeat timer.                                         |
-| `OPENCLAW_DURABLE_ORCHESTRATION_POLICY`      | disabled   | Opt-in prompt guidance for subagent orchestration: `auto`, `solo_first`, `parallel_first`, or `manual_fanout`. |
-| `OPENCLAW_DURABLE_INPUT_PREVIEW_CHARS`       | `600`      | Maximum input preview characters stored by default. Set `0` to store metadata only.                            |
-| `OPENCLAW_DURABLE_INPUT_TEXT`                | disabled   | Store full input text inline only when set to `full` or `inline`.                                              |
-| `OPENCLAW_DURABLE_INPUT_FULL_MAX_CHARS`      | `16384`    | Maximum full input text characters stored when full input retention is enabled.                                |
-
-When `OPENCLAW_DURABLE_ORCHESTRATION_POLICY` is unset, durable orchestration
-prompt guidance is enabled only when `OPENCLAW_DURABLE_RUNTIME` is enabled.
+| Variable                                   | Default  | Purpose                                                                             |
+| ------------------------------------------ | -------- | ----------------------------------------------------------------------------------- |
+| `OPENCLAW_DURABLE_RUNTIME`                 | disabled | Enables the durable runtime when set to `1`, `true`, `yes`, or `on`.                |
+| `OPENCLAW_DURABLE_RUNTIME_STORE`           | `sqlite` | Selects the durable store backend. Only `sqlite` is supported in this slice.        |
+| `OPENCLAW_DURABLE_WORKER`                  | disabled | Starts the recovery worker only when the durable runtime is also enabled.           |
+| `OPENCLAW_DURABLE_WORKER_POLL_INTERVAL_MS` | `1000`   | Worker poll interval.                                                               |
+| `OPENCLAW_DURABLE_WORKER_CLAIM_TTL_MS`     | `300000` | Claim lease time for worker-owned runs or steps.                                    |
+| `OPENCLAW_DURABLE_WORKER_MAX_CONCURRENCY`  | `1`      | Maximum worker concurrency for this local-first slice.                              |
+| `OPENCLAW_DURABLE_INPUT_PREVIEW_CHARS`     | `600`    | Maximum input preview characters stored by default. Set `0` to store metadata only. |
+| `OPENCLAW_DURABLE_INPUT_TEXT`              | disabled | Store full input text inline only when set to `full` or `inline`.                   |
+| `OPENCLAW_DURABLE_INPUT_FULL_MAX_CHARS`    | `16384`  | Maximum full input text characters stored when full input retention is enabled.     |
 
 ## Retention And Privacy
 
@@ -97,11 +119,14 @@ They do not store full user input unless `OPENCLAW_DURABLE_INPUT_TEXT=full` or
 privacy can set `OPENCLAW_DURABLE_INPUT_PREVIEW_CHARS=0` to store metadata only.
 
 The durable runtime records enough identity, status, recovery state, and state
-refs to inspect where work stopped. It does not make automatic retry or resume
-decisions by itself in this foundation slice.
+refs to inspect where work stopped. With `OPENCLAW_DURABLE_WORKER=1`, it also
+acts as the fail-closed authority for accepted agent/chat intake and dispatches
+source-backed attention through canonical subagent and task owner APIs. It does
+not replay an external side effect whose outcome is unknown.
 
 ## Related
 
 - [Gateway protocol](/gateway/protocol#durable-coordination-rpcs)
-- [Durable Session and Task Runtime RFC](/specs/durable-session-task-runtime-rfc)
+- [Durable core architecture](/specs/durable-core-architecture)
+- [Upstream 7.1 gap analysis](/specs/durable-core-upstream-7.1-gap-analysis)
 - [CLI reference](/cli)

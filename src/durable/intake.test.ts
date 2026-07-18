@@ -28,7 +28,7 @@ describe("durable runtime intake", () => {
         operationKind: "frontdoor.runtime",
         idempotencyKey: "message-1",
         requestHash: "hash-1",
-        sourceType: "gateway",
+        sourceOwner: "gateway",
         sourceRef: "channel:main",
         messageId: "message-1",
         input: {
@@ -51,7 +51,7 @@ describe("durable runtime intake", () => {
         operationKind: "frontdoor.runtime",
         idempotencyKey: "message-1",
         requestHash: "hash-1",
-        sourceType: "gateway",
+        sourceOwner: "gateway",
         sourceRef: "channel:main",
         messageId: "message-1",
         input: {
@@ -74,7 +74,7 @@ describe("durable runtime intake", () => {
         operationKind: "frontdoor.runtime",
         status: "received",
         recoveryState: "runnable",
-        sourceType: "gateway",
+        sourceOwner: "gateway",
         sourceRef: "channel:main",
         messageId: "message-1",
         inputRef: first.inputRef?.refId,

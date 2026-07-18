@@ -3,7 +3,6 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { resolveDurableRuntimeSqlitePath } from "../durable/config.js";
-import { buildDurableFanInGroupId } from "../durable/fan-in.js";
 import { openDurableRuntimeStore } from "../durable/store-factory.js";
 import { resolveSqliteDatabaseFilePaths } from "../infra/sqlite-files.js";
 import { durableCommand } from "./durable.js";
@@ -61,6 +60,59 @@ describe("durableCommand", () => {
     }
   });
 
+  it("lists and inspects source-backed obligations", async () => {
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-cli-obligations-"));
+    const env = {
+      OPENCLAW_STATE_DIR: stateDir,
+      OPENCLAW_DURABLE_RUNTIME: "1",
+    };
+    const wakeId = (() => {
+      const store = openDurableRuntimeStore({ env });
+      try {
+        return store.createWakeObligation({
+          sourceOwner: "subagent_runs",
+          sourceRef: "subagent-cli-1",
+          targetKind: "agent_session",
+          targetRef: "agent:test:main",
+          ownerKind: "agent_session",
+          ownerRef: "agent:test:main",
+          targetResolutionStatus: "resolved",
+          reason: "child_terminal",
+          dedupeKey: "subagent-terminal:subagent-cli-1:agent:test:main",
+          now: 100,
+        }).wakeId;
+      } finally {
+        store.close();
+      }
+    })();
+
+    try {
+      const listCapture = createRuntimeCapture();
+      await durableCommand(
+        { action: "obligations", env, json: true, limit: 10 },
+        listCapture.runtime,
+      );
+      expect(JSON.parse(listCapture.logs[0] ?? "[]")).toEqual([
+        expect.objectContaining({
+          wakeId,
+          sourceOwner: "subagent_runs",
+          sourceRef: "subagent-cli-1",
+        }),
+      ]);
+
+      const inspectCapture = createRuntimeCapture();
+      await durableCommand(
+        { action: "wake", runtimeRunId: wakeId, env, json: true },
+        inspectCapture.runtime,
+      );
+      expect(JSON.parse(inspectCapture.logs[0] ?? "{}")).toMatchObject({
+        wake: { wakeId, sourceOwner: "subagent_runs", sourceRef: "subagent-cli-1" },
+      });
+    } finally {
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
   it("explains why a run is waiting on child work", async () => {
     const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-cli-why-"));
     const env = {
@@ -74,6 +126,7 @@ describe("durableCommand", () => {
           operationKind: "test.parent",
           status: "waiting_child",
           recoveryState: "waiting_child",
+          sourceOwner: "test",
           sourceRef: "agent:test:main",
           now: 100,
         });
@@ -87,6 +140,7 @@ describe("durableCommand", () => {
         });
         const child = store.createRun({
           operationKind: "test.child",
+          rootOperationReason: "test-root",
           status: "running",
           recoveryState: "running",
           parentRuntimeRunId: parent.runtimeRunId,
@@ -121,7 +175,7 @@ describe("durableCommand", () => {
     }
   });
 
-  it("renders fan-in group and result mailbox diagnostics in show output", async () => {
+  it("renders fan-in group diagnostics in show output", async () => {
     const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-cli-show-"));
     const env = {
       OPENCLAW_STATE_DIR: stateDir,
@@ -134,14 +188,12 @@ describe("durableCommand", () => {
           operationKind: "test.parent",
           status: "waiting_child",
           recoveryState: "waiting_child",
+          sourceOwner: "test",
           sourceRef: "agent:test:main",
           now: 100,
         });
         const parentStepId = "children";
-        const fanInGroupId = buildDurableFanInGroupId({
-          parentRuntimeRunId: parent.runtimeRunId,
-          parentStepId,
-        });
+        const fanInGroupId = `${parent.runtimeRunId}:${parentStepId}`;
         store.createStep({
           runtimeRunId: parent.runtimeRunId,
           stepId: parentStepId,
@@ -153,6 +205,7 @@ describe("durableCommand", () => {
         });
         const child = store.createRun({
           operationKind: "test.child",
+          rootOperationReason: "test-root",
           status: "succeeded",
           recoveryState: "terminal",
           parentRuntimeRunId: parent.runtimeRunId,
@@ -168,20 +221,6 @@ describe("durableCommand", () => {
           metadata: { fanInGroupId, childSessionKey: "agent:test:subagent:child" },
           now: 110,
         });
-        store.createStep({
-          runtimeRunId: parent.runtimeRunId,
-          stepId: `result_mailbox:${child.runtimeRunId}`,
-          parentStepId,
-          stepType: "result_mailbox",
-          status: "queued",
-          recoveryState: "runnable",
-          metadata: {
-            outcome: { terminalOutcome: "succeeded" },
-            ack: { status: "pending" },
-            delivery: { status: "attempted" },
-          },
-          now: 120,
-        });
         return parent.runtimeRunId;
       } finally {
         store.close();
@@ -195,9 +234,6 @@ describe("durableCommand", () => {
 
       expect(logs[0]).toContain("fan_in=");
       expect(logs[0]).toContain("session=agent:test:subagent:child");
-      expect(logs[0]).toContain("outcome=succeeded");
-      expect(logs[0]).toContain("ack=pending");
-      expect(logs[0]).toContain("delivery=attempted");
     } finally {
       fs.rmSync(stateDir, { recursive: true, force: true });
     }
@@ -214,6 +250,7 @@ describe("durableCommand", () => {
       try {
         return store.createRun({
           operationKind: "test.agent_turn",
+          rootOperationReason: "test-root",
           status: "lost",
           recoveryState: "lost",
           completedAt: 200,

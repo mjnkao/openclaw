@@ -1,19 +1,14 @@
 import { createSubsystemLogger } from "../logging/subsystem.js";
 // Recovery reconciliation for durable runtime runs.
-import { reconcileSupersededAgentTurnContinuations } from "./agent-turn-continuations.js";
 import { isDurableWorkerEnabled } from "./config.js";
-import { reconcileDurableFanIn, type DurableFanInPolicy } from "./fan-in.js";
-import {
-  isDurableResultMailboxAcknowledged,
-  upsertDurableChildResultMailbox,
-} from "./result-mailbox.js";
+import { recordDurableRuntimeHealthFailure, recordDurableRuntimeHealthSuccess } from "./health.js";
 import {
   DURABLE_AGENT_TURN_OPERATION_KIND,
   DURABLE_CHAT_SEND_OPERATION_KIND,
-  DURABLE_SUBAGENT_RUN_OPERATION_KIND,
 } from "./runtime-ids.js";
 import { openDurableRuntimeStore } from "./store-factory.js";
 import type { DurableRuntimeRun, DurableRuntimeStep, DurableRuntimeStore } from "./types.js";
+import { runDurableWakeDispatcherOnce } from "./wake-dispatcher.js";
 
 const log = createSubsystemLogger("durable/recovery");
 
@@ -29,28 +24,6 @@ export type DurableRecoveryResult = {
   queuedRuns?: number;
 };
 
-function parsePositiveInteger(value: string | undefined): number | undefined {
-  const trimmed = value?.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-  const parsed = Number(trimmed);
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
-}
-
-export function resolveDurableRecoveryIntervalMs(env: NodeJS.ProcessEnv = process.env): number {
-  return (
-    parsePositiveInteger(env.OPENCLAW_DURABLE_RECOVERY_INTERVAL_MS) ?? DEFAULT_RECOVERY_INTERVAL_MS
-  );
-}
-
-export function resolveDurableStaleAgentTurnAfterMs(env: NodeJS.ProcessEnv = process.env): number {
-  return (
-    parsePositiveInteger(env.OPENCLAW_DURABLE_STALE_AGENT_TURN_AFTER_MS) ??
-    DEFAULT_STALE_AGENT_TURN_AFTER_MS
-  );
-}
-
 function shouldMarkAgentTurnLost(run: DurableRuntimeRun): boolean {
   if (run.operationKind !== DURABLE_AGENT_TURN_OPERATION_KIND) {
     return false;
@@ -60,13 +33,6 @@ function shouldMarkAgentTurnLost(run: DurableRuntimeRun): boolean {
 
 function shouldMarkChatSendLost(run: DurableRuntimeRun): boolean {
   if (run.operationKind !== DURABLE_CHAT_SEND_OPERATION_KIND) {
-    return false;
-  }
-  return run.status === "received" || run.status === "queued" || run.status === "running";
-}
-
-function shouldMarkSubagentRunLost(run: DurableRuntimeRun): boolean {
-  if (run.operationKind !== DURABLE_SUBAGENT_RUN_OPERATION_KIND) {
     return false;
   }
   return run.status === "received" || run.status === "queued" || run.status === "running";
@@ -105,9 +71,6 @@ function runtimeSubject(run: DurableRuntimeRun): string {
   if (run.operationKind === DURABLE_CHAT_SEND_OPERATION_KIND) {
     return "Chat send";
   }
-  if (run.operationKind === DURABLE_SUBAGENT_RUN_OPERATION_KIND) {
-    return "Subagent run";
-  }
   return "Runtime run";
 }
 
@@ -124,19 +87,12 @@ function lostNextAction(run: DurableRuntimeRun): string {
       ? "inspect_timeline_then_requeue_chat_send"
       : "inspect_timeline_then_retry_request";
   }
-  if (run.operationKind === DURABLE_SUBAGENT_RUN_OPERATION_KIND) {
-    return "inspect_timeline_then_retry_child_or_continue_parent";
-  }
   return "inspect_timeline_then_apply_policy";
 }
 
 function safeRecoveryActions(run: DurableRuntimeRun): string[] {
   const input = lostInputRecoveryHint(run);
   const actions = ["inspect_timeline"];
-  if (run.operationKind === DURABLE_SUBAGENT_RUN_OPERATION_KIND) {
-    actions.push("retry_child", "continue_parent_by_policy");
-    return actions;
-  }
   if (input?.canReplay) {
     actions.push("requeue_from_durable_input");
   }
@@ -210,7 +166,7 @@ function mergeRecoveryDiagnosticMetadata(
   diagnostic: Record<string, unknown>,
 ): Record<string, unknown> {
   return {
-    ...(metadata ?? {}),
+    ...metadata,
     [RECOVERY_DIAGNOSTIC_METADATA_KEY]: diagnostic,
   };
 }
@@ -270,6 +226,42 @@ function markRunLost(params: {
       recoveryDiagnostic: diagnostic,
     },
   });
+  const sourceOwner = params.run.sourceOwner ?? "durable_execution_records";
+  const sourceRef = params.run.sourceRef ?? params.run.runtimeRunId;
+  const sessionKey = firstString(
+    params.run.metadata?.sessionKey,
+    params.run.sourceOwner === "session_store" ? params.run.sourceRef : undefined,
+  );
+  const fact = params.store.recordUncertaintyFact({
+    sourceOwner,
+    sourceRef,
+    kind: "lost_after_dispatch",
+    sourceRunId: params.run.runtimeRunId,
+    stepId: params.stepId,
+    refId: params.processInstanceId,
+    dedupeKey: `restart-lost:${params.run.runtimeRunId}:${params.processInstanceId}`,
+    facts: diagnostic,
+    now: params.now,
+  });
+  params.store.createWakeObligation({
+    sourceOwner,
+    sourceRef,
+    targetKind: sessionKey ? "agent_session" : "run",
+    targetRef: sessionKey ?? params.run.runtimeRunId,
+    ownerKind: sessionKey ? "agent_session" : "run",
+    ownerRef: sessionKey ?? params.run.runtimeRunId,
+    reportRouteRef: sessionKey,
+    targetResolutionStatus: "resolved",
+    targetResolutionReason: sessionKey
+      ? "session resolved from the source execution record"
+      : "durable execution record is the inspectable owner",
+    reason: "restart_interrupted",
+    factsRef: `uncertainty_facts:${fact.factId}`,
+    sourceRunId: params.run.runtimeRunId,
+    dedupeKey: `restart-wake:${params.run.runtimeRunId}:${sessionKey ?? "run"}`,
+    metadata: diagnostic,
+    now: params.now,
+  });
   return true;
 }
 
@@ -308,140 +300,6 @@ function markChatSendLost(params: {
   });
 }
 
-function isDurableFanInPolicy(value: unknown): value is DurableFanInPolicy {
-  return (
-    value === "all_succeeded" ||
-    value === "all_terminal" ||
-    value === "first_success" ||
-    value === "continue_on_child_failure" ||
-    value === "fail_parent_on_child_failure"
-  );
-}
-
-function fanInPolicyForParentStep(params: {
-  store: DurableRuntimeStore;
-  parentRuntimeRunId: string;
-  parentStepId: string;
-}): DurableFanInPolicy {
-  const parentStep = params.store
-    .listSteps(params.parentRuntimeRunId)
-    .find((step) => step.stepId === params.parentStepId);
-  const policy = isRecord(parentStep?.metadata) ? parentStep.metadata.policy : undefined;
-  return isDurableFanInPolicy(policy) ? policy : "continue_on_child_failure";
-}
-
-function recoveryDiagnosticForRun(
-  store: DurableRuntimeStore,
-  runtimeRunId: string,
-): Record<string, unknown> | undefined {
-  const updatedRun = store.getRun(runtimeRunId);
-  const diagnostic = isRecord(updatedRun?.metadata)
-    ? updatedRun.metadata[RECOVERY_DIAGNOSTIC_METADATA_KEY]
-    : undefined;
-  return isRecord(diagnostic) ? diagnostic : undefined;
-}
-
-function markSubagentRunLost(params: {
-  store: DurableRuntimeStore;
-  run: DurableRuntimeRun;
-  now: number;
-  reason: string;
-  processInstanceId: string;
-}): boolean {
-  if (!shouldMarkSubagentRunLost(params.run)) {
-    return false;
-  }
-  const marked = markRunLost({
-    ...params,
-    eventType: "subagent.run.lost",
-    stepId: "subagent_run",
-    agentInvocationId: params.run.idempotencyKey,
-  });
-  if (!marked) {
-    return false;
-  }
-
-  const recoveryDiagnostic = recoveryDiagnosticForRun(params.store, params.run.runtimeRunId);
-  for (const link of params.store.listParentLinks(params.run.runtimeRunId)) {
-    if (link.status === "succeeded" || link.status === "failed" || link.status === "cancelled") {
-      continue;
-    }
-    const linkMetadata = isRecord(link.metadata) ? link.metadata : {};
-    params.store.updateLink({
-      parentRuntimeRunId: link.parentRuntimeRunId,
-      parentStepId: link.parentStepId,
-      childRuntimeRunId: link.childRuntimeRunId,
-      status: "lost",
-      metadata: {
-        ...linkMetadata,
-        lostReason: params.reason,
-        ...(recoveryDiagnostic ? { recoveryDiagnostic } : {}),
-      },
-      now: params.now,
-    });
-    params.store.appendEvent({
-      runtimeRunId: link.parentRuntimeRunId,
-      eventType: "subagent.child.lost",
-      eventTime: params.now,
-      stepId: link.parentStepId,
-      agentInvocationId: params.run.idempotencyKey,
-      correlationId: params.run.sourceRef,
-      payload: {
-        childRuntimeRunId: params.run.runtimeRunId,
-        reason: params.reason,
-        processInstanceId: params.processInstanceId,
-        ...(recoveryDiagnostic ? { recoveryDiagnostic } : {}),
-      },
-    });
-    const mailbox = upsertDurableChildResultMailbox({
-      store: params.store,
-      parentRuntimeRunId: link.parentRuntimeRunId,
-      parentStepId: link.parentStepId,
-      childRuntimeRunId: params.run.runtimeRunId,
-      childSessionKey: firstString(
-        params.run.metadata?.childSessionKey,
-        link.metadata?.childSessionKey,
-        params.run.sourceRef,
-      ),
-      agentInvocationId: params.run.idempotencyKey,
-      linkStatus: "lost",
-      terminalStatus: "lost",
-      terminalOutcome: "lost",
-      reason: params.reason,
-      summary: "Subagent run was marked lost during durable recovery.",
-      now: params.now,
-    });
-    if (!isDurableResultMailboxAcknowledged(mailbox)) {
-      params.store.appendEvent({
-        runtimeRunId: link.parentRuntimeRunId,
-        eventType: "subagent.child.result_mailbox_queued",
-        eventTime: params.now,
-        stepId: link.parentStepId,
-        agentInvocationId: params.run.idempotencyKey,
-        correlationId: params.run.sourceRef,
-        payload: {
-          childRuntimeRunId: params.run.runtimeRunId,
-          status: "lost",
-          reason: params.reason,
-          processInstanceId: params.processInstanceId,
-        },
-      });
-    }
-    reconcileDurableFanIn({
-      store: params.store,
-      parentRuntimeRunId: link.parentRuntimeRunId,
-      parentStepId: link.parentStepId,
-      policy: fanInPolicyForParentStep({
-        store: params.store,
-        parentRuntimeRunId: link.parentRuntimeRunId,
-        parentStepId: link.parentStepId,
-      }),
-      now: params.now,
-    });
-  }
-  return true;
-}
-
 export function reconcileDurableAgentTurnsOnGatewayStartup(params: {
   store: DurableRuntimeStore;
   processInstanceId: string;
@@ -469,19 +327,6 @@ export function reconcileDurableAgentTurnsOnGatewayStartup(params: {
   return { scanned: openRuns.length, markedLost };
 }
 
-export function reconcileDurableAgentTurnContinuationsOnGatewayStartup(params: {
-  store: DurableRuntimeStore;
-  processInstanceId: string;
-  now: number;
-}): DurableRecoveryResult {
-  const result = reconcileSupersededAgentTurnContinuations({
-    store: params.store,
-    processInstanceId: params.processInstanceId,
-    now: params.now,
-  });
-  return { scanned: result.scanned, markedLost: 0, queuedRuns: result.closed };
-}
-
 export function reconcileDurableChatSendsOnGatewayStartup(params: {
   store: DurableRuntimeStore;
   processInstanceId: string;
@@ -496,33 +341,6 @@ export function reconcileDurableChatSendsOnGatewayStartup(params: {
   for (const run of openRuns) {
     if (
       markChatSendLost({
-        store: params.store,
-        run,
-        now: params.now,
-        reason: "gateway_startup_reconciliation",
-        processInstanceId: params.processInstanceId,
-      })
-    ) {
-      markedLost += 1;
-    }
-  }
-  return { scanned: openRuns.length, markedLost };
-}
-
-export function reconcileDurableSubagentRunsOnGatewayStartup(params: {
-  store: DurableRuntimeStore;
-  processInstanceId: string;
-  now: number;
-  limit?: number;
-}): DurableRecoveryResult {
-  const openRuns = params.store.listOpenRuns({
-    operationKind: DURABLE_SUBAGENT_RUN_OPERATION_KIND,
-    limit: params.limit ?? 5000,
-  });
-  let markedLost = 0;
-  for (const run of openRuns) {
-    if (
-      markSubagentRunLost({
         store: params.store,
         run,
         now: params.now,
@@ -591,38 +409,6 @@ export function reconcileStaleDurableChatSends(params: {
         run,
         now: params.now,
         reason: "stale_chat_send_reconciliation",
-        processInstanceId: params.processInstanceId,
-      })
-    ) {
-      markedLost += 1;
-    }
-  }
-  return { scanned: openRuns.length, markedLost };
-}
-
-export function reconcileStaleDurableSubagentRuns(params: {
-  store: DurableRuntimeStore;
-  processInstanceId: string;
-  now: number;
-  staleAfterMs: number;
-  limit?: number;
-}): DurableRecoveryResult {
-  const cutoff = params.now - params.staleAfterMs;
-  const openRuns = params.store.listOpenRuns({
-    operationKind: DURABLE_SUBAGENT_RUN_OPERATION_KIND,
-    limit: params.limit ?? 5000,
-  });
-  let markedLost = 0;
-  for (const run of openRuns) {
-    if (run.updatedAt > cutoff) {
-      continue;
-    }
-    if (
-      markSubagentRunLost({
-        store: params.store,
-        run,
-        now: params.now,
-        reason: "stale_subagent_run_reconciliation",
         processInstanceId: params.processInstanceId,
       })
     ) {
@@ -882,12 +668,12 @@ export function startDurableRecoveryWorker(params: {
   if (!isDurableWorkerEnabled(env)) {
     return () => {};
   }
-  const intervalMs = resolveDurableRecoveryIntervalMs(env);
-  const staleAfterMs = resolveDurableStaleAgentTurnAfterMs(env);
+  const intervalMs = DEFAULT_RECOVERY_INTERVAL_MS;
+  const staleAfterMs = DEFAULT_STALE_AGENT_TURN_AFTER_MS;
   let running = false;
   let stopped = false;
 
-  const reconcileOnce = () => {
+  const reconcileOnce = async () => {
     if (running || stopped) {
       return;
     }
@@ -895,63 +681,69 @@ export function startDurableRecoveryWorker(params: {
     let store: DurableRuntimeStore | null = null;
     try {
       store = openDurableRuntimeStore({ env });
+      const now = Date.now();
       const result = reconcileStaleDurableAgentTurns({
         store,
         processInstanceId: params.processInstanceId,
-        now: Date.now(),
+        now,
         staleAfterMs,
-      });
-      const continuationResult = reconcileSupersededAgentTurnContinuations({
-        store,
-        processInstanceId: params.processInstanceId,
-        now: Date.now(),
       });
       const chatSendResult = reconcileStaleDurableChatSends({
         store,
         processInstanceId: params.processInstanceId,
-        now: Date.now(),
-        staleAfterMs,
-      });
-      const subagentRunResult = reconcileStaleDurableSubagentRuns({
-        store,
-        processInstanceId: params.processInstanceId,
-        now: Date.now(),
+        now,
         staleAfterMs,
       });
       const timerResult = reconcileDueDurableTimers({
         store,
         processInstanceId: params.processInstanceId,
-        now: Date.now(),
+        now,
       });
       const signalResult = reconcilePendingDurableSignals({
         store,
         processInstanceId: params.processInstanceId,
-        now: Date.now(),
+        now,
       });
+      const wakeResult = await runDurableWakeDispatcherOnce({
+        store,
+        workerId: params.processInstanceId,
+        now,
+      });
+      recordDurableRuntimeHealthSuccess();
       if (
         result.markedLost > 0 ||
         chatSendResult.markedLost > 0 ||
-        subagentRunResult.markedLost > 0 ||
-        continuationResult.closed > 0 ||
         (timerResult.firedTimers ?? 0) > 0 ||
-        (signalResult.consumedSignals ?? 0) > 0
+        (signalResult.consumedSignals ?? 0) > 0 ||
+        wakeResult.obligationsCreated > 0 ||
+        wakeResult.delivered > 0 ||
+        wakeResult.suspended > 0 ||
+        wakeResult.overdue > 0
       ) {
         log.warn("reconciled durable runtime state", {
           staleScanned: result.scanned,
           markedLost: result.markedLost,
           staleChatSendsScanned: chatSendResult.scanned,
           markedLostChatSends: chatSendResult.markedLost,
-          staleSubagentRunsScanned: subagentRunResult.scanned,
-          markedLostSubagentRuns: subagentRunResult.markedLost,
-          supersededContinuationsScanned: continuationResult.scanned,
-          supersededContinuationsClosed: continuationResult.closed,
           firedTimers: timerResult.firedTimers ?? 0,
           consumedSignals: signalResult.consumedSignals ?? 0,
           queuedRuns: (timerResult.queuedRuns ?? 0) + (signalResult.queuedRuns ?? 0),
+          ownerFactsScanned: wakeResult.ownerFactsScanned,
+          wakeObligationsCreated: wakeResult.obligationsCreated,
+          wakeClaims: wakeResult.claimed,
+          wakesDelivered: wakeResult.delivered,
+          wakesFailed: wakeResult.failed,
+          wakesSuspended: wakeResult.suspended,
+          wakesOverdue: wakeResult.overdue,
           staleAfterMs,
         });
       }
     } catch (err) {
+      recordDurableRuntimeHealthFailure({
+        component: "recovery",
+        operation: "reconcile_once",
+        error: err,
+      });
       log.warn(`durable recovery worker failed: ${String(err)}`);
     } finally {
       store?.close();
@@ -959,8 +751,11 @@ export function startDurableRecoveryWorker(params: {
     }
   };
 
-  const timer = setInterval(reconcileOnce, intervalMs);
+  const timer = setInterval(() => {
+    void reconcileOnce();
+  }, intervalMs);
   timer.unref?.();
+  void reconcileOnce();
   log.info("started durable recovery worker", {
     intervalMs,
     staleAfterMs,

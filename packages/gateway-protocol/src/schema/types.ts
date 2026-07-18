@@ -125,6 +125,21 @@ export type TasksCancelResult = SchemaType<"TasksCancelResult">;
 export type DurableCoordinationGetParams = SchemaType<"DurableCoordinationGetParams">;
 export type DurableCoordinationProjection = SchemaType<"DurableCoordinationProjection">;
 export type DurableCoordinationGetResult = SchemaType<"DurableCoordinationGetResult">;
+export type DurableHealthGetParams = SchemaType<"DurableHealthGetParams">;
+export type DurableHealthResult = SchemaType<"DurableHealthResult">;
+export type DurableLimitParams = SchemaType<"DurableLimitParams">;
+export type DurableObligationsListResult = SchemaType<"DurableObligationsListResult">;
+export type WakeObligationListResult = SchemaType<"WakeObligationListResult">;
+export type WakeObligationIdParams = SchemaType<"WakeObligationIdParams">;
+export type WakeObligationInspectResult = SchemaType<"WakeObligationInspectResult">;
+export type WakeObligationControlParams = SchemaType<"WakeObligationControlParams">;
+export type WakeObligationSupersedeParams = SchemaType<"WakeObligationSupersedeParams">;
+export type WakeObligationControlResult = SchemaType<"WakeObligationControlResult">;
+export type UncertaintyFactListResult = SchemaType<"UncertaintyFactListResult">;
+export type UncertaintyFactResolveParams = SchemaType<"UncertaintyFactResolveParams">;
+export type UncertaintyFactResolveResult = SchemaType<"UncertaintyFactResolveResult">;
+export type DeliveryAttemptEvidenceListParams = SchemaType<"DeliveryAttemptEvidenceListParams">;
+export type DeliveryAttemptEvidenceListResult = SchemaType<"DeliveryAttemptEvidenceListResult">;
 
 /** Config read/write/schema payloads plus update status and run controls. */
 export type ConfigGetParams = SchemaType<"ConfigGetParams">;

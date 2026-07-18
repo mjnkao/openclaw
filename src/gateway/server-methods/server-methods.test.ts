@@ -660,7 +660,6 @@ describe("waitForAgentJob", () => {
     expect(agentJobTesting.getAgentRunCacheSize()).toBe(max);
     agentJobTesting.resetAgentRunCache();
   });
-
 });
 
 describe("augmentChatHistoryWithCanvasBlocks", () => {
@@ -926,52 +925,6 @@ describe("sanitizeChatHistoryMessages", () => {
           completion_tokens: 1,
           total_tokens: 12,
         },
-        timestamp: 1,
-      },
-    ]);
-  });
-
-  it("preserves bounded user context refs for display context", () => {
-    const result = sanitizeChatHistoryMessages([
-      {
-        role: "user",
-        content: "please check this card",
-        contextRefs: [
-          {
-            type: "work_unit",
-            id: "workboard:default:card-1",
-            label: "Card 1",
-            source: "workboard",
-            metadata: { status: "todo" },
-          },
-          { type: "", id: "missing-type" },
-          {
-            type: "work_unit",
-            id: "oversized-metadata",
-            metadata: { payload: "x".repeat(9000) },
-          },
-        ],
-        timestamp: 1,
-      },
-    ]);
-
-    expect(result).toEqual([
-      {
-        role: "user",
-        content: "please check this card",
-        contextRefs: [
-          {
-            type: "work_unit",
-            id: "workboard:default:card-1",
-            label: "Card 1",
-            source: "workboard",
-            metadata: { status: "todo" },
-          },
-          {
-            type: "work_unit",
-            id: "oversized-metadata",
-          },
-        ],
         timestamp: 1,
       },
     ]);

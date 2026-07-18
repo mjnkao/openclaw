@@ -186,7 +186,7 @@ type SpawnSubagentContext = {
   agentSessionKey?: string;
   /** Separate key used only for completion routing, not sandbox policy. */
   completionOwnerKey?: string;
-  /** Current requester agent run id, used only for internal durable lineage. */
+  /** Exact requester run used for durable parent-child correlation. */
   requesterRunId?: string;
   agentChannel?: string;
   agentAccountId?: string;
@@ -1658,13 +1658,13 @@ export async function spawnSubagentDirect(
       childSessionKey,
       controllerSessionKey: ownership.controllerSessionKey,
       requesterSessionKey: ownership.completionRequesterSessionKey,
+      requesterRunId: ctx.requesterRunId,
       requesterOrigin,
       requesterDisplayKey: ownership.completionRequesterDisplayKey,
       task,
       taskName,
       agentId: targetAgentId,
       requesterAgentId,
-      requesterRunId: ctx.requesterRunId,
       cleanup,
       label: label || undefined,
       model: resolvedModel,

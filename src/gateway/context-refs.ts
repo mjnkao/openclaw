@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import type { MsgContext } from "../auto-reply/templating.js";
-import { isDurableRuntimesEnabled } from "../durable/config.js";
+import { isDurableAuthorityEnabled, isDurableRuntimesEnabled } from "../durable/config.js";
+import {
+  recordDurableRuntimeHealthFailure,
+  recordDurableRuntimeHealthSuccess,
+} from "../durable/health.js";
 import { buildDurableIntakeEnvelope } from "../durable/intake-envelope.js";
 import { acceptDurableRuntimeIntake } from "../durable/intake.js";
 import { DURABLE_CHAT_SEND_OPERATION_KIND } from "../durable/runtime-ids.js";
@@ -266,7 +270,7 @@ export function recordDurableChatSendFrontdoorIntake(params: {
   const intakeEnvelope = buildDurableIntakeEnvelope({
     operationKind: DURABLE_CHAT_SEND_OPERATION_KIND,
     runId: params.runId,
-    sourceType: "chat.send",
+    sourceOwner: "session_store",
     sourceRef: params.sessionKey,
     agentId: params.agentId,
     sessionKey: params.sessionKey,
@@ -291,7 +295,7 @@ export function recordDurableChatSendFrontdoorIntake(params: {
       operationVersion: "1",
       idempotencyKey: params.runId,
       requestHash,
-      sourceType: "chat.send",
+      sourceOwner: "session_store",
       sourceRef: params.sessionKey,
       messageId: params.runId,
       turnId: params.runId,
@@ -325,12 +329,22 @@ export function recordDurableChatSendFrontdoorIntake(params: {
       payload: metadataWithEnvelope,
       payloadHash: requestHash,
     });
+    recordDurableRuntimeHealthSuccess(now);
   } catch (error) {
+    recordDurableRuntimeHealthFailure({
+      component: "intake",
+      operation: "chat_send_intake",
+      error,
+      now,
+    });
     params.log?.warn?.(
       `failed to record durable chat.send intake ${params.runId}: ${
         error instanceof Error ? error.message : String(error)
       }`,
     );
+    if (isDurableAuthorityEnabled(env)) {
+      throw error;
+    }
   } finally {
     store?.close();
   }
@@ -380,7 +394,7 @@ export function recordDurableChatSendTerminal(params: {
       operationKind: DURABLE_CHAT_SEND_OPERATION_KIND,
       operationVersion: "1",
       idempotencyKey: params.runId,
-      sourceType: "chat.send",
+      sourceOwner: "session_store",
       sourceRef: params.sessionKey,
       messageId: params.runId,
       turnId: params.runId,

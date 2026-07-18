@@ -49,6 +49,7 @@ describe("durable runtime worker", () => {
       }));
       const run = store.createRun({
         operationKind: "test.runtime",
+        rootOperationReason: "worker_test_fixture",
         status: "queued",
         recoveryState: "runnable",
         now: 100,
@@ -107,6 +108,7 @@ describe("durable runtime worker", () => {
       }));
       const run = store.createRun({
         operationKind: "test.runtime",
+        rootOperationReason: "worker_test_fixture",
         status: "queued",
         recoveryState: "runnable",
       });

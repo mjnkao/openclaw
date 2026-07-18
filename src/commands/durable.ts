@@ -1,10 +1,13 @@
-import { isDurableRuntimesEnabled } from "../durable/config.js";
+import { isDurableAuthorityEnabled, isDurableRuntimesEnabled } from "../durable/config.js";
 import {
   buildDurableCoordinationProjection,
   type DurableCoordinationProjection,
 } from "../durable/coordination-projection.js";
+import { getDurableRuntimeHealthSnapshot } from "../durable/health.js";
 import { openDurableRuntimeStore } from "../durable/store-factory.js";
 import type {
+  DeliveryAttemptEvidence,
+  DurableUnresolvedObligation,
   DurableRuntimeEvent,
   DurableRuntimeLink,
   DurableRuntimeRef,
@@ -13,6 +16,9 @@ import type {
   DurableRuntimeStep,
   DurableRuntimeStore,
   DurableRuntimeTimer,
+  UncertaintyFact,
+  WakeObligation,
+  WakeObligationInspection,
 } from "../durable/types.js";
 import type { RuntimeEnv } from "../runtime.js";
 
@@ -27,14 +33,30 @@ export type DurableCliAction =
   | "refs"
   | "timers"
   | "coordination"
+  | "obligations"
+  | "wakes"
+  | "wake"
+  | "uncertainty"
+  | "delivery-attempts"
   | "why"
-  | "stats";
+  | "stats"
+  | "health"
+  | "wake-acknowledge"
+  | "wake-resume"
+  | "wake-supersede"
+  | "uncertainty-resolve";
 
 export type DurableCliOptions = {
   action: DurableCliAction;
   runtimeRunId?: string;
   json?: boolean;
   limit?: number;
+  reason?: string;
+  expectedSourceRevision?: string;
+  resolutionKind?: string;
+  resolutionRef?: string;
+  resolutionStatus?: "resolved" | "superseded";
+  expectedUpdatedAt?: number;
   env?: NodeJS.ProcessEnv;
 };
 
@@ -81,6 +103,67 @@ function metadataRecord(value: unknown): Record<string, unknown> {
 
 function parseLimit(value: number | undefined): number {
   return Math.max(1, Math.min(500, Math.trunc(value ?? 50)));
+}
+
+function renderObligations(obligations: DurableUnresolvedObligation[]): string {
+  if (obligations.length === 0) {
+    return "No unresolved durable obligations.";
+  }
+  return obligations
+    .map((obligation) => {
+      const reason = obligation.reason ? ` reason=${obligation.reason}` : "";
+      return `${obligation.obligationId} ${obligation.kind}/${obligation.status} source=${obligation.sourceOwner}:${obligation.sourceRef} updated=${formatTime(obligation.updatedAt)}${reason}`;
+    })
+    .join("\n");
+}
+
+function renderWakes(wakes: WakeObligation[]): string {
+  if (wakes.length === 0) {
+    return "No durable wake obligations.";
+  }
+  return wakes
+    .map(
+      (wake) =>
+        `${wake.wakeId} ${wake.reason}/${wake.status} source=${wake.sourceOwner}:${wake.sourceRef} attempts=${wake.attemptCount} updated=${formatTime(wake.updatedAt)}`,
+    )
+    .join("\n");
+}
+
+function renderUncertaintyFacts(facts: UncertaintyFact[]): string {
+  if (facts.length === 0) {
+    return "No unresolved durable uncertainty facts.";
+  }
+  return facts
+    .map(
+      (fact) =>
+        `${fact.factId} ${fact.kind}/${fact.status} source=${fact.sourceOwner}:${fact.sourceRef} updated=${formatTime(fact.updatedAt)}`,
+    )
+    .join("\n");
+}
+
+function renderDeliveryAttempts(attempts: DeliveryAttemptEvidence[]): string {
+  if (attempts.length === 0) {
+    return "No delivery attempt evidence.";
+  }
+  return attempts
+    .map((attempt) => {
+      const error = attempt.error ? ` error=${attempt.error}` : "";
+      return `${attempt.deliveryAttemptId} ${attempt.status} source=${attempt.sourceOwner}:${attempt.sourceRef} scheduled=${formatTime(attempt.scheduledAt)}${error}`;
+    })
+    .join("\n");
+}
+
+function renderWakeInspection(inspection: WakeObligationInspection): string {
+  const { wake } = inspection;
+  return [
+    `Wake: ${wake.wakeId}`,
+    `Status: ${wake.status}`,
+    `Reason: ${wake.reason}`,
+    `Source: ${wake.sourceOwner}:${wake.sourceRef}`,
+    `Target: ${inspection.targetResolution.status ?? "unresolved"}${inspection.targetResolution.targetRef ? ` ${inspection.targetResolution.targetRef}` : ""}`,
+    `Delivery attempts: ${inspection.deliveryAttemptEvidence.length}`,
+    `Open uncertainty facts: ${inspection.unresolvedUncertaintyFacts.length}`,
+  ].join("\n");
 }
 
 function requireRunId(opts: DurableCliOptions, runtime: RuntimeEnv): string | undefined {
@@ -446,6 +529,24 @@ export async function durableCommand(opts: DurableCliOptions, runtime: RuntimeEn
 
   const store = openDurableRuntimeStore({ env });
   try {
+    if (opts.action === "health") {
+      const health = {
+        enabled: true,
+        authority: isDurableAuthorityEnabled(env),
+        process: getDurableRuntimeHealthSnapshot(),
+        store: store.getStats(),
+      };
+      if (opts.json) {
+        writeJson(runtime, health);
+      } else {
+        write(
+          runtime,
+          `Durable runtime: ${health.process.status} authority=${yesNo(health.authority)} open_runs=${health.store.openRuns} pending_wakes=${health.store.pendingWakes} unresolved_uncertainty=${health.store.unresolvedUncertaintyFacts}`,
+        );
+      }
+      return;
+    }
+
     if (opts.action === "stats") {
       const stats = store.getStats();
       if (opts.json) {
@@ -465,6 +566,128 @@ export async function durableCommand(opts: DurableCliOptions, runtime: RuntimeEn
         writeJson(runtime, runs);
       } else {
         write(runtime, renderRuns(runs));
+      }
+      return;
+    }
+
+    if (opts.action === "obligations") {
+      const obligations = store.listUnresolvedObligations({ limit: parseLimit(opts.limit) });
+      if (opts.json) {
+        writeJson(runtime, obligations);
+      } else {
+        write(runtime, renderObligations(obligations));
+      }
+      return;
+    }
+
+    if (opts.action === "wakes") {
+      const wakes = store.listWakeObligations({ limit: parseLimit(opts.limit) });
+      if (opts.json) {
+        writeJson(runtime, wakes);
+      } else {
+        write(runtime, renderWakes(wakes));
+      }
+      return;
+    }
+
+    if (opts.action === "uncertainty") {
+      const facts = store.listUnresolvedUncertaintyFacts({ limit: parseLimit(opts.limit) });
+      if (opts.json) {
+        writeJson(runtime, facts);
+      } else {
+        write(runtime, renderUncertaintyFacts(facts));
+      }
+      return;
+    }
+
+    if (opts.action === "wake" || opts.action === "delivery-attempts") {
+      const wakeId = opts.runtimeRunId?.trim();
+      if (!wakeId) {
+        runtime.error("A wake obligation id is required.");
+        runtime.exit(1);
+        return;
+      }
+      const payload =
+        opts.action === "wake"
+          ? store.getWakeObligationInspection(wakeId)
+          : store.listDeliveryAttemptEvidence({ wakeId, limit: parseLimit(opts.limit) });
+      if (!payload) {
+        runtime.error(`Wake obligation not found: ${wakeId}`);
+        runtime.exit(1);
+        return;
+      }
+      if (opts.json) {
+        writeJson(runtime, payload);
+      } else if (opts.action === "wake") {
+        write(runtime, renderWakeInspection(payload as WakeObligationInspection));
+      } else {
+        write(runtime, renderDeliveryAttempts(payload as DeliveryAttemptEvidence[]));
+      }
+      return;
+    }
+
+    if (
+      opts.action === "wake-acknowledge" ||
+      opts.action === "wake-resume" ||
+      opts.action === "wake-supersede"
+    ) {
+      const wakeId = opts.runtimeRunId?.trim();
+      if (!wakeId) {
+        runtime.error("A wake obligation id is required.");
+        runtime.exit(1);
+        return;
+      }
+      const control = {
+        wakeId,
+        actorKind: "operator" as const,
+        actorRef: "cli",
+        reason: opts.reason,
+        expectedSourceRevision: opts.expectedSourceRevision,
+      };
+      const wake =
+        opts.action === "wake-acknowledge"
+          ? store.acknowledgeWakeObligation(control)
+          : opts.action === "wake-resume"
+            ? store.resumeWakeObligation(control)
+            : store.supersedeWakeObligation(control);
+      if (!wake) {
+        runtime.error(`Wake obligation was not found or cannot make that transition: ${wakeId}`);
+        runtime.exit(1);
+        return;
+      }
+      if (opts.json) {
+        writeJson(runtime, wake);
+      } else {
+        write(runtime, `${wake.wakeId} ${wake.reason}/${wake.status}`);
+      }
+      return;
+    }
+
+    if (opts.action === "uncertainty-resolve") {
+      const factId = opts.runtimeRunId?.trim();
+      const resolutionKind = opts.resolutionKind?.trim();
+      if (!factId || !resolutionKind) {
+        runtime.error("An uncertainty fact id and --kind are required.");
+        runtime.exit(1);
+        return;
+      }
+      const fact = store.resolveUncertaintyFact({
+        factId,
+        status: opts.resolutionStatus ?? "resolved",
+        resolutionKind,
+        resolutionRef: opts.resolutionRef,
+        expectedUpdatedAt: opts.expectedUpdatedAt,
+        metadata: { decision: { actorKind: "operator", actorRef: "cli", decidedAt: Date.now() } },
+      });
+      if (!fact) {
+        runtime.error(`Uncertainty fact was not found or already terminal: ${factId}`);
+        runtime.exit(1);
+        return;
+      }
+      if (opts.json) {
+        writeJson(runtime, fact);
+      } else {
+        write(runtime, `${fact.factId} ${fact.kind}/${fact.status}`);
       }
       return;
     }

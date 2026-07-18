@@ -397,6 +397,32 @@ export interface CurrentConversationBindings {
   updated_at: number;
 }
 
+export interface DeliveryAttemptEvidence {
+  attempted_at: number | null;
+  created_at: number;
+  dedupe_key: string;
+  delivered_at: number | null;
+  delivery_attempt_id: string;
+  delivery_claim_expires_at: number | null;
+  delivery_claimed_by: string | null;
+  error_message: string | null;
+  evidence_json: string | null;
+  failed_at: number | null;
+  metadata_json: string | null;
+  replay_pass_id: string | null;
+  route_kind: string | null;
+  route_ref: string | null;
+  scheduled_at: number;
+  source_owner: string;
+  source_ref: string;
+  status: string;
+  target_kind: string | null;
+  target_ref: string | null;
+  unknown_at: number | null;
+  updated_at: number;
+  wake_id: string;
+}
+
 export interface DeliveryQueueEntries {
   account_id: string | null;
   channel: string | null;
@@ -500,7 +526,7 @@ export interface DiagnosticStabilityBundles {
   reason: string;
 }
 
-export interface DurableRuntimeEvents {
+export interface DurableEventEvidence {
   agent_invocation_id: string | null;
   causation_event_id: string | null;
   checkpoint_ref: string | null;
@@ -518,34 +544,8 @@ export interface DurableRuntimeEvents {
   tool_invocation_id: string | null;
 }
 
-export interface DurableRuntimeLinks {
-  child_runtime_run_id: string;
-  created_at: number;
-  link_type: string;
-  metadata_json: string | null;
-  parent_runtime_run_id: string;
-  parent_step_id: string;
-  status: string;
-  updated_at: number;
-}
-
-export interface DurableRuntimeRefs {
-  created_at: number;
-  hash: string | null;
-  media_type: string | null;
-  metadata_json: string | null;
-  ref_id: string;
-  ref_kind: string;
-  runtime_run_id: string;
-  step_id: string | null;
-  storage_kind: string;
-  storage_uri: string | null;
-}
-
-export interface DurableRuntimeRuns {
+export interface DurableExecutionRecords {
   checkpoint_ref: string | null;
-  claim_expires_at: number | null;
-  claimed_by: string | null;
   completed_at: number | null;
   created_at: number;
   heartbeat_at: number | null;
@@ -561,28 +561,15 @@ export interface DurableRuntimeRuns {
   report_route_id: string | null;
   request_hash: string | null;
   runtime_run_id: string;
+  source_owner: string | null;
   source_ref: string | null;
-  source_type: string | null;
   status: string;
   turn_id: string | null;
   updated_at: number;
   work_unit_id: string | null;
 }
 
-export interface DurableRuntimeSignals {
-  consumed_at: number | null;
-  correlation_id: string | null;
-  idempotency_key: string | null;
-  metadata_json: string | null;
-  payload_ref: string | null;
-  received_at: number;
-  runtime_run_id: string;
-  signal_id: string;
-  signal_type: string;
-  step_id: string | null;
-}
-
-export interface DurableRuntimeSteps {
+export interface DurableExecutionSteps {
   attempt: Generated<number>;
   checkpoint_ref: string | null;
   claim_expires_at: number | null;
@@ -606,7 +593,44 @@ export interface DurableRuntimeSteps {
   updated_at: number;
 }
 
-export interface DurableRuntimeTimers {
+export interface DurablePayloadRefs {
+  created_at: number;
+  hash: string | null;
+  media_type: string | null;
+  metadata_json: string | null;
+  ref_id: string;
+  ref_kind: string;
+  runtime_run_id: string;
+  step_id: string | null;
+  storage_kind: string;
+  storage_uri: string | null;
+}
+
+export interface DurableRunCorrelations {
+  child_runtime_run_id: string;
+  created_at: number;
+  link_type: string;
+  metadata_json: string | null;
+  parent_runtime_run_id: string;
+  parent_step_id: string;
+  status: string;
+  updated_at: number;
+}
+
+export interface DurableSignalEvidence {
+  consumed_at: number | null;
+  correlation_id: string | null;
+  idempotency_key: string | null;
+  metadata_json: string | null;
+  payload_ref: string | null;
+  received_at: number;
+  runtime_run_id: string;
+  signal_id: string;
+  signal_type: string;
+  step_id: string | null;
+}
+
+export interface DurableTimerObligations {
   cancelled_at: number | null;
   created_at: number;
   due_at: number;
@@ -617,13 +641,6 @@ export interface DurableRuntimeTimers {
   step_id: string | null;
   timer_id: string;
   timer_type: string;
-}
-
-export interface DurableSchemaMigrations {
-  applied_at: number;
-  metadata_json: string | null;
-  schema_name: string;
-  version: number;
 }
 
 export interface ExecApprovalsConfig {
@@ -1093,6 +1110,27 @@ export interface TuiLastSessions {
   updated_at: number;
 }
 
+export interface UncertaintyFacts {
+  created_at: number;
+  dedupe_key: string | null;
+  event_id: string | null;
+  fact_id: string;
+  facts_json: string | null;
+  facts_ref: string | null;
+  kind: string;
+  metadata_json: string | null;
+  ref_id: string | null;
+  resolution_kind: string | null;
+  resolution_ref: string | null;
+  resolved_at: number | null;
+  source_owner: string;
+  source_ref: string;
+  source_run_id: string | null;
+  status: string;
+  step_id: string | null;
+  updated_at: number;
+}
+
 export interface UpdateCheckState {
   auto_first_seen_at: string | null;
   auto_first_seen_tag: string | null;
@@ -1135,6 +1173,36 @@ export interface VoicewakeTriggers {
   position: number;
   trigger: string;
   updated_at_ms: number;
+}
+
+export interface WakeObligations {
+  acked_at: number | null;
+  attempt_count: Generated<number>;
+  created_at: number;
+  dedupe_key: string;
+  facts_ref: string | null;
+  failed_reason: string | null;
+  last_attempt_at: number | null;
+  metadata_json: string | null;
+  owner_kind: string | null;
+  owner_ref: string | null;
+  parent_run_id: string | null;
+  parent_session_key: string | null;
+  reason: string;
+  report_route_ref: string | null;
+  source_owner: string;
+  source_ref: string;
+  source_run_id: string | null;
+  status: string;
+  target_agent: string | null;
+  target_channel: string | null;
+  target_kind: string | null;
+  target_ref: string | null;
+  target_resolution_reason: string | null;
+  target_resolution_status: string | null;
+  target_session: string | null;
+  updated_at: number;
+  wake_id: string;
 }
 
 export interface WebPushSubscriptions {
@@ -1205,6 +1273,7 @@ export interface DB {
   cron_jobs: CronJobs;
   cron_run_logs: CronRunLogs;
   current_conversation_bindings: CurrentConversationBindings;
+  delivery_attempt_evidence: DeliveryAttemptEvidence;
   delivery_queue_entries: DeliveryQueueEntries;
   device_auth_tokens: DeviceAuthTokens;
   device_bootstrap_tokens: DeviceBootstrapTokens;
@@ -1213,14 +1282,13 @@ export interface DB {
   device_pairing_pending: DevicePairingPending;
   diagnostic_events: DiagnosticEvents;
   diagnostic_stability_bundles: DiagnosticStabilityBundles;
-  durable_runtime_events: DurableRuntimeEvents;
-  durable_runtime_links: DurableRuntimeLinks;
-  durable_runtime_refs: DurableRuntimeRefs;
-  durable_runtime_runs: DurableRuntimeRuns;
-  durable_runtime_signals: DurableRuntimeSignals;
-  durable_runtime_steps: DurableRuntimeSteps;
-  durable_runtime_timers: DurableRuntimeTimers;
-  durable_schema_migrations: DurableSchemaMigrations;
+  durable_event_evidence: DurableEventEvidence;
+  durable_execution_records: DurableExecutionRecords;
+  durable_execution_steps: DurableExecutionSteps;
+  durable_payload_refs: DurablePayloadRefs;
+  durable_run_correlations: DurableRunCorrelations;
+  durable_signal_evidence: DurableSignalEvidence;
+  durable_timer_obligations: DurableTimerObligations;
   exec_approvals_config: ExecApprovalsConfig;
   flow_runs: FlowRuns;
   gateway_boot_lifecycle: GatewayBootLifecycle;
@@ -1253,10 +1321,12 @@ export interface DB {
   task_delivery_state: TaskDeliveryState;
   task_runs: TaskRuns;
   tui_last_sessions: TuiLastSessions;
+  uncertainty_facts: UncertaintyFacts;
   update_check_state: UpdateCheckState;
   voicewake_routing_config: VoicewakeRoutingConfig;
   voicewake_routing_routes: VoicewakeRoutingRoutes;
   voicewake_triggers: VoicewakeTriggers;
+  wake_obligations: WakeObligations;
   web_push_subscriptions: WebPushSubscriptions;
   web_push_vapid_keys: WebPushVapidKeys;
   workspace_setup_state: WorkspaceSetupState;

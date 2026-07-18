@@ -13,8 +13,6 @@ const {
   isRestartEnabledMock,
   callGatewayToolMock,
   clearRestartSentinelMock,
-  isDurableGatewayRestartContinuationUsefulMock,
-  recordDurableGatewayRestartInterruptionMock,
   scheduleGatewaySigusr1RestartMock,
   writeRestartSentinelMock,
 } = vi.hoisted(() => ({
@@ -32,14 +30,6 @@ const {
     () =>
       "Recommended follow-up: run openclaw doctor --non-interactive in a terminal or approvals-capable OpenClaw surface.",
   ),
-  isDurableGatewayRestartContinuationUsefulMock: vi.fn(() => false),
-  recordDurableGatewayRestartInterruptionMock: vi.fn(() => ({
-    enabled: false,
-    inspectedRuns: 0,
-    interruptedRuns: 0,
-    interruptedChildren: 0,
-    reconciledParents: 0,
-  })),
   writeRestartSentinelMock: vi.fn(async (_payload: RestartSentinelPayload) => undefined),
   clearRestartSentinelMock: vi.fn(async () => undefined),
   scheduleGatewaySigusr1RestartMock: vi.fn((_opts?: ScheduleGatewayRestartArgs) => ({
@@ -76,14 +66,6 @@ vi.mock("../../infra/restart-sentinel.js", async () => {
 
 vi.mock("../../infra/restart.js", () => ({
   scheduleGatewaySigusr1Restart: scheduleGatewaySigusr1RestartMock,
-}));
-
-vi.mock("../../durable/restart-interruption.js", () => ({
-  buildDefaultDurableRestartContinuationMessage: vi.fn(
-    () => "Default durable restart continuation.",
-  ),
-  isDurableGatewayRestartContinuationUseful: isDurableGatewayRestartContinuationUsefulMock,
-  recordDurableGatewayRestartInterruption: recordDurableGatewayRestartInterruptionMock,
 }));
 
 vi.mock("../../logging/subsystem.js", () => ({
@@ -135,9 +117,6 @@ describe("gateway tool restart continuation", () => {
     writeRestartSentinelMock.mockReset();
     writeRestartSentinelMock.mockResolvedValue(undefined);
     clearRestartSentinelMock.mockClear();
-    isDurableGatewayRestartContinuationUsefulMock.mockReset();
-    isDurableGatewayRestartContinuationUsefulMock.mockReturnValue(false);
-    recordDurableGatewayRestartInterruptionMock.mockClear();
     scheduleGatewaySigusr1RestartMock.mockReset();
     scheduleGatewaySigusr1RestartMock.mockReturnValue({
       ok: true,
@@ -362,7 +341,7 @@ describe("gateway tool restart continuation", () => {
       config: {},
     });
 
-    const result = await tool.execute?.("tool-call-1", {
+    await tool.execute?.("tool-call-1", {
       action: "restart",
       delayMs: 250,
       reason: "restart requested",
@@ -373,40 +352,6 @@ describe("gateway tool restart continuation", () => {
     const payload = requireRestartSentinelPayload();
     expect(payload.sessionKey).toBe("agent:main:main");
     expect(payload.continuation).toBeNull();
-    expect(result?.details).toMatchObject({
-      continuationQueued: false,
-      warning: expect.stringContaining("no internal post-restart agent turn was queued"),
-    });
-  });
-
-  it("adds a default durable continuation for session-scoped restarts when durable runtime is active", async () => {
-    isDurableGatewayRestartContinuationUsefulMock.mockReturnValueOnce(true);
-    const tool = createGatewayTool({
-      agentSessionKey: "agent:main:main",
-      config: {},
-    });
-
-    const result = await tool.execute?.("tool-call-1", {
-      action: "restart",
-      delayMs: 250,
-      reason: "restart requested",
-    });
-
-    await requireScheduledRestartArgs().emitHooks?.beforeEmit?.();
-
-    const payload = requireRestartSentinelPayload();
-    expect(payload.sessionKey).toBe("agent:main:main");
-    expect(payload.continuation).toEqual({
-      kind: "agentTurn",
-      message: "Default durable restart continuation.",
-    });
-    expect(recordDurableGatewayRestartInterruptionMock).toHaveBeenCalledWith({
-      reason: "restart requested",
-      sessionKey: "agent:main:main",
-    });
-    expect(result?.details).toMatchObject({
-      continuationQueued: true,
-    });
   });
 
   it("removes the prepared sentinel when restart emission is rejected", async () => {

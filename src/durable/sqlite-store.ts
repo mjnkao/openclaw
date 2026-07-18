@@ -17,11 +17,11 @@ import {
 import { resolveDurableRuntimeSqlitePath } from "./config.js";
 import type {
   AppendDurableRuntimeEventInput,
-  ClaimDeliveryAttemptEvidenceInput,
-  ClaimDurableRuntimeRunInput,
+  ClaimNextWakeObligationInput,
   ClaimDurableRuntimeStepInput,
   CompactDurableRuntimeRunInput,
   CompactDurableRuntimeRunResult,
+  CompleteWakeObligationClaimInput,
   CreateDurableRuntimeLinkInput,
   CreateWakeObligationInput,
   CreateDurableRuntimeRefInput,
@@ -30,13 +30,8 @@ import type {
   CreateDurableRuntimeStepInput,
   CreateDurableRuntimeTimerInput,
   CreateUncertaintyFactInput,
-  DurableContinuationCleanupAudit,
-  DurableContinuationCleanupStatus,
-  DurableContinuationCleanupTargetKind,
-  DurableDedupeLedgerEntry,
-  DurableDedupeLedgerStatus,
-  DurableDedupeScope,
   WakeObligation,
+  WakeObligationClaim,
   WakeObligationOwnerKind,
   WakeObligationStatus,
   WakeObligationTargetKind,
@@ -66,21 +61,18 @@ import type {
   WakeObligationControlDecisionKind,
   DeliveryAttemptEvidence,
   DeliveryAttemptEvidenceStatus,
-  FinalizeDeliveryAttemptEvidenceInput,
   WakeObligationInspection,
   UpdateDurableRuntimeRunInput,
   UpdateDurableRuntimeLinkInput,
-  RecordDurableContinuationCleanupInput,
-  RecordDurableDedupeLedgerInput,
-  RecordDeliveryAttemptEvidenceInput,
-  RenewDeliveryAttemptEvidenceClaimInput,
+  ResumeWakeObligationInput,
   ResolveUncertaintyFactInput,
+  RenewWakeObligationClaimInput,
   MarkWakeObligationDecisionRequiredInput,
-  SupersedeDeliveryAttemptEvidenceInput,
   SupersedeWakeObligationInput,
+  SuspendWakeObligationInput,
   WakeObligationControlInput,
   UpdateWakeObligationInput,
-  UpdateDeliveryAttemptEvidenceInput,
+  UpdateWakeObligationProjectionInput,
   UpdateDurableRuntimeStepInput,
   UpdateDurableRuntimeTimerInput,
 } from "./types.js";
@@ -92,7 +84,7 @@ type DurableRuntimeRunRow = {
   idempotency_key: string | null;
   request_hash: string | null;
   status: DurableRuntimeRunStatus;
-  source_type: string | null;
+  source_owner: string | null;
   source_ref: string | null;
   input_ref: string | null;
   created_at: number;
@@ -106,8 +98,6 @@ type DurableRuntimeRunRow = {
   turn_id: string | null;
   work_unit_id: string | null;
   report_route_id: string | null;
-  claimed_by: string | null;
-  claim_expires_at: number | null;
   heartbeat_at: number | null;
   metadata_json: string | null;
 };
@@ -206,6 +196,8 @@ type DurableRuntimeSignalRow = {
 
 type WakeObligationRow = {
   wake_id: string;
+  source_owner: string;
+  source_ref: string;
   parent_run_id: string | null;
   parent_session_key: string | null;
   target_agent: string | null;
@@ -234,6 +226,8 @@ type WakeObligationRow = {
 
 type UncertaintyFactRow = {
   fact_id: string;
+  source_owner: string;
+  source_ref: string;
   kind: UncertaintyFact["kind"];
   source_run_id: string | null;
   step_id: string | null;
@@ -251,36 +245,10 @@ type UncertaintyFactRow = {
   metadata_json: string | null;
 };
 
-type DurableContinuationCleanupAuditRow = {
-  cleanup_id: string;
-  target_kind: DurableContinuationCleanupTargetKind;
-  target_id: string;
-  runtime_run_id: string | null;
-  step_id: string | null;
-  superseded_by_ref: string | null;
-  reason: string | null;
-  requested_by: string | null;
-  dedupe_key: string;
-  status: DurableContinuationCleanupStatus;
-  created_at: number | bigint;
-  metadata_json: string | null;
-};
-
-type DurableDedupeLedgerEntryRow = {
-  ledger_id: string;
-  scope: DurableDedupeScope;
-  dedupe_key: string;
-  subject_ref: string | null;
-  operation_kind: string | null;
-  status: DurableDedupeLedgerStatus;
-  first_seen_at: number | bigint;
-  last_seen_at: number | bigint;
-  hit_count: number | bigint;
-  metadata_json: string | null;
-};
-
 type DeliveryAttemptEvidenceRow = {
   delivery_attempt_id: string;
+  source_owner: string;
+  source_ref: string;
   wake_id: string;
   dedupe_key: string;
   replay_pass_id: string | null;
@@ -305,6 +273,8 @@ type DeliveryAttemptEvidenceRow = {
 
 type DurableUnresolvedObligationRow = {
   obligation_id: string;
+  source_owner: string;
+  source_ref: string;
   kind: DurableUnresolvedObligation["kind"];
   runtime_run_id: string | null;
   step_id: string | null;
@@ -318,26 +288,95 @@ type DurableUnresolvedObligationRow = {
   metadata_json: string | null;
 };
 
+type PendingSubagentDeliveryRow = {
+  run_id: string;
+  requester_session_key: string;
+  pending_final_delivery_created_at: number | null;
+  pending_final_delivery_last_attempt_at: number | null;
+  pending_final_delivery_attempt_count: number | null;
+  pending_final_delivery_last_error: string | null;
+  created_at: number;
+};
+
+type PendingDeliveryQueueRow = {
+  queue_name: string;
+  id: string;
+  status: string;
+  session_key: string | null;
+  channel: string | null;
+  target: string | null;
+  retry_count: number | bigint;
+  last_attempt_at: number | null;
+  last_error: string | null;
+  recovery_state: string | null;
+  enqueued_at: number;
+  updated_at: number;
+};
+
+type ExpiredStateLeaseRow = {
+  scope: string;
+  lease_key: string;
+  owner: string;
+  expires_at: number | null;
+  heartbeat_at: number | null;
+  payload_json: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
 type CountRow = { count: number | bigint };
 type DurableRuntimeDatabase = Pick<
   OpenClawStateKyselyDatabase,
-  | "durable_runtime_continuation_cleanup"
-  | "durable_runtime_dedupe_ledger"
-  | "durable_runtime_events"
-  | "durable_runtime_links"
-  | "durable_runtime_wake_obligations"
-  | "durable_runtime_refs"
-  | "durable_runtime_runs"
-  | "durable_runtime_signals"
-  | "durable_runtime_steps"
-  | "durable_runtime_timers"
-  | "durable_runtime_uncertainty_facts"
-  | "durable_runtime_delivery_attempt_evidence"
+  | "durable_event_evidence"
+  | "durable_run_correlations"
+  | "wake_obligations"
+  | "durable_payload_refs"
+  | "durable_execution_records"
+  | "durable_signal_evidence"
+  | "durable_execution_steps"
+  | "durable_timer_obligations"
+  | "uncertainty_facts"
+  | "delivery_attempt_evidence"
+  | "delivery_queue_entries"
+  | "state_leases"
+  | "subagent_runs"
 >;
 type SyncQuery<Row> = Parameters<typeof executeSqliteQuerySync<Row>>[1];
 
 function optionalText(value: string | undefined): string | null {
   return value && value.trim() ? value : null;
+}
+
+const DURABLE_STEP_LEASE_SCOPE = "durable_execution_step";
+const WAKE_OBLIGATION_LEASE_SCOPE = "wake_obligation";
+
+function wakeRetryDelayMs(params: {
+  wakeId: string;
+  attemptCount: number;
+  retryBaseMs: number;
+  retryMaxMs: number;
+}): number {
+  const exponent = Math.max(0, Math.min(20, params.attemptCount - 1));
+  const base = Math.min(params.retryMaxMs, params.retryBaseMs * 2 ** exponent);
+  const hash = [...params.wakeId].reduce((sum, char) => sum + char.charCodeAt(0), 0);
+  const jitter = 0.75 + (hash % 51) / 100;
+  return Math.min(params.retryMaxMs, Math.max(params.retryBaseMs, Math.round(base * jitter)));
+}
+
+function durableStepLeaseKey(runtimeRunId: string, stepId: string): string {
+  return `${runtimeRunId}:${stepId}`;
+}
+
+function requireSourceRef(
+  input: { sourceOwner: string; sourceRef: string },
+  subject: string,
+): { sourceOwner: string; sourceRef: string } {
+  const sourceOwner = optionalText(input.sourceOwner);
+  const sourceRef = optionalText(input.sourceRef);
+  if (!sourceOwner || !sourceRef) {
+    throw new Error(`${subject} requires sourceOwner and sourceRef`);
+  }
+  return { sourceOwner, sourceRef };
 }
 
 function serializeJson(value: Record<string, unknown> | undefined): string | null {
@@ -382,6 +421,9 @@ function buildWakeControlDecision(
     ...(input.reason ? { reason: input.reason } : {}),
     ...(input.decisionRef ? { decisionRef: input.decisionRef } : {}),
     ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+    ...(input.expectedSourceRevision
+      ? { expectedSourceRevision: input.expectedSourceRevision }
+      : {}),
     ...(input.evidence ? { evidence: input.evidence } : {}),
     ...(input.metadata ? { metadata: input.metadata } : {}),
     decidedAt: now,
@@ -411,6 +453,18 @@ function latestWakeControl(metadataJson: string | null): Record<string, unknown>
   return isRecordValue(control) ? control : undefined;
 }
 
+function matchesExpectedWakeSourceRevision(
+  current: WakeObligationRow,
+  expectedSourceRevision: string | undefined,
+): boolean {
+  const expected = optionalText(expectedSourceRevision);
+  if (!expected) {
+    return true;
+  }
+  const metadata = parseMetadata(current.metadata_json);
+  return optionalText(String(metadata.sourceRevision ?? "")) === expected;
+}
+
 function isMatchingControlNoop(
   current: WakeObligationRow,
   kind: WakeObligationControlDecisionKind,
@@ -433,9 +487,11 @@ function rowToRun(row: DurableRuntimeRunRow): DurableRuntimeRun {
     recoveryState: row.recovery_state,
     ...(row.idempotency_key ? { idempotencyKey: row.idempotency_key } : {}),
     ...(row.request_hash ? { requestHash: row.request_hash } : {}),
-    ...(row.source_type ? { sourceType: row.source_type, sourceOwner: row.source_type } : {}),
+    ...(row.source_owner ? { sourceOwner: row.source_owner } : {}),
     ...(row.source_ref ? { sourceRef: row.source_ref } : {}),
-    ...(metadata.rootOperationReason ? { rootOperationReason: String(metadata.rootOperationReason) } : {}),
+    ...(metadata.rootOperationReason
+      ? { rootOperationReason: String(metadata.rootOperationReason) }
+      : {}),
     ...(row.input_ref ? { inputRef: row.input_ref } : {}),
     ...(row.checkpoint_ref ? { checkpointRef: row.checkpoint_ref } : {}),
     ...(row.parent_runtime_run_id ? { parentRuntimeRunId: row.parent_runtime_run_id } : {}),
@@ -444,8 +500,6 @@ function rowToRun(row: DurableRuntimeRunRow): DurableRuntimeRun {
     ...(row.turn_id ? { turnId: row.turn_id } : {}),
     ...(row.work_unit_id ? { workUnitId: row.work_unit_id } : {}),
     ...(row.report_route_id ? { reportRouteId: row.report_route_id } : {}),
-    ...(row.claimed_by ? { claimedBy: row.claimed_by } : {}),
-    ...(row.claim_expires_at == null ? {} : { claimExpiresAt: row.claim_expires_at }),
     ...(row.heartbeat_at == null ? {} : { heartbeatAt: row.heartbeat_at }),
     ...(row.metadata_json ? { metadata } : {}),
     createdAt: row.created_at,
@@ -561,6 +615,8 @@ function rowToSignal(row: DurableRuntimeSignalRow): DurableRuntimeSignal {
 function rowToWakeObligation(row: WakeObligationRow): WakeObligation {
   return {
     wakeId: row.wake_id,
+    sourceOwner: row.source_owner,
+    sourceRef: row.source_ref,
     ...(row.parent_run_id ? { parentRunId: row.parent_run_id } : {}),
     ...(row.parent_session_key ? { parentSessionKey: row.parent_session_key } : {}),
     ...(row.target_agent ? { targetAgent: row.target_agent } : {}),
@@ -592,11 +648,11 @@ function rowToWakeObligation(row: WakeObligationRow): WakeObligation {
   };
 }
 
-function rowToUncertaintyFact(
-  row: UncertaintyFactRow,
-): UncertaintyFact {
+function rowToUncertaintyFact(row: UncertaintyFactRow): UncertaintyFact {
   return {
     factId: row.fact_id,
+    sourceOwner: row.source_owner,
+    sourceRef: row.source_ref,
     kind: row.kind,
     ...(row.source_run_id ? { sourceRunId: row.source_run_id } : {}),
     ...(row.step_id ? { stepId: row.step_id } : {}),
@@ -615,43 +671,11 @@ function rowToUncertaintyFact(
   };
 }
 
-function rowToContinuationCleanupAudit(
-  row: DurableContinuationCleanupAuditRow,
-): DurableContinuationCleanupAudit {
-  return {
-    cleanupId: row.cleanup_id,
-    targetKind: row.target_kind,
-    targetId: row.target_id,
-    ...(row.runtime_run_id ? { runtimeRunId: row.runtime_run_id } : {}),
-    ...(row.step_id ? { stepId: row.step_id } : {}),
-    ...(row.superseded_by_ref ? { supersededByRef: row.superseded_by_ref } : {}),
-    ...(row.reason ? { reason: row.reason } : {}),
-    ...(row.requested_by ? { requestedBy: row.requested_by } : {}),
-    dedupeKey: row.dedupe_key,
-    status: row.status,
-    ...(row.metadata_json ? { metadata: parseJsonRecord(row.metadata_json) } : {}),
-    createdAt: Number(row.created_at),
-  };
-}
-
-function rowToDedupeLedgerEntry(row: DurableDedupeLedgerEntryRow): DurableDedupeLedgerEntry {
-  return {
-    ledgerId: row.ledger_id,
-    scope: row.scope,
-    dedupeKey: row.dedupe_key,
-    ...(row.subject_ref ? { subjectRef: row.subject_ref } : {}),
-    ...(row.operation_kind ? { operationKind: row.operation_kind } : {}),
-    status: row.status,
-    firstSeenAt: Number(row.first_seen_at),
-    lastSeenAt: Number(row.last_seen_at),
-    hitCount: Number(row.hit_count),
-    ...(row.metadata_json ? { metadata: parseJsonRecord(row.metadata_json) } : {}),
-  };
-}
-
 function rowToDeliveryAttemptEvidence(row: DeliveryAttemptEvidenceRow): DeliveryAttemptEvidence {
   return {
     deliveryAttemptId: row.delivery_attempt_id,
+    sourceOwner: row.source_owner,
+    sourceRef: row.source_ref,
     wakeId: row.wake_id,
     dedupeKey: row.dedupe_key,
     ...(row.replay_pass_id ? { replayPassId: row.replay_pass_id } : {}),
@@ -682,6 +706,8 @@ function rowToUnresolvedObligation(
 ): DurableUnresolvedObligation {
   return {
     obligationId: row.obligation_id,
+    sourceOwner: row.source_owner,
+    sourceRef: row.source_ref,
     kind: row.kind,
     ...(row.runtime_run_id ? { runtimeRunId: row.runtime_run_id } : {}),
     ...(row.step_id ? { stepId: row.step_id } : {}),
@@ -762,42 +788,24 @@ function isAllowedWakeStatusTransition(
     return true;
   }
   if (current === "pending") {
-    return next === "delivered" || next === "acked" || next === "failed" || next === "superseded";
-  }
-  if (current === "delivered") {
-    return next === "acked" || next === "failed" || next === "superseded";
-  }
-  if (current === "failed") {
-    return next === "superseded";
-  }
-  return false;
-}
-
-function isTerminalDeliveryAttemptEvidenceStatus(status: DeliveryAttemptEvidenceStatus): boolean {
-  return status === "delivered" || status === "failed" || status === "superseded";
-}
-
-function isAllowedDeliveryAttemptEvidenceStatusTransition(
-  current: DeliveryAttemptEvidenceStatus,
-  next: DeliveryAttemptEvidenceStatus,
-): boolean {
-  if (current === next) {
-    return true;
-  }
-  if (current === "pending") {
     return (
-      next === "attempted" ||
       next === "delivered" ||
+      next === "acked" ||
       next === "failed" ||
-      next === "unknown" ||
+      next === "suspended" ||
       next === "superseded"
     );
   }
-  if (current === "attempted") {
-    return next === "delivered" || next === "failed" || next === "unknown" || next === "superseded";
+  if (current === "delivered") {
+    return next === "acked" || next === "failed" || next === "suspended" || next === "superseded";
   }
-  if (current === "unknown") {
-    return next === "delivered" || next === "failed" || next === "superseded";
+  if (current === "failed") {
+    return (
+      next === "delivered" || next === "acked" || next === "suspended" || next === "superseded"
+    );
+  }
+  if (current === "suspended") {
+    return next === "pending" || next === "acked" || next === "superseded";
   }
   return false;
 }
@@ -808,6 +816,9 @@ function isSameSqlValue(
 ): boolean {
   return left === right;
 }
+
+export const DURABLE_SQLITE_SCHEMA_VERSION = OPENCLAW_STATE_SCHEMA_VERSION;
+export const DURABLE_RUNTIME_SQLITE_SCHEMA_VERSION = DURABLE_SQLITE_SCHEMA_VERSION;
 
 export function openDurableRuntimeSqliteStore(storeOptions?: {
   path?: string;
@@ -830,6 +841,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
   let closed = false;
 
   const createWakeObligationRecord = (input: CreateWakeObligationInput): WakeObligation => {
+    const { sourceOwner, sourceRef } = requireSourceRef(input, "Durable wake obligation");
     const parentRunId = optionalText(input.parentRunId);
     const parentSessionKey = optionalText(input.parentSessionKey);
     const targetRef = optionalText(input.targetRef);
@@ -860,18 +872,17 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
     return runSqliteImmediateTransactionSync(db, () => {
       const existing = queryFirst<WakeObligationRow>(
         db,
-        durableDb
-          .selectFrom("durable_runtime_wake_obligations")
-          .selectAll()
-          .where("dedupe_key", "=", dedupeKey),
+        durableDb.selectFrom("wake_obligations").selectAll().where("dedupe_key", "=", dedupeKey),
       );
       if (existing) {
         return rowToWakeObligation(existing);
       }
       executeQuery(
         db,
-        durableDb.insertInto("durable_runtime_wake_obligations").values({
+        durableDb.insertInto("wake_obligations").values({
           wake_id: wakeId,
+          source_owner: sourceOwner,
+          source_ref: sourceRef,
           parent_run_id: parentRunId,
           parent_session_key: parentSessionKey,
           target_agent: optionalText(input.targetAgent),
@@ -900,10 +911,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       );
       const row = queryFirst<WakeObligationRow>(
         db,
-        durableDb
-          .selectFrom("durable_runtime_wake_obligations")
-          .selectAll()
-          .where("wake_id", "=", wakeId),
+        durableDb.selectFrom("wake_obligations").selectAll().where("wake_id", "=", wakeId),
       );
       return rowToWakeObligation(row!);
     });
@@ -916,10 +924,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
     return runSqliteImmediateTransactionSync(db, () => {
       const current = queryFirst<WakeObligationRow>(
         db,
-        durableDb
-          .selectFrom("durable_runtime_wake_obligations")
-          .selectAll()
-          .where("wake_id", "=", input.wakeId),
+        durableDb.selectFrom("wake_obligations").selectAll().where("wake_id", "=", input.wakeId),
       );
       if (!current) {
         return undefined;
@@ -934,6 +939,8 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
           : optionalText(input.failedReason ?? undefined);
       const nextMetadataJson =
         input.metadata === undefined ? current.metadata_json : serializeJson(input.metadata);
+      const nextFactsRef =
+        input.factsRef === undefined ? current.facts_ref : optionalText(input.factsRef);
       if (isTerminalWakeStatus(current.status)) {
         const isNoOp =
           input.status === current.status &&
@@ -941,6 +948,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
           isSameSqlValue(nextLastAttemptAt, current.last_attempt_at) &&
           isSameSqlValue(nextAckedAt, current.acked_at) &&
           isSameSqlValue(nextFailedReason, current.failed_reason) &&
+          isSameSqlValue(nextFactsRef, current.facts_ref) &&
           isSameSqlValue(nextMetadataJson, current.metadata_json);
         return isNoOp ? rowToWakeObligation(current) : undefined;
       }
@@ -950,13 +958,14 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       executeQuery(
         db,
         durableDb
-          .updateTable("durable_runtime_wake_obligations")
+          .updateTable("wake_obligations")
           .set({
             status: input.status,
             attempt_count: Number(nextAttemptCount),
             last_attempt_at: nextLastAttemptAt == null ? null : Number(nextLastAttemptAt),
             acked_at: nextAckedAt == null ? null : Number(nextAckedAt),
             failed_reason: nextFailedReason,
+            facts_ref: nextFactsRef,
             updated_at: now,
             metadata_json: nextMetadataJson,
           })
@@ -964,27 +973,55 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       );
       const row = queryFirst<WakeObligationRow>(
         db,
-        durableDb
-          .selectFrom("durable_runtime_wake_obligations")
-          .selectAll()
-          .where("wake_id", "=", input.wakeId),
+        durableDb.selectFrom("wake_obligations").selectAll().where("wake_id", "=", input.wakeId),
       );
       return rowToWakeObligation(row!);
+    });
+  };
+
+  const updateWakeObligationProjectionRecord = (
+    input: UpdateWakeObligationProjectionInput,
+  ): WakeObligation | undefined => {
+    const current = getWakeObligationRecord(input.wakeId);
+    if (!current) {
+      return undefined;
+    }
+    return updateWakeObligationRecord({
+      wakeId: input.wakeId,
+      status: current.status,
+      metadata: input.metadata,
+      factsRef: input.factsRef,
+      now: input.now,
+    });
+  };
+
+  const suspendWakeObligationRecord = (
+    input: SuspendWakeObligationInput,
+  ): WakeObligation | undefined => {
+    const current = getWakeObligationRecord(input.wakeId);
+    if (!current || isTerminalWakeStatus(current.status)) {
+      return undefined;
+    }
+    return updateWakeObligationRecord({
+      wakeId: input.wakeId,
+      status: "suspended",
+      failedReason: input.failedReason,
+      metadata: input.metadata,
+      now: input.now,
     });
   };
 
   const getWakeObligationRecord = (wakeId: string): WakeObligation | undefined => {
     const row = queryFirst<WakeObligationRow>(
       db,
-      durableDb
-        .selectFrom("durable_runtime_wake_obligations")
-        .selectAll()
-        .where("wake_id", "=", wakeId),
+      durableDb.selectFrom("wake_obligations").selectAll().where("wake_id", "=", wakeId),
     );
     return row ? rowToWakeObligation(row) : undefined;
   };
 
   const listWakeObligationRecords = (options?: {
+    sourceOwner?: string;
+    sourceRef?: string;
     parentRunId?: string;
     parentSessionKey?: string;
     targetKind?: WakeObligationTargetKind;
@@ -996,6 +1033,8 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
     status?: WakeObligationStatus;
     limit?: number;
   }): WakeObligation[] => {
+    const sourceOwner = optionalText(options?.sourceOwner);
+    const sourceRef = optionalText(options?.sourceRef);
     const parentRunId = optionalText(options?.parentRunId);
     const parentSessionKey = optionalText(options?.parentSessionKey);
     const targetRef = optionalText(options?.targetRef);
@@ -1004,8 +1043,10 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
     const rows = queryRows<WakeObligationRow>(
       db,
       durableDb
-        .selectFrom("durable_runtime_wake_obligations")
+        .selectFrom("wake_obligations")
         .selectAll()
+        .$if(Boolean(sourceOwner), (qb) => qb.where("source_owner", "=", sourceOwner!))
+        .$if(Boolean(sourceRef), (qb) => qb.where("source_ref", "=", sourceRef!))
         .$if(Boolean(parentRunId), (qb) => qb.where("parent_run_id", "=", parentRunId!))
         .$if(Boolean(parentSessionKey), (qb) =>
           qb.where("parent_session_key", "=", parentSessionKey!),
@@ -1029,16 +1070,22 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
   };
 
   const storeListUncertaintyFacts = (options?: {
+    sourceOwner?: string;
+    sourceRef?: string;
     sourceRunId?: string;
     status?: UncertaintyFactStatus;
     limit?: number;
   }): UncertaintyFact[] => {
+    const sourceOwner = optionalText(options?.sourceOwner);
+    const sourceRef = optionalText(options?.sourceRef);
     const sourceRunId = optionalText(options?.sourceRunId);
     const rows = queryRows<UncertaintyFactRow>(
       db,
       durableDb
-        .selectFrom("durable_runtime_uncertainty_facts")
+        .selectFrom("uncertainty_facts")
         .selectAll()
+        .$if(Boolean(sourceOwner), (qb) => qb.where("source_owner", "=", sourceOwner!))
+        .$if(Boolean(sourceRef), (qb) => qb.where("source_ref", "=", sourceRef!))
         .$if(Boolean(sourceRunId), (qb) => qb.where("source_run_id", "=", sourceRunId!))
         .$if(Boolean(options?.status), (qb) => qb.where("status", "=", options!.status!))
         .orderBy("updated_at", "desc")
@@ -1054,12 +1101,12 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
     const now = input.now ?? Date.now();
     const current = queryFirst<WakeObligationRow>(
       db,
-      durableDb
-        .selectFrom("durable_runtime_wake_obligations")
-        .selectAll()
-        .where("wake_id", "=", input.wakeId),
+      durableDb.selectFrom("wake_obligations").selectAll().where("wake_id", "=", input.wakeId),
     );
     if (!current) {
+      return undefined;
+    }
+    if (!matchesExpectedWakeSourceRevision(current, input.expectedSourceRevision)) {
       return undefined;
     }
     if (current.status === "acked") {
@@ -1084,12 +1131,12 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
     const now = input.now ?? Date.now();
     const current = queryFirst<WakeObligationRow>(
       db,
-      durableDb
-        .selectFrom("durable_runtime_wake_obligations")
-        .selectAll()
-        .where("wake_id", "=", input.wakeId),
+      durableDb.selectFrom("wake_obligations").selectAll().where("wake_id", "=", input.wakeId),
     );
     if (!current) {
+      return undefined;
+    }
+    if (!matchesExpectedWakeSourceRevision(current, input.expectedSourceRevision)) {
       return undefined;
     }
     if (current.status === "superseded") {
@@ -1112,18 +1159,47 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
     });
   };
 
+  const resumeWakeObligationRecord = (
+    input: ResumeWakeObligationInput,
+  ): WakeObligation | undefined => {
+    const now = input.now ?? Date.now();
+    const current = queryFirst<WakeObligationRow>(
+      db,
+      durableDb.selectFrom("wake_obligations").selectAll().where("wake_id", "=", input.wakeId),
+    );
+    if (!current) {
+      return undefined;
+    }
+    if (!matchesExpectedWakeSourceRevision(current, input.expectedSourceRevision)) {
+      return undefined;
+    }
+    if (current.status !== "suspended") {
+      return isMatchingControlNoop(current, "resumed", input.idempotencyKey)
+        ? rowToWakeObligation(current)
+        : undefined;
+    }
+    const decision = buildWakeControlDecision(input, "resumed", now);
+    return updateWakeObligationRecord({
+      wakeId: input.wakeId,
+      status: "pending",
+      failedReason: null,
+      metadata: mergeWakeControlMetadata(current.metadata_json, decision),
+      now,
+    });
+  };
+
   const markWakeObligationDecisionRequiredRecord = (
     input: MarkWakeObligationDecisionRequiredInput,
   ): WakeObligation | undefined => {
     const now = input.now ?? Date.now();
     const current = queryFirst<WakeObligationRow>(
       db,
-      durableDb
-        .selectFrom("durable_runtime_wake_obligations")
-        .selectAll()
-        .where("wake_id", "=", input.wakeId),
+      durableDb.selectFrom("wake_obligations").selectAll().where("wake_id", "=", input.wakeId),
     );
     if (!current) {
+      return undefined;
+    }
+    if (!matchesExpectedWakeSourceRevision(current, input.expectedSourceRevision)) {
       return undefined;
     }
     if (isTerminalWakeStatus(current.status)) {
@@ -1140,7 +1216,9 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
     });
   };
 
-  const getWakeObligationInspectionRecord = (wakeId: string): WakeObligationInspection | undefined => {
+  const getWakeObligationInspectionRecord = (
+    wakeId: string,
+  ): WakeObligationInspection | undefined => {
     const wake = getWakeObligationRecord(wakeId);
     if (!wake) {
       return undefined;
@@ -1148,12 +1226,11 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
     const metadata = wake.metadata ?? {};
     const diagnostics = isRecordValue(metadata.diagnostics) ? metadata.diagnostics : undefined;
     const evidence = isRecordValue(metadata.evidence) ? metadata.evidence : undefined;
-    const unresolvedUncertaintyFacts = wake.sourceRunId
-      ? storeListUncertaintyFacts({
-          sourceRunId: wake.sourceRunId,
-          status: "open",
-        })
-      : [];
+    const unresolvedUncertaintyFacts = storeListUncertaintyFacts({
+      sourceOwner: wake.sourceOwner,
+      sourceRef: wake.sourceRef,
+      status: "open",
+    });
     return {
       wake,
       targetResolution: {
@@ -1172,6 +1249,8 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       deliveryAttemptEvidence: listDeliveryAttemptEvidenceRecords({ wakeId }),
       unresolvedUncertaintyFacts,
       sourceRefs: {
+        sourceOwner: wake.sourceOwner,
+        sourceRef: wake.sourceRef,
         ...(wake.factsRef ? { factsRef: wake.factsRef } : {}),
         ...(wake.sourceRunId ? { sourceRunId: wake.sourceRunId } : {}),
         dedupeKey: wake.dedupeKey,
@@ -1181,308 +1260,331 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
     };
   };
 
-  const recordDeliveryAttemptEvidenceRecord = (
-    input: RecordDeliveryAttemptEvidenceInput,
-  ): DeliveryAttemptEvidence => {
-    const now = input.now ?? Date.now();
-    const deliveryAttemptId = input.deliveryAttemptId ?? `wake_delivery_${randomUUID()}`;
-    const dedupeKey = optionalText(input.dedupeKey);
-    if (!dedupeKey) {
-      throw new Error("Durable delivery attempt evidence requires a dedupeKey");
-    }
-    return runSqliteImmediateTransactionSync(db, () => {
-      const existing = queryFirst<DeliveryAttemptEvidenceRow>(
-        db,
-        durableDb
-          .selectFrom("durable_runtime_delivery_attempt_evidence")
-          .selectAll()
-          .where("dedupe_key", "=", dedupeKey),
-      );
-      if (existing) {
-        return rowToDeliveryAttemptEvidence(existing);
-      }
-      const wake = queryFirst<WakeObligationRow>(
-        db,
-        durableDb
-          .selectFrom("durable_runtime_wake_obligations")
-          .selectAll()
-          .where("wake_id", "=", input.wakeId),
-      );
-      if (!wake) {
-        throw new Error(`Durable delivery attempt evidence references unknown wake ${input.wakeId}`);
-      }
-      executeQuery(
-        db,
-        durableDb.insertInto("durable_runtime_delivery_attempt_evidence").values({
-          delivery_attempt_id: deliveryAttemptId,
-          wake_id: input.wakeId,
-          dedupe_key: dedupeKey,
-          replay_pass_id: optionalText(input.replayPassId),
-          target_kind: optionalText(input.targetKind),
-          target_ref: optionalText(input.targetRef),
-          route_kind: optionalText(input.routeKind),
-          route_ref: optionalText(input.routeRef),
-          status: input.status ?? "pending",
-          evidence_json: serializeJson(input.evidence),
-          error_message: optionalText(input.error),
-          scheduled_at: now,
-          attempted_at: input.attemptedAt ?? null,
-          delivered_at: input.deliveredAt ?? null,
-          failed_at: input.failedAt ?? null,
-          unknown_at: input.unknownAt ?? null,
-          delivery_claimed_by: null,
-          delivery_claim_expires_at: null,
-          created_at: now,
-          updated_at: now,
-          metadata_json: serializeJson(input.metadata),
-        }),
-      );
-      executeQuery(
-        db,
-        durableDb
-          .updateTable("durable_runtime_wake_obligations")
-          .set({
-            attempt_count: Number(wake.attempt_count) + 1,
-            last_attempt_at: now,
-            updated_at: now,
-          })
-          .where("wake_id", "=", input.wakeId),
-      );
-      const row = queryFirst<DeliveryAttemptEvidenceRow>(
-        db,
-        durableDb
-          .selectFrom("durable_runtime_delivery_attempt_evidence")
-          .selectAll()
-          .where("delivery_attempt_id", "=", deliveryAttemptId),
-      );
-      return rowToDeliveryAttemptEvidence(row!);
-    });
-  };
-
-  const updateDeliveryAttemptEvidenceRecord = (
-    input: UpdateDeliveryAttemptEvidenceInput,
-  ): DeliveryAttemptEvidence | undefined => {
-    const now = input.now ?? Date.now();
-    return runSqliteImmediateTransactionSync(db, () => {
-      const current = queryFirst<DeliveryAttemptEvidenceRow>(
-        db,
-        durableDb
-          .selectFrom("durable_runtime_delivery_attempt_evidence")
-          .selectAll()
-          .where("delivery_attempt_id", "=", input.deliveryAttemptId),
-      );
-      if (!current) {
-        return undefined;
-      }
-      const nextEvidenceJson =
-        input.evidence === undefined ? current.evidence_json : serializeJson(input.evidence);
-      const nextError =
-        input.error === undefined ? current.error_message : optionalText(input.error ?? undefined);
-      const nextAttemptedAt =
-        input.attemptedAt === undefined ? current.attempted_at : input.attemptedAt;
-      const nextDeliveredAt =
-        input.deliveredAt === undefined ? current.delivered_at : input.deliveredAt;
-      const nextFailedAt = input.failedAt === undefined ? current.failed_at : input.failedAt;
-      const nextUnknownAt = input.unknownAt === undefined ? current.unknown_at : input.unknownAt;
-      const nextMetadataJson =
-        input.metadata === undefined ? current.metadata_json : serializeJson(input.metadata);
-      if (isTerminalDeliveryAttemptEvidenceStatus(current.status)) {
-        const isNoOp =
-          input.status === current.status &&
-          isSameSqlValue(nextEvidenceJson, current.evidence_json) &&
-          isSameSqlValue(nextError, current.error_message) &&
-          isSameSqlValue(nextAttemptedAt, current.attempted_at) &&
-          isSameSqlValue(nextDeliveredAt, current.delivered_at) &&
-          isSameSqlValue(nextFailedAt, current.failed_at) &&
-          isSameSqlValue(nextUnknownAt, current.unknown_at) &&
-          isSameSqlValue(nextMetadataJson, current.metadata_json);
-        return isNoOp ? rowToDeliveryAttemptEvidence(current) : undefined;
-      }
-      if (!isAllowedDeliveryAttemptEvidenceStatusTransition(current.status, input.status)) {
-        return undefined;
-      }
-      const nextClaim =
-        input.status === "delivered" ||
-        input.status === "failed" ||
-        input.status === "unknown" ||
-        input.status === "superseded"
-          ? { delivery_claimed_by: null, delivery_claim_expires_at: null }
-          : {};
-      const expectedClaimedBy = optionalText(input.expectedClaimedBy);
-      const affected = executeQuery(
-        db,
-        durableDb
-          .updateTable("durable_runtime_delivery_attempt_evidence")
-          .set({
-            status: input.status,
-            evidence_json: nextEvidenceJson,
-            error_message: nextError,
-            attempted_at: nextAttemptedAt == null ? null : Number(nextAttemptedAt),
-            delivered_at: nextDeliveredAt == null ? null : Number(nextDeliveredAt),
-            failed_at: nextFailedAt == null ? null : Number(nextFailedAt),
-            unknown_at: nextUnknownAt == null ? null : Number(nextUnknownAt),
-            ...nextClaim,
-            updated_at: now,
-            metadata_json: nextMetadataJson,
-          })
-          .where("delivery_attempt_id", "=", input.deliveryAttemptId)
-          .$if(Boolean(expectedClaimedBy), (qb) =>
-            qb.where("delivery_claimed_by", "=", expectedClaimedBy!),
-          ),
-      );
-      if (affected !== 1) {
-        return undefined;
-      }
-      const row = queryFirst<DeliveryAttemptEvidenceRow>(
-        db,
-        durableDb
-          .selectFrom("durable_runtime_delivery_attempt_evidence")
-          .selectAll()
-          .where("delivery_attempt_id", "=", input.deliveryAttemptId),
-      );
-      return rowToDeliveryAttemptEvidence(row!);
-    });
-  };
-
-  const finalizeDeliveryAttemptEvidenceRecord = (
-    input: FinalizeDeliveryAttemptEvidenceInput,
-  ): DeliveryAttemptEvidence | undefined => {
-    const now = input.now ?? Date.now();
-    return runSqliteImmediateTransactionSync(db, () => {
-      const current = queryFirst<DeliveryAttemptEvidenceRow>(
-        db,
-        durableDb
-          .selectFrom("durable_runtime_delivery_attempt_evidence")
-          .selectAll()
-          .where("delivery_attempt_id", "=", input.deliveryAttemptId),
-      );
-      if (!current) {
-        return undefined;
-      }
-      if (input.status !== input.wakeStatus) {
-        return undefined;
-      }
-      const wake = queryFirst<WakeObligationRow>(
-        db,
-        durableDb
-          .selectFrom("durable_runtime_wake_obligations")
-          .selectAll()
-          .where("wake_id", "=", current.wake_id),
-      );
-      if (!wake) {
-        return undefined;
-      }
-      const nextWakeAttemptCount = input.wakeAttemptCount ?? wake.attempt_count;
-      const nextWakeLastAttemptAt =
-        input.wakeLastAttemptAt === undefined ? wake.last_attempt_at : input.wakeLastAttemptAt;
-      const nextWakeFailedReason =
-        input.wakeFailedReason === undefined
-          ? wake.failed_reason
-          : optionalText(input.wakeFailedReason ?? undefined);
-      if (isTerminalWakeStatus(wake.status)) {
-        const isNoOp =
-          input.wakeStatus === wake.status &&
-          isSameSqlValue(nextWakeAttemptCount, wake.attempt_count) &&
-          isSameSqlValue(nextWakeLastAttemptAt, wake.last_attempt_at) &&
-          isSameSqlValue(nextWakeFailedReason, wake.failed_reason);
-        if (!isNoOp) {
-          return undefined;
-        }
-      } else if (!isAllowedWakeStatusTransition(wake.status, input.wakeStatus)) {
-        return undefined;
-      }
-
-      const nextEvidenceJson =
-        input.evidence === undefined ? current.evidence_json : serializeJson(input.evidence);
-      const nextError =
-        input.error === undefined ? current.error_message : optionalText(input.error ?? undefined);
-      const nextAttemptedAt =
-        input.attemptedAt === undefined ? current.attempted_at : input.attemptedAt;
-      const nextDeliveredAt =
-        input.deliveredAt === undefined ? current.delivered_at : input.deliveredAt;
-      const nextFailedAt = input.failedAt === undefined ? current.failed_at : input.failedAt;
-      const nextUnknownAt = input.unknownAt === undefined ? current.unknown_at : input.unknownAt;
-      const nextMetadataJson =
-        input.metadata === undefined ? current.metadata_json : serializeJson(input.metadata);
-      const expectedClaimedBy = optionalText(input.expectedClaimedBy);
-      const affected = executeQuery(
-        db,
-        durableDb
-          .updateTable("durable_runtime_delivery_attempt_evidence")
-          .set({
-            status: input.status,
-            evidence_json: nextEvidenceJson,
-            error_message: nextError,
-            attempted_at: nextAttemptedAt == null ? null : Number(nextAttemptedAt),
-            delivered_at: nextDeliveredAt == null ? null : Number(nextDeliveredAt),
-            failed_at: nextFailedAt == null ? null : Number(nextFailedAt),
-            unknown_at: nextUnknownAt == null ? null : Number(nextUnknownAt),
-            delivery_claimed_by: null,
-            delivery_claim_expires_at: null,
-            updated_at: now,
-            metadata_json: nextMetadataJson,
-          })
-          .where("delivery_attempt_id", "=", input.deliveryAttemptId)
-          .$if(Boolean(expectedClaimedBy), (qb) =>
-            qb.where("delivery_claimed_by", "=", expectedClaimedBy!),
-          ),
-      );
-      if (affected !== 1) {
-        return undefined;
-      }
-      executeQuery(
-        db,
-        durableDb
-          .updateTable("durable_runtime_wake_obligations")
-          .set({
-            status: input.wakeStatus,
-            attempt_count: Number(nextWakeAttemptCount),
-            last_attempt_at: nextWakeLastAttemptAt == null ? null : Number(nextWakeLastAttemptAt),
-            failed_reason: nextWakeFailedReason,
-            updated_at: now,
-          })
-          .where("wake_id", "=", current.wake_id),
-      );
-      const row = queryFirst<DeliveryAttemptEvidenceRow>(
-        db,
-        durableDb
-          .selectFrom("durable_runtime_delivery_attempt_evidence")
-          .selectAll()
-          .where("delivery_attempt_id", "=", input.deliveryAttemptId),
-      );
-      return rowToDeliveryAttemptEvidence(row!);
-    });
-  };
-
-  const renewDeliveryAttemptEvidenceClaimRecord = (
-    input: RenewDeliveryAttemptEvidenceClaimInput,
-  ): DeliveryAttemptEvidence | undefined => {
+  const claimNextWakeObligationRecord = (
+    input: ClaimNextWakeObligationInput,
+  ): WakeObligationClaim | undefined => {
     const now = input.now ?? Date.now();
     const claimExpiresAt = now + input.claimTtlMs;
-    const replayPassId = optionalText(input.replayPassId);
-    if (!replayPassId) {
+    return runSqliteImmediateTransactionSync(db, () => {
+      const candidates = queryRows<WakeObligationRow>(
+        db,
+        durableDb
+          .selectFrom("wake_obligations")
+          .selectAll()
+          .where("status", "in", ["pending", "failed"])
+          .orderBy("updated_at", "asc")
+          .orderBy("wake_id", "asc")
+          .limit(100),
+      );
+      for (const candidate of candidates) {
+        const retryDelay = wakeRetryDelayMs({
+          wakeId: candidate.wake_id,
+          attemptCount: Number(candidate.attempt_count),
+          retryBaseMs: input.retryBaseMs,
+          retryMaxMs: input.retryMaxMs,
+        });
+        if (
+          candidate.last_attempt_at !== null &&
+          Number(candidate.last_attempt_at) + retryDelay > now
+        ) {
+          continue;
+        }
+
+        const ambiguousAttempt = queryFirst<DeliveryAttemptEvidenceRow>(
+          db,
+          durableDb
+            .selectFrom("delivery_attempt_evidence")
+            .selectAll()
+            .where("wake_id", "=", candidate.wake_id)
+            .where("status", "=", "attempted")
+            .orderBy("scheduled_at", "desc")
+            .limit(1),
+        );
+        if (
+          ambiguousAttempt &&
+          ambiguousAttempt.delivery_claim_expires_at !== null &&
+          ambiguousAttempt.delivery_claim_expires_at <= now
+        ) {
+          executeQuery(
+            db,
+            durableDb
+              .updateTable("delivery_attempt_evidence")
+              .set({
+                status: "unknown",
+                error_message: "wake dispatch claim expired before durable completion evidence",
+                unknown_at: now,
+                delivery_claimed_by: null,
+                delivery_claim_expires_at: null,
+                updated_at: now,
+              })
+              .where("delivery_attempt_id", "=", ambiguousAttempt.delivery_attempt_id),
+          );
+          executeQuery(
+            db,
+            durableDb
+              .updateTable("wake_obligations")
+              .set({
+                status: "suspended",
+                failed_reason: "dispatch_outcome_unknown",
+                updated_at: now,
+              })
+              .where("wake_id", "=", candidate.wake_id),
+          );
+          executeQuery(
+            db,
+            durableDb
+              .deleteFrom("state_leases")
+              .where("scope", "=", WAKE_OBLIGATION_LEASE_SCOPE)
+              .where("lease_key", "=", candidate.wake_id),
+          );
+          executeQuery(
+            db,
+            durableDb
+              .insertInto("uncertainty_facts")
+              .values({
+                fact_id: `uncertainty_${randomUUID()}`,
+                source_owner: candidate.source_owner,
+                source_ref: candidate.source_ref,
+                kind: "delivery_unknown",
+                source_run_id: candidate.source_run_id,
+                step_id: null,
+                event_id: null,
+                ref_id: ambiguousAttempt.delivery_attempt_id,
+                facts_ref: candidate.facts_ref,
+                dedupe_key: `wake-dispatch-unknown:${ambiguousAttempt.delivery_attempt_id}`,
+                facts_json: JSON.stringify({
+                  wakeId: candidate.wake_id,
+                  deliveryAttemptId: ambiguousAttempt.delivery_attempt_id,
+                }),
+                status: "open",
+                resolution_kind: null,
+                resolution_ref: null,
+                resolved_at: null,
+                created_at: now,
+                updated_at: now,
+                metadata_json: null,
+              })
+              .onConflict((conflict) => conflict.column("dedupe_key").doNothing()),
+          );
+          continue;
+        }
+
+        executeQuery(
+          db,
+          durableDb
+            .deleteFrom("state_leases")
+            .where("scope", "=", WAKE_OBLIGATION_LEASE_SCOPE)
+            .where("lease_key", "=", candidate.wake_id)
+            .where("expires_at", "<=", now),
+        );
+        const existingLease = queryFirst<{ owner: string }>(
+          db,
+          durableDb
+            .selectFrom("state_leases")
+            .select("owner")
+            .where("scope", "=", WAKE_OBLIGATION_LEASE_SCOPE)
+            .where("lease_key", "=", candidate.wake_id),
+        );
+        if (existingLease) {
+          continue;
+        }
+
+        const claimToken = `wake_claim_${randomUUID()}`;
+        const deliveryAttemptId = `wake_delivery_${randomUUID()}`;
+        const attemptNumber = Number(candidate.attempt_count) + 1;
+        executeQuery(
+          db,
+          durableDb.insertInto("state_leases").values({
+            scope: WAKE_OBLIGATION_LEASE_SCOPE,
+            lease_key: candidate.wake_id,
+            owner: claimToken,
+            expires_at: claimExpiresAt,
+            heartbeat_at: now,
+            payload_json: JSON.stringify({
+              wakeId: candidate.wake_id,
+              deliveryAttemptId,
+              workerId: input.workerId,
+            }),
+            created_at: now,
+            updated_at: now,
+          }),
+        );
+        executeQuery(
+          db,
+          durableDb.insertInto("delivery_attempt_evidence").values({
+            delivery_attempt_id: deliveryAttemptId,
+            source_owner: candidate.source_owner,
+            source_ref: candidate.source_ref,
+            wake_id: candidate.wake_id,
+            dedupe_key: `${candidate.wake_id}:dispatch:${attemptNumber}`,
+            replay_pass_id: claimToken,
+            target_kind: candidate.target_kind,
+            target_ref: candidate.target_ref,
+            route_kind: candidate.target_kind,
+            route_ref: candidate.report_route_ref ?? candidate.target_ref,
+            status: "attempted",
+            evidence_json: JSON.stringify({ workerId: input.workerId }),
+            error_message: null,
+            scheduled_at: now,
+            attempted_at: now,
+            delivered_at: null,
+            failed_at: null,
+            unknown_at: null,
+            delivery_claimed_by: claimToken,
+            delivery_claim_expires_at: claimExpiresAt,
+            created_at: now,
+            updated_at: now,
+            metadata_json: null,
+          }),
+        );
+        executeQuery(
+          db,
+          durableDb
+            .updateTable("wake_obligations")
+            .set({ attempt_count: attemptNumber, last_attempt_at: now, updated_at: now })
+            .where("wake_id", "=", candidate.wake_id),
+        );
+        const wake = queryFirst<WakeObligationRow>(
+          db,
+          durableDb
+            .selectFrom("wake_obligations")
+            .selectAll()
+            .where("wake_id", "=", candidate.wake_id),
+        );
+        const attempt = queryFirst<DeliveryAttemptEvidenceRow>(
+          db,
+          durableDb
+            .selectFrom("delivery_attempt_evidence")
+            .selectAll()
+            .where("delivery_attempt_id", "=", deliveryAttemptId),
+        );
+        return {
+          wake: rowToWakeObligation(wake!),
+          deliveryAttempt: rowToDeliveryAttemptEvidence(attempt!),
+          claimToken,
+          claimExpiresAt,
+        };
+      }
+      return undefined;
+    });
+  };
+
+  const completeWakeObligationClaimRecord = (
+    input: CompleteWakeObligationClaimInput,
+  ): DeliveryAttemptEvidence | undefined => {
+    const now = input.now ?? Date.now();
+    const validPair =
+      (input.attemptStatus === "delivered" && input.wakeStatus === "delivered") ||
+      (input.attemptStatus === "failed" &&
+        (input.wakeStatus === "failed" || input.wakeStatus === "suspended")) ||
+      (input.attemptStatus === "unknown" && input.wakeStatus === "suspended") ||
+      (input.attemptStatus === "superseded" && input.wakeStatus === "superseded");
+    if (!validPair) {
       return undefined;
     }
     return runSqliteImmediateTransactionSync(db, () => {
-      const affected = executeQuery(
+      const lease = queryFirst<{ expires_at: number | bigint | null }>(
         db,
         durableDb
-          .updateTable("durable_runtime_delivery_attempt_evidence")
+          .selectFrom("state_leases")
+          .select("expires_at")
+          .where("scope", "=", WAKE_OBLIGATION_LEASE_SCOPE)
+          .where("lease_key", "=", input.wakeId)
+          .where("owner", "=", input.claimToken),
+      );
+      if (!lease || lease.expires_at === null || Number(lease.expires_at) <= now) {
+        return undefined;
+      }
+      const current = queryFirst<DeliveryAttemptEvidenceRow>(
+        db,
+        durableDb
+          .selectFrom("delivery_attempt_evidence")
+          .selectAll()
+          .where("delivery_attempt_id", "=", input.deliveryAttemptId)
+          .where("wake_id", "=", input.wakeId)
+          .where("delivery_claimed_by", "=", input.claimToken),
+      );
+      const wake = queryFirst<WakeObligationRow>(
+        db,
+        durableDb.selectFrom("wake_obligations").selectAll().where("wake_id", "=", input.wakeId),
+      );
+      if (!current || !wake || isTerminalWakeStatus(wake.status)) {
+        return undefined;
+      }
+      if (!isAllowedWakeStatusTransition(wake.status, input.wakeStatus)) {
+        return undefined;
+      }
+      executeQuery(
+        db,
+        durableDb
+          .updateTable("delivery_attempt_evidence")
           .set({
-            delivery_claim_expires_at: claimExpiresAt,
+            status: input.attemptStatus,
+            evidence_json: serializeJson(input.evidence),
+            error_message: optionalText(input.error),
+            delivered_at: input.attemptStatus === "delivered" ? now : null,
+            failed_at: input.attemptStatus === "failed" ? now : null,
+            unknown_at: input.attemptStatus === "unknown" ? now : null,
+            delivery_claimed_by: null,
+            delivery_claim_expires_at: null,
             updated_at: now,
           })
-          .where("delivery_attempt_id", "=", input.deliveryAttemptId)
-          .where("status", "=", "attempted")
-          .where("delivery_claimed_by", "=", replayPassId),
+          .where("delivery_attempt_id", "=", input.deliveryAttemptId),
       );
-      if (affected !== 1) {
-        return undefined;
+      executeQuery(
+        db,
+        durableDb
+          .updateTable("wake_obligations")
+          .set({
+            status: input.wakeStatus,
+            failed_reason:
+              input.wakeStatus === "failed" || input.wakeStatus === "suspended"
+                ? optionalText(input.error)
+                : null,
+            updated_at: now,
+          })
+          .where("wake_id", "=", input.wakeId),
+      );
+      executeQuery(
+        db,
+        durableDb
+          .deleteFrom("state_leases")
+          .where("scope", "=", WAKE_OBLIGATION_LEASE_SCOPE)
+          .where("lease_key", "=", input.wakeId)
+          .where("owner", "=", input.claimToken),
+      );
+      if (input.attemptStatus === "unknown") {
+        executeQuery(
+          db,
+          durableDb
+            .insertInto("uncertainty_facts")
+            .values({
+              fact_id: `uncertainty_${randomUUID()}`,
+              source_owner: wake.source_owner,
+              source_ref: wake.source_ref,
+              kind: "delivery_unknown",
+              source_run_id: wake.source_run_id,
+              step_id: null,
+              event_id: null,
+              ref_id: input.deliveryAttemptId,
+              facts_ref: wake.facts_ref,
+              dedupe_key: `wake-dispatch-unknown:${input.deliveryAttemptId}`,
+              facts_json: serializeJson(input.evidence),
+              status: "open",
+              resolution_kind: null,
+              resolution_ref: null,
+              resolved_at: null,
+              created_at: now,
+              updated_at: now,
+              metadata_json: null,
+            })
+            .onConflict((conflict) => conflict.column("dedupe_key").doNothing()),
+        );
       }
       const row = queryFirst<DeliveryAttemptEvidenceRow>(
         db,
         durableDb
-          .selectFrom("durable_runtime_delivery_attempt_evidence")
+          .selectFrom("delivery_attempt_evidence")
           .selectAll()
           .where("delivery_attempt_id", "=", input.deliveryAttemptId),
       );
@@ -1490,51 +1592,61 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
     });
   };
 
-  const claimDeliveryAttemptEvidenceRecord = (
-    input: ClaimDeliveryAttemptEvidenceInput,
-  ): DeliveryAttemptEvidence | undefined => {
+  const renewWakeObligationClaimRecord = (input: RenewWakeObligationClaimInput): boolean => {
     const now = input.now ?? Date.now();
     const claimExpiresAt = now + input.claimTtlMs;
     return runSqliteImmediateTransactionSync(db, () => {
-      const affected = executeQuery(
+      const lease = queryFirst<{ expires_at: number | bigint | null }>(
         db,
         durableDb
-          .updateTable("durable_runtime_delivery_attempt_evidence")
-          .set({
-            replay_pass_id: optionalText(input.replayPassId),
-            status: "attempted",
-            evidence_json: input.evidence === undefined ? undefined : serializeJson(input.evidence),
-            attempted_at: now,
-            delivery_claimed_by: optionalText(input.replayPassId),
-            delivery_claim_expires_at: claimExpiresAt,
-            updated_at: now,
-            metadata_json: input.metadata === undefined ? undefined : serializeJson(input.metadata),
-          })
+          .selectFrom("state_leases")
+          .select("expires_at")
+          .where("scope", "=", WAKE_OBLIGATION_LEASE_SCOPE)
+          .where("lease_key", "=", input.wakeId)
+          .where("owner", "=", input.claimToken),
+      );
+      const attempt = queryFirst<{
+        delivery_claim_expires_at: number | bigint | null;
+      }>(
+        db,
+        durableDb
+          .selectFrom("delivery_attempt_evidence")
+          .select("delivery_claim_expires_at")
           .where("delivery_attempt_id", "=", input.deliveryAttemptId)
-          .where((eb) =>
-            eb.or([
-              eb("status", "=", "pending"),
-              eb.and([
-                eb("status", "=", "attempted"),
-                eb.or([
-                  eb("delivery_claim_expires_at", "is", null),
-                  eb("delivery_claim_expires_at", "<=", now),
-                ]),
-              ]),
-            ]),
-          ),
+          .where("wake_id", "=", input.wakeId)
+          .where("status", "=", "attempted")
+          .where("delivery_claimed_by", "=", input.claimToken),
       );
-      if (affected !== 1) {
-        return undefined;
+      if (
+        !lease ||
+        lease.expires_at === null ||
+        Number(lease.expires_at) <= now ||
+        !attempt ||
+        attempt.delivery_claim_expires_at === null ||
+        Number(attempt.delivery_claim_expires_at) <= now
+      ) {
+        return false;
       }
-      const row = queryFirst<DeliveryAttemptEvidenceRow>(
+      const renewedLease = executeQuery(
         db,
         durableDb
-          .selectFrom("durable_runtime_delivery_attempt_evidence")
-          .selectAll()
-          .where("delivery_attempt_id", "=", input.deliveryAttemptId),
+          .updateTable("state_leases")
+          .set({ expires_at: claimExpiresAt, heartbeat_at: now, updated_at: now })
+          .where("scope", "=", WAKE_OBLIGATION_LEASE_SCOPE)
+          .where("lease_key", "=", input.wakeId)
+          .where("owner", "=", input.claimToken),
       );
-      return row ? rowToDeliveryAttemptEvidence(row) : undefined;
+      const renewedAttempt = executeQuery(
+        db,
+        durableDb
+          .updateTable("delivery_attempt_evidence")
+          .set({ delivery_claim_expires_at: claimExpiresAt, updated_at: now })
+          .where("delivery_attempt_id", "=", input.deliveryAttemptId)
+          .where("wake_id", "=", input.wakeId)
+          .where("status", "=", "attempted")
+          .where("delivery_claimed_by", "=", input.claimToken),
+      );
+      return renewedLease === 1 && renewedAttempt === 1;
     });
   };
 
@@ -1544,7 +1656,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
     const row = queryFirst<DeliveryAttemptEvidenceRow>(
       db,
       durableDb
-        .selectFrom("durable_runtime_delivery_attempt_evidence")
+        .selectFrom("delivery_attempt_evidence")
         .selectAll()
         .where("delivery_attempt_id", "=", deliveryAttemptId),
     );
@@ -1562,7 +1674,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
     const rows = queryRows<DeliveryAttemptEvidenceRow>(
       db,
       durableDb
-        .selectFrom("durable_runtime_delivery_attempt_evidence")
+        .selectFrom("delivery_attempt_evidence")
         .selectAll()
         .$if(Boolean(wakeId), (qb) => qb.where("wake_id", "=", wakeId!))
         .$if(Boolean(dedupeKey), (qb) => qb.where("dedupe_key", "=", dedupeKey!))
@@ -1574,50 +1686,20 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
     return rows.map(rowToDeliveryAttemptEvidence);
   };
 
-  const supersedeDeliveryAttemptEvidenceRecord = (
-    input: SupersedeDeliveryAttemptEvidenceInput,
-  ): DeliveryAttemptEvidence | undefined => {
-    const now = input.now ?? Date.now();
-    const current = queryFirst<DeliveryAttemptEvidenceRow>(
-      db,
-      durableDb
-        .selectFrom("durable_runtime_delivery_attempt_evidence")
-        .selectAll()
-        .where("delivery_attempt_id", "=", input.deliveryAttemptId),
-    );
-    if (!current || current.wake_id !== input.wakeId) {
-      return undefined;
-    }
-    if (current.status === "superseded") {
-      return rowToDeliveryAttemptEvidence(current);
-    }
-    const decision = buildWakeControlDecision(input, "superseded", now);
-    const currentMetadata = parseMetadata(current.metadata_json);
-    return updateDeliveryAttemptEvidenceRecord({
-      deliveryAttemptId: input.deliveryAttemptId,
-      status: "superseded",
-      evidence: {
-        kind: "wake_delivery_attempt_superseded",
-        ...(input.supersededByRef ? { supersededByRef: input.supersededByRef } : {}),
-        control: decision,
-      },
-      error: input.reason ?? null,
-      metadata: {
-        ...currentMetadata,
-        durableDeliveryAttemptEvidenceControl: decision,
-        ...(input.supersededByRef ? { supersededByRef: input.supersededByRef } : {}),
-      },
-      now,
-    });
-  };
-
   return {
     createRun(input: CreateDurableRuntimeRunInput): DurableRuntimeRun {
-      const sourceOwner = optionalText(input.sourceOwner ?? input.sourceType);
+      const sourceOwner = optionalText(input.sourceOwner);
       const sourceRef = optionalText(input.sourceRef);
       const rootOperationReason = optionalText(input.rootOperationReason);
       if ((sourceOwner && !sourceRef) || (!sourceOwner && sourceRef)) {
-        throw new Error("Durable execution record sourceOwner and sourceRef must be provided together");
+        throw new Error(
+          "Durable execution record sourceOwner and sourceRef must be provided together",
+        );
+      }
+      if (sourceOwner && sourceRef && rootOperationReason) {
+        throw new Error(
+          "Durable execution record must use sourceOwner/sourceRef or rootOperationReason, not both",
+        );
       }
       if ((!sourceOwner || !sourceRef) && !rootOperationReason) {
         throw new Error(
@@ -1630,7 +1712,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       const status = input.status ?? "received";
       const recoveryState = input.recoveryState ?? "runnable";
       const metadata = {
-        ...(input.metadata ?? {}),
+        ...input.metadata,
         ...(rootOperationReason ? { rootOperationReason } : {}),
       };
       return runSqliteImmediateTransactionSync(db, () => {
@@ -1639,7 +1721,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
           queryFirst<DurableRuntimeRunRow>(
             db,
             durableDb
-              .selectFrom("durable_runtime_runs")
+              .selectFrom("durable_execution_records")
               .selectAll()
               .where("operation_kind", "=", input.operationKind)
               .where("idempotency_key", "=", input.idempotencyKey),
@@ -1658,14 +1740,14 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         }
         executeQuery(
           db,
-          durableDb.insertInto("durable_runtime_runs").values({
+          durableDb.insertInto("durable_execution_records").values({
             runtime_run_id: runtimeRunId,
             operation_kind: input.operationKind,
             operation_version: operationVersion,
             idempotency_key: optionalText(input.idempotencyKey),
             request_hash: optionalText(input.requestHash),
             status,
-            source_type: sourceOwner,
+            source_owner: sourceOwner,
             source_ref: sourceRef,
             input_ref: optionalText(input.inputRef),
             created_at: now,
@@ -1679,8 +1761,6 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
             turn_id: optionalText(input.turnId),
             work_unit_id: optionalText(input.workUnitId),
             report_route_id: optionalText(input.reportRouteId),
-            claimed_by: null,
-            claim_expires_at: null,
             heartbeat_at: null,
             metadata_json: serializeJson(metadata),
           }),
@@ -1688,7 +1768,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const row = queryFirst<DurableRuntimeRunRow>(
           db,
           durableDb
-            .selectFrom("durable_runtime_runs")
+            .selectFrom("durable_execution_records")
             .selectAll()
             .where("runtime_run_id", "=", runtimeRunId),
         );
@@ -1700,7 +1780,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       const row = queryFirst<DurableRuntimeRunRow>(
         db,
         durableDb
-          .selectFrom("durable_runtime_runs")
+          .selectFrom("durable_execution_records")
           .selectAll()
           .where("runtime_run_id", "=", runtimeRunId),
       );
@@ -1713,7 +1793,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const current = queryFirst<DurableRuntimeRunRow>(
           db,
           durableDb
-            .selectFrom("durable_runtime_runs")
+            .selectFrom("durable_execution_records")
             .selectAll()
             .where("runtime_run_id", "=", input.runtimeRunId),
         );
@@ -1740,12 +1820,6 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
           input.reportRouteId === undefined
             ? current.report_route_id
             : optionalText(input.reportRouteId ?? undefined);
-        const nextClaimedBy =
-          input.claimedBy === undefined
-            ? current.claimed_by
-            : optionalText(input.claimedBy ?? undefined);
-        const nextClaimExpiresAt =
-          input.claimExpiresAt === undefined ? current.claim_expires_at : input.claimExpiresAt;
         const nextHeartbeatAt =
           input.heartbeatAt === undefined ? current.heartbeat_at : input.heartbeatAt;
         const nextMetadataJson =
@@ -1758,8 +1832,6 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
             isSameSqlValue(nextCheckpointRef, current.checkpoint_ref) &&
             isSameSqlValue(nextWorkUnitId, current.work_unit_id) &&
             isSameSqlValue(nextReportRouteId, current.report_route_id) &&
-            isSameSqlValue(nextClaimedBy, current.claimed_by) &&
-            isSameSqlValue(nextClaimExpiresAt, current.claim_expires_at) &&
             isSameSqlValue(nextHeartbeatAt, current.heartbeat_at) &&
             isSameSqlValue(nextMetadataJson, current.metadata_json);
           return isNoOp ? rowToRun(current) : undefined;
@@ -1767,7 +1839,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         executeQuery(
           db,
           durableDb
-            .updateTable("durable_runtime_runs")
+            .updateTable("durable_execution_records")
             .set({
               status: nextStatus,
               recovery_state: nextRecoveryState,
@@ -1776,8 +1848,6 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
               checkpoint_ref: nextCheckpointRef,
               work_unit_id: nextWorkUnitId,
               report_route_id: nextReportRouteId,
-              claimed_by: nextClaimedBy,
-              claim_expires_at: nextClaimExpiresAt,
               heartbeat_at: nextHeartbeatAt,
               metadata_json: nextMetadataJson,
             })
@@ -1786,7 +1856,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const row = queryFirst<DurableRuntimeRunRow>(
           db,
           durableDb
-            .selectFrom("durable_runtime_runs")
+            .selectFrom("durable_execution_records")
             .selectAll()
             .where("runtime_run_id", "=", input.runtimeRunId),
         );
@@ -1802,7 +1872,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const latestEvent = queryFirst<Pick<DurableRuntimeEventRow, "event_seq">>(
           db,
           durableDb
-            .selectFrom("durable_runtime_events")
+            .selectFrom("durable_event_evidence")
             .select("event_seq")
             .where("runtime_run_id", "=", input.runtimeRunId)
             .orderBy("event_seq", "desc")
@@ -1811,7 +1881,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const nextSeq = (latestEvent?.event_seq ?? 0) + 1;
         executeQuery(
           db,
-          durableDb.insertInto("durable_runtime_events").values({
+          durableDb.insertInto("durable_event_evidence").values({
             event_id: eventId,
             runtime_run_id: input.runtimeRunId,
             event_seq: nextSeq,
@@ -1832,14 +1902,14 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         executeQuery(
           db,
           durableDb
-            .updateTable("durable_runtime_runs")
+            .updateTable("durable_execution_records")
             .set({ updated_at: recordedAt })
             .where("runtime_run_id", "=", input.runtimeRunId),
         );
         const row = queryFirst<DurableRuntimeEventRow>(
           db,
           durableDb
-            .selectFrom("durable_runtime_events")
+            .selectFrom("durable_event_evidence")
             .selectAll()
             .where("runtime_run_id", "=", input.runtimeRunId)
             .where("event_seq", "=", nextSeq),
@@ -1853,7 +1923,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       const rows = queryRows<DurableRuntimeRunRow>(
         db,
         durableDb
-          .selectFrom("durable_runtime_runs")
+          .selectFrom("durable_execution_records")
           .selectAll()
           .orderBy("updated_at", "desc")
           .orderBy("runtime_run_id", "desc")
@@ -1866,7 +1936,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       const limit = Math.max(1, Math.min(5000, Math.trunc(options?.limit ?? 500)));
       const operationKind = optionalText(options?.operationKind);
       const query = durableDb
-        .selectFrom("durable_runtime_runs")
+        .selectFrom("durable_execution_records")
         .selectAll()
         .where("status", "not in", ["succeeded", "failed", "cancelled", "lost"])
         .$if(Boolean(operationKind), (qb) => qb.where("operation_kind", "=", operationKind!))
@@ -1874,103 +1944,6 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         .orderBy("runtime_run_id", "asc")
         .limit(limit);
       return queryRows<DurableRuntimeRunRow>(db, query).map(rowToRun);
-    },
-
-    claimNextRunnableRun(input: ClaimDurableRuntimeRunInput): DurableRuntimeRun | undefined {
-      const now = input.now ?? Date.now();
-      const claimExpiresAt = now + input.claimTtlMs;
-      return runSqliteImmediateTransactionSync(db, () => {
-        const operationKind = optionalText(input.operationKind);
-        const row = queryFirst<DurableRuntimeRunRow>(
-          db,
-          durableDb
-            .selectFrom("durable_runtime_runs")
-            .selectAll()
-            .$if(Boolean(operationKind), (qb) => qb.where("operation_kind", "=", operationKind!))
-            .where("status", "in", ["received", "queued"])
-            .where("recovery_state", "in", ["runnable", "claimed"])
-            .where((eb) =>
-              eb.or([
-                eb("claimed_by", "is", null),
-                eb("claim_expires_at", "is", null),
-                eb("claim_expires_at", "<=", now),
-              ]),
-            )
-            .orderBy("updated_at", "asc")
-            .orderBy("runtime_run_id", "asc")
-            .limit(1),
-        );
-        if (!row) {
-          return undefined;
-        }
-        executeQuery(
-          db,
-          durableDb
-            .updateTable("durable_runtime_runs")
-            .set({
-              status: "queued",
-              recovery_state: "claimed",
-              claimed_by: input.workerId,
-              claim_expires_at: claimExpiresAt,
-              heartbeat_at: now,
-              updated_at: now,
-            })
-            .where("runtime_run_id", "=", row.runtime_run_id),
-        );
-        const claimed = queryFirst<DurableRuntimeRunRow>(
-          db,
-          durableDb
-            .selectFrom("durable_runtime_runs")
-            .selectAll()
-            .where("runtime_run_id", "=", row.runtime_run_id),
-        );
-        return rowToRun(claimed!);
-      });
-    },
-
-    releaseRunClaim(input: {
-      runtimeRunId: string;
-      workerId: string;
-      now?: number;
-    }): DurableRuntimeRun | undefined {
-      const now = input.now ?? Date.now();
-      return runSqliteImmediateTransactionSync(db, () => {
-        const current = queryFirst<DurableRuntimeRunRow>(
-          db,
-          durableDb
-            .selectFrom("durable_runtime_runs")
-            .selectAll()
-            .where("runtime_run_id", "=", input.runtimeRunId)
-            .where("claimed_by", "=", input.workerId)
-            .where("status", "not in", ["succeeded", "failed", "cancelled", "lost"])
-            .where("recovery_state", "!=", "terminal")
-            .where("completed_at", "is", null),
-        );
-        if (!current) {
-          return undefined;
-        }
-        executeQuery(
-          db,
-          durableDb
-            .updateTable("durable_runtime_runs")
-            .set({
-              recovery_state: "runnable",
-              claimed_by: null,
-              claim_expires_at: null,
-              heartbeat_at: null,
-              updated_at: now,
-            })
-            .where("runtime_run_id", "=", input.runtimeRunId),
-        );
-        const row = queryFirst<DurableRuntimeRunRow>(
-          db,
-          durableDb
-            .selectFrom("durable_runtime_runs")
-            .selectAll()
-            .where("runtime_run_id", "=", input.runtimeRunId),
-        );
-        return row ? rowToRun(row) : undefined;
-      });
     },
 
     createStep(input: CreateDurableRuntimeStepInput): DurableRuntimeStep {
@@ -1985,7 +1958,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
           queryFirst<DurableRuntimeStepRow>(
             db,
             durableDb
-              .selectFrom("durable_runtime_steps")
+              .selectFrom("durable_execution_steps")
               .selectAll()
               .where("runtime_run_id", "=", input.runtimeRunId)
               .where("idempotency_key", "=", input.idempotencyKey),
@@ -1995,7 +1968,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         }
         executeQuery(
           db,
-          durableDb.insertInto("durable_runtime_steps").values({
+          durableDb.insertInto("durable_execution_steps").values({
             runtime_run_id: input.runtimeRunId,
             step_id: stepId,
             parent_step_id: optionalText(input.parentStepId),
@@ -2022,7 +1995,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const row = queryFirst<DurableRuntimeStepRow>(
           db,
           durableDb
-            .selectFrom("durable_runtime_steps")
+            .selectFrom("durable_execution_steps")
             .selectAll()
             .where("runtime_run_id", "=", input.runtimeRunId)
             .where("step_id", "=", stepId),
@@ -2037,7 +2010,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const current = queryFirst<DurableRuntimeStepRow>(
           db,
           durableDb
-            .selectFrom("durable_runtime_steps")
+            .selectFrom("durable_execution_steps")
             .selectAll()
             .where("runtime_run_id", "=", input.runtimeRunId)
             .where("step_id", "=", input.stepId),
@@ -2089,6 +2062,16 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
               : input.completedAt;
         const nextMetadataJson =
           input.metadata === undefined ? current.metadata_json : serializeJson(input.metadata);
+        if (nextClaimedBy !== null && nextClaimedBy !== current.claimed_by) {
+          return undefined;
+        }
+        if (
+          !expectedClaimedBy &&
+          ((input.claimExpiresAt != null && input.claimExpiresAt !== current.claim_expires_at) ||
+            (input.heartbeatAt != null && input.heartbeatAt !== current.heartbeat_at))
+        ) {
+          return undefined;
+        }
         if (isTerminalStepRow(current) && !input.allowTerminalReopen) {
           if (expectedClaimedBy && current.claimed_by !== expectedClaimedBy) {
             return undefined;
@@ -2113,10 +2096,34 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         if (expectedClaimedBy && current.claimed_by !== expectedClaimedBy) {
           return undefined;
         }
+        if (expectedClaimedBy) {
+          const lease = queryFirst<{ expires_at: number | bigint | null }>(
+            db,
+            durableDb
+              .selectFrom("state_leases")
+              .select("expires_at")
+              .where("scope", "=", DURABLE_STEP_LEASE_SCOPE)
+              .where("lease_key", "=", durableStepLeaseKey(input.runtimeRunId, input.stepId))
+              .where("owner", "=", expectedClaimedBy),
+          );
+          if (!lease || lease.expires_at === null || Number(lease.expires_at) <= now) {
+            return undefined;
+          }
+        }
+        if (expectedClaimedBy && nextClaimedBy === null) {
+          executeQuery(
+            db,
+            durableDb
+              .deleteFrom("state_leases")
+              .where("scope", "=", DURABLE_STEP_LEASE_SCOPE)
+              .where("lease_key", "=", durableStepLeaseKey(input.runtimeRunId, input.stepId))
+              .where("owner", "=", expectedClaimedBy),
+          );
+        }
         executeQuery(
           db,
           durableDb
-            .updateTable("durable_runtime_steps")
+            .updateTable("durable_execution_steps")
             .set({
               status: nextStatus,
               recovery_state: nextRecoveryState,
@@ -2140,7 +2147,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const row = queryFirst<DurableRuntimeStepRow>(
           db,
           durableDb
-            .selectFrom("durable_runtime_steps")
+            .selectFrom("durable_execution_steps")
             .selectAll()
             .where("runtime_run_id", "=", input.runtimeRunId)
             .where("step_id", "=", input.stepId),
@@ -2157,8 +2164,8 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const row = queryFirst<DurableRuntimeStepRow>(
           db,
           durableDb
-            .selectFrom("durable_runtime_steps as s")
-            .innerJoin("durable_runtime_runs as r", "r.runtime_run_id", "s.runtime_run_id")
+            .selectFrom("durable_execution_steps as s")
+            .innerJoin("durable_execution_records as r", "r.runtime_run_id", "s.runtime_run_id")
             .selectAll("s")
             .where("s.status", "in", ["pending", "queued"])
             .where("s.recovery_state", "in", ["runnable", "claimed"])
@@ -2180,14 +2187,52 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         if (!row) {
           return undefined;
         }
+        const leaseKey = durableStepLeaseKey(row.runtime_run_id, row.step_id);
         executeQuery(
           db,
           durableDb
-            .updateTable("durable_runtime_steps")
+            .deleteFrom("state_leases")
+            .where("scope", "=", DURABLE_STEP_LEASE_SCOPE)
+            .where("lease_key", "=", leaseKey)
+            .where("expires_at", "<=", now),
+        );
+        const existingLease = queryFirst<{ owner: string }>(
+          db,
+          durableDb
+            .selectFrom("state_leases")
+            .select("owner")
+            .where("scope", "=", DURABLE_STEP_LEASE_SCOPE)
+            .where("lease_key", "=", leaseKey),
+        );
+        if (existingLease) {
+          return undefined;
+        }
+        const claimToken = `claim_${randomUUID()}`;
+        executeQuery(
+          db,
+          durableDb.insertInto("state_leases").values({
+            scope: DURABLE_STEP_LEASE_SCOPE,
+            lease_key: leaseKey,
+            owner: claimToken,
+            expires_at: claimExpiresAt,
+            heartbeat_at: now,
+            payload_json: JSON.stringify({
+              runtimeRunId: row.runtime_run_id,
+              stepId: row.step_id,
+              workerId: input.workerId,
+            }),
+            created_at: now,
+            updated_at: now,
+          }),
+        );
+        executeQuery(
+          db,
+          durableDb
+            .updateTable("durable_execution_steps")
             .set({
               status: "queued",
               recovery_state: "claimed",
-              claimed_by: input.workerId,
+              claimed_by: claimToken,
               claim_expires_at: claimExpiresAt,
               heartbeat_at: now,
               updated_at: now,
@@ -2198,12 +2243,68 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const claimed = queryFirst<DurableRuntimeStepRow>(
           db,
           durableDb
-            .selectFrom("durable_runtime_steps")
+            .selectFrom("durable_execution_steps")
             .selectAll()
             .where("runtime_run_id", "=", row.runtime_run_id)
             .where("step_id", "=", row.step_id),
         );
         return rowToStep(claimed!);
+      });
+    },
+
+    renewStepClaim(input: {
+      runtimeRunId: string;
+      stepId: string;
+      workerId: string;
+      claimTtlMs: number;
+      now?: number;
+    }): DurableRuntimeStep | undefined {
+      const now = input.now ?? Date.now();
+      const claimExpiresAt = now + input.claimTtlMs;
+      return runSqliteImmediateTransactionSync(db, () => {
+        const renewed = executeQuery(
+          db,
+          durableDb
+            .updateTable("state_leases")
+            .set({
+              expires_at: claimExpiresAt,
+              heartbeat_at: now,
+              updated_at: now,
+            })
+            .where("scope", "=", DURABLE_STEP_LEASE_SCOPE)
+            .where("lease_key", "=", durableStepLeaseKey(input.runtimeRunId, input.stepId))
+            .where("owner", "=", input.workerId)
+            .where("expires_at", ">", now),
+        );
+        if (renewed !== 1) {
+          return undefined;
+        }
+        const updated = executeQuery(
+          db,
+          durableDb
+            .updateTable("durable_execution_steps")
+            .set({
+              claim_expires_at: claimExpiresAt,
+              heartbeat_at: now,
+              updated_at: now,
+            })
+            .where("runtime_run_id", "=", input.runtimeRunId)
+            .where("step_id", "=", input.stepId)
+            .where("claimed_by", "=", input.workerId)
+            .where("status", "not in", ["succeeded", "failed", "cancelled", "lost", "skipped"]),
+        );
+        if (updated !== 1) {
+          return undefined;
+        }
+        const row = queryFirst<DurableRuntimeStepRow>(
+          db,
+          durableDb
+            .selectFrom("durable_execution_steps")
+            .selectAll()
+            .where("runtime_run_id", "=", input.runtimeRunId)
+            .where("step_id", "=", input.stepId),
+        );
+        return row ? rowToStep(row) : undefined;
       });
     },
 
@@ -2218,7 +2319,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const current = queryFirst<DurableRuntimeStepRow>(
           db,
           durableDb
-            .selectFrom("durable_runtime_steps")
+            .selectFrom("durable_execution_steps")
             .selectAll()
             .where("runtime_run_id", "=", input.runtimeRunId)
             .where("step_id", "=", input.stepId)
@@ -2233,7 +2334,15 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         executeQuery(
           db,
           durableDb
-            .updateTable("durable_runtime_steps")
+            .deleteFrom("state_leases")
+            .where("scope", "=", DURABLE_STEP_LEASE_SCOPE)
+            .where("lease_key", "=", durableStepLeaseKey(input.runtimeRunId, input.stepId))
+            .where("owner", "=", input.workerId),
+        );
+        executeQuery(
+          db,
+          durableDb
+            .updateTable("durable_execution_steps")
             .set({
               status: current.status === "running" ? "queued" : current.status,
               recovery_state: "runnable",
@@ -2248,7 +2357,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const row = queryFirst<DurableRuntimeStepRow>(
           db,
           durableDb
-            .selectFrom("durable_runtime_steps")
+            .selectFrom("durable_execution_steps")
             .selectAll()
             .where("runtime_run_id", "=", input.runtimeRunId)
             .where("step_id", "=", input.stepId),
@@ -2261,7 +2370,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       const rows = queryRows<DurableRuntimeStepRow>(
         db,
         durableDb
-          .selectFrom("durable_runtime_steps")
+          .selectFrom("durable_execution_steps")
           .selectAll()
           .where("runtime_run_id", "=", runtimeRunId)
           .orderBy("created_at", "asc")
@@ -2275,7 +2384,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       const refId = input.refId ?? `ref_${randomUUID()}`;
       executeQuery(
         db,
-        durableDb.insertInto("durable_runtime_refs").values({
+        durableDb.insertInto("durable_payload_refs").values({
           ref_id: refId,
           runtime_run_id: input.runtimeRunId,
           step_id: optionalText(input.stepId),
@@ -2290,7 +2399,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       );
       const row = queryFirst<DurableRuntimeRefRow>(
         db,
-        durableDb.selectFrom("durable_runtime_refs").selectAll().where("ref_id", "=", refId),
+        durableDb.selectFrom("durable_payload_refs").selectAll().where("ref_id", "=", refId),
       );
       return rowToRef(row!);
     },
@@ -2298,7 +2407,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
     getRef(refId: string): DurableRuntimeRef | undefined {
       const row = queryFirst<DurableRuntimeRefRow>(
         db,
-        durableDb.selectFrom("durable_runtime_refs").selectAll().where("ref_id", "=", refId),
+        durableDb.selectFrom("durable_payload_refs").selectAll().where("ref_id", "=", refId),
       );
       return row ? rowToRef(row) : undefined;
     },
@@ -2307,7 +2416,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       const rows = queryRows<DurableRuntimeRefRow>(
         db,
         durableDb
-          .selectFrom("durable_runtime_refs")
+          .selectFrom("durable_payload_refs")
           .selectAll()
           .where("runtime_run_id", "=", runtimeRunId)
           .orderBy("created_at", "asc")
@@ -2320,7 +2429,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       const now = input.now ?? Date.now();
       executeQuery(
         db,
-        durableDb.insertInto("durable_runtime_links").values({
+        durableDb.insertInto("durable_run_correlations").values({
           parent_runtime_run_id: input.parentRuntimeRunId,
           parent_step_id: input.parentStepId,
           child_runtime_run_id: input.childRuntimeRunId,
@@ -2334,7 +2443,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       const row = queryFirst<DurableRuntimeLinkRow>(
         db,
         durableDb
-          .selectFrom("durable_runtime_links")
+          .selectFrom("durable_run_correlations")
           .selectAll()
           .where("parent_runtime_run_id", "=", input.parentRuntimeRunId)
           .where("parent_step_id", "=", input.parentStepId)
@@ -2349,7 +2458,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const current = queryFirst<DurableRuntimeLinkRow>(
           db,
           durableDb
-            .selectFrom("durable_runtime_links")
+            .selectFrom("durable_run_correlations")
             .selectAll()
             .where("parent_runtime_run_id", "=", input.parentRuntimeRunId)
             .where("parent_step_id", "=", input.parentStepId)
@@ -2361,7 +2470,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         executeQuery(
           db,
           durableDb
-            .updateTable("durable_runtime_links")
+            .updateTable("durable_run_correlations")
             .set({
               status: input.status ?? current.status,
               updated_at: now,
@@ -2377,7 +2486,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const row = queryFirst<DurableRuntimeLinkRow>(
           db,
           durableDb
-            .selectFrom("durable_runtime_links")
+            .selectFrom("durable_run_correlations")
             .selectAll()
             .where("parent_runtime_run_id", "=", input.parentRuntimeRunId)
             .where("parent_step_id", "=", input.parentStepId)
@@ -2391,7 +2500,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       const rows = queryRows<DurableRuntimeLinkRow>(
         db,
         durableDb
-          .selectFrom("durable_runtime_links")
+          .selectFrom("durable_run_correlations")
           .selectAll()
           .where("parent_runtime_run_id", "=", parentRuntimeRunId)
           .orderBy("created_at", "asc")
@@ -2404,7 +2513,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       const rows = queryRows<DurableRuntimeLinkRow>(
         db,
         durableDb
-          .selectFrom("durable_runtime_links")
+          .selectFrom("durable_run_correlations")
           .selectAll()
           .where("child_runtime_run_id", "=", childRuntimeRunId)
           .orderBy("created_at", "asc")
@@ -2419,7 +2528,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       const timerId = input.timerId ?? `timer_${randomUUID()}`;
       executeQuery(
         db,
-        durableDb.insertInto("durable_runtime_timers").values({
+        durableDb.insertInto("durable_timer_obligations").values({
           timer_id: timerId,
           runtime_run_id: input.runtimeRunId,
           step_id: optionalText(input.stepId),
@@ -2434,7 +2543,10 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       );
       const row = queryFirst<DurableRuntimeTimerRow>(
         db,
-        durableDb.selectFrom("durable_runtime_timers").selectAll().where("timer_id", "=", timerId),
+        durableDb
+          .selectFrom("durable_timer_obligations")
+          .selectAll()
+          .where("timer_id", "=", timerId),
       );
       return rowToTimer(row!);
     },
@@ -2445,7 +2557,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const current = queryFirst<DurableRuntimeTimerRow>(
           db,
           durableDb
-            .selectFrom("durable_runtime_timers")
+            .selectFrom("durable_timer_obligations")
             .selectAll()
             .where("timer_id", "=", input.timerId),
         );
@@ -2455,7 +2567,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         executeQuery(
           db,
           durableDb
-            .updateTable("durable_runtime_timers")
+            .updateTable("durable_timer_obligations")
             .set({
               status: input.status,
               fired_at:
@@ -2476,7 +2588,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const row = queryFirst<DurableRuntimeTimerRow>(
           db,
           durableDb
-            .selectFrom("durable_runtime_timers")
+            .selectFrom("durable_timer_obligations")
             .selectAll()
             .where("timer_id", "=", input.timerId),
         );
@@ -2488,7 +2600,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       const rows = queryRows<DurableRuntimeTimerRow>(
         db,
         durableDb
-          .selectFrom("durable_runtime_timers")
+          .selectFrom("durable_timer_obligations")
           .selectAll()
           .$if(Boolean(runtimeRunId), (qb) => qb.where("runtime_run_id", "=", runtimeRunId!))
           .orderBy("due_at", "asc")
@@ -2502,7 +2614,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       const rows = queryRows<DurableRuntimeTimerRow>(
         db,
         durableDb
-          .selectFrom("durable_runtime_timers")
+          .selectFrom("durable_timer_obligations")
           .selectAll()
           .where("status", "=", "pending")
           .where("due_at", "<=", now)
@@ -2521,7 +2633,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
           queryFirst<DurableRuntimeSignalRow>(
             db,
             durableDb
-              .selectFrom("durable_runtime_signals")
+              .selectFrom("durable_signal_evidence")
               .selectAll()
               .where("runtime_run_id", "=", input.runtimeRunId)
               .where("idempotency_key", "=", input.idempotencyKey),
@@ -2532,7 +2644,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const signalId = input.signalId ?? `sig_${randomUUID()}`;
         executeQuery(
           db,
-          durableDb.insertInto("durable_runtime_signals").values({
+          durableDb.insertInto("durable_signal_evidence").values({
             signal_id: signalId,
             runtime_run_id: input.runtimeRunId,
             step_id: optionalText(input.stepId),
@@ -2548,7 +2660,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const row = queryFirst<DurableRuntimeSignalRow>(
           db,
           durableDb
-            .selectFrom("durable_runtime_signals")
+            .selectFrom("durable_signal_evidence")
             .selectAll()
             .where("signal_id", "=", signalId),
         );
@@ -2562,7 +2674,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const current = queryFirst<DurableRuntimeSignalRow>(
           db,
           durableDb
-            .selectFrom("durable_runtime_signals")
+            .selectFrom("durable_signal_evidence")
             .selectAll()
             .where("signal_id", "=", input.signalId),
         );
@@ -2572,14 +2684,14 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         executeQuery(
           db,
           durableDb
-            .updateTable("durable_runtime_signals")
+            .updateTable("durable_signal_evidence")
             .set({ consumed_at: current.consumed_at ?? now })
             .where("signal_id", "=", input.signalId),
         );
         const row = queryFirst<DurableRuntimeSignalRow>(
           db,
           durableDb
-            .selectFrom("durable_runtime_signals")
+            .selectFrom("durable_signal_evidence")
             .selectAll()
             .where("signal_id", "=", input.signalId),
         );
@@ -2592,7 +2704,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       const rows = queryRows<DurableRuntimeSignalRow>(
         db,
         durableDb
-          .selectFrom("durable_runtime_signals")
+          .selectFrom("durable_signal_evidence")
           .selectAll()
           .where("consumed_at", "is", null)
           .orderBy("received_at", "asc")
@@ -2606,7 +2718,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       const rows = queryRows<DurableRuntimeSignalRow>(
         db,
         durableDb
-          .selectFrom("durable_runtime_signals")
+          .selectFrom("durable_signal_evidence")
           .selectAll()
           .where("runtime_run_id", "=", runtimeRunId)
           .orderBy("received_at", "asc")
@@ -2619,8 +2731,14 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       return createWakeObligationRecord(input);
     },
 
-    updateWakeObligation(input: UpdateWakeObligationInput): WakeObligation | undefined {
-      return updateWakeObligationRecord(input);
+    updateWakeObligationProjection(
+      input: UpdateWakeObligationProjectionInput,
+    ): WakeObligation | undefined {
+      return updateWakeObligationProjectionRecord(input);
+    },
+
+    suspendWakeObligation(input: SuspendWakeObligationInput): WakeObligation | undefined {
+      return suspendWakeObligationRecord(input);
     },
 
     acknowledgeWakeObligation(input: WakeObligationControlInput): WakeObligation | undefined {
@@ -2629,6 +2747,10 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
 
     supersedeWakeObligation(input: SupersedeWakeObligationInput): WakeObligation | undefined {
       return supersedeWakeObligationRecord(input);
+    },
+
+    resumeWakeObligation(input: ResumeWakeObligationInput): WakeObligation | undefined {
+      return resumeWakeObligationRecord(input);
     },
 
     markWakeObligationDecisionRequired(
@@ -2646,6 +2768,8 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
     },
 
     listWakeObligations(options?: {
+      sourceOwner?: string;
+      sourceRef?: string;
       parentRunId?: string;
       parentSessionKey?: string;
       targetKind?: WakeObligationTargetKind;
@@ -2660,9 +2784,8 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       return listWakeObligationRecords(options);
     },
 
-    recordUncertaintyFact(
-      input: CreateUncertaintyFactInput,
-    ): UncertaintyFact {
+    recordUncertaintyFact(input: CreateUncertaintyFactInput): UncertaintyFact {
+      const { sourceOwner, sourceRef } = requireSourceRef(input, "Durable uncertainty fact");
       const now = input.now ?? Date.now();
       const factId = input.factId ?? `uncertain_${randomUUID()}`;
       const dedupeKey = optionalText(input.dedupeKey);
@@ -2672,7 +2795,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
           queryFirst<UncertaintyFactRow>(
             db,
             durableDb
-              .selectFrom("durable_runtime_uncertainty_facts")
+              .selectFrom("uncertainty_facts")
               .selectAll()
               .where("dedupe_key", "=", dedupeKey),
           );
@@ -2681,8 +2804,10 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         }
         executeQuery(
           db,
-          durableDb.insertInto("durable_runtime_uncertainty_facts").values({
+          durableDb.insertInto("uncertainty_facts").values({
             fact_id: factId,
+            source_owner: sourceOwner,
+            source_ref: sourceRef,
             kind: input.kind,
             source_run_id: optionalText(input.sourceRunId),
             step_id: optionalText(input.stepId),
@@ -2702,28 +2827,26 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         );
         const row = queryFirst<UncertaintyFactRow>(
           db,
-          durableDb
-            .selectFrom("durable_runtime_uncertainty_facts")
-            .selectAll()
-            .where("fact_id", "=", factId),
+          durableDb.selectFrom("uncertainty_facts").selectAll().where("fact_id", "=", factId),
         );
         return rowToUncertaintyFact(row!);
       });
     },
 
-    resolveUncertaintyFact(
-      input: ResolveUncertaintyFactInput,
-    ): UncertaintyFact | undefined {
+    resolveUncertaintyFact(input: ResolveUncertaintyFactInput): UncertaintyFact | undefined {
       const now = input.now ?? Date.now();
       return runSqliteImmediateTransactionSync(db, () => {
         const current = queryFirst<UncertaintyFactRow>(
           db,
-          durableDb
-            .selectFrom("durable_runtime_uncertainty_facts")
-            .selectAll()
-            .where("fact_id", "=", input.factId),
+          durableDb.selectFrom("uncertainty_facts").selectAll().where("fact_id", "=", input.factId),
         );
         if (!current) {
+          return undefined;
+        }
+        if (
+          input.expectedUpdatedAt !== undefined &&
+          Number(current.updated_at) !== input.expectedUpdatedAt
+        ) {
           return undefined;
         }
         if (current.status !== "open") {
@@ -2740,7 +2863,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         executeQuery(
           db,
           durableDb
-            .updateTable("durable_runtime_uncertainty_facts")
+            .updateTable("uncertainty_facts")
             .set({
               status: input.status,
               resolution_kind: optionalText(input.resolutionKind),
@@ -2756,16 +2879,15 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         );
         const row = queryFirst<UncertaintyFactRow>(
           db,
-          durableDb
-            .selectFrom("durable_runtime_uncertainty_facts")
-            .selectAll()
-            .where("fact_id", "=", input.factId),
+          durableDb.selectFrom("uncertainty_facts").selectAll().where("fact_id", "=", input.factId),
         );
         return rowToUncertaintyFact(row!);
       });
     },
 
     listUncertaintyFacts(options?: {
+      sourceOwner?: string;
+      sourceRef?: string;
       sourceRunId?: string;
       status?: UncertaintyFactStatus;
       limit?: number;
@@ -2773,188 +2895,18 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       return storeListUncertaintyFacts(options);
     },
 
-    recordContinuationCleanup(
-      input: RecordDurableContinuationCleanupInput,
-    ): DurableContinuationCleanupAudit {
-      const now = input.now ?? Date.now();
-      const cleanupId = input.cleanupId ?? `cleanup_${randomUUID()}`;
-      const dedupeKey = optionalText(input.dedupeKey);
-      if (!dedupeKey) {
-        throw new Error("Durable continuation cleanup requires a dedupeKey");
-      }
-      return runSqliteImmediateTransactionSync(db, () => {
-        const existing = queryFirst<DurableContinuationCleanupAuditRow>(
-          db,
-          durableDb
-            .selectFrom("durable_runtime_continuation_cleanup")
-            .selectAll()
-            .where("dedupe_key", "=", dedupeKey),
-        );
-        if (existing) {
-          return rowToContinuationCleanupAudit(existing);
-        }
-        executeQuery(
-          db,
-          durableDb.insertInto("durable_runtime_continuation_cleanup").values({
-            cleanup_id: cleanupId,
-            target_kind: input.targetKind,
-            target_id: input.targetId,
-            runtime_run_id: optionalText(input.runtimeRunId),
-            step_id: optionalText(input.stepId),
-            superseded_by_ref: optionalText(input.supersededByRef),
-            reason: optionalText(input.reason),
-            requested_by: optionalText(input.requestedBy),
-            dedupe_key: dedupeKey,
-            status: input.status ?? "superseded",
-            created_at: now,
-            metadata_json: serializeJson(input.metadata),
-          }),
-        );
-        const row = queryFirst<DurableContinuationCleanupAuditRow>(
-          db,
-          durableDb
-            .selectFrom("durable_runtime_continuation_cleanup")
-            .selectAll()
-            .where("cleanup_id", "=", cleanupId),
-        );
-        return rowToContinuationCleanupAudit(row!);
-      });
+    claimNextWakeObligation(input: ClaimNextWakeObligationInput): WakeObligationClaim | undefined {
+      return claimNextWakeObligationRecord(input);
     },
 
-    listContinuationCleanupAudit(options?: {
-      runtimeRunId?: string;
-      targetKind?: DurableContinuationCleanupTargetKind;
-      limit?: number;
-    }): DurableContinuationCleanupAudit[] {
-      const runtimeRunId = optionalText(options?.runtimeRunId);
-      const rows = queryRows<DurableContinuationCleanupAuditRow>(
-        db,
-        durableDb
-          .selectFrom("durable_runtime_continuation_cleanup")
-          .selectAll()
-          .$if(Boolean(runtimeRunId), (qb) => qb.where("runtime_run_id", "=", runtimeRunId!))
-          .$if(Boolean(options?.targetKind), (qb) =>
-            qb.where("target_kind", "=", options!.targetKind!),
-          )
-          .orderBy("created_at", "desc")
-          .orderBy("cleanup_id", "desc")
-          .limit(normalizeQueryLimit(options?.limit, 500)),
-      );
-      return rows.map(rowToContinuationCleanupAudit);
+    renewWakeObligationClaim(input: RenewWakeObligationClaimInput): boolean {
+      return renewWakeObligationClaimRecord(input);
     },
 
-    recordDedupeLedgerEntry(input: RecordDurableDedupeLedgerInput): DurableDedupeLedgerEntry {
-      const now = input.now ?? Date.now();
-      const ledgerId = input.ledgerId ?? `dedupe_${randomUUID()}`;
-      const dedupeKey = optionalText(input.dedupeKey);
-      if (!dedupeKey) {
-        throw new Error("Durable dedupe ledger requires a dedupeKey");
-      }
-      return runSqliteImmediateTransactionSync(db, () => {
-        const existing = queryFirst<DurableDedupeLedgerEntryRow>(
-          db,
-          durableDb
-            .selectFrom("durable_runtime_dedupe_ledger")
-            .selectAll()
-            .where("scope", "=", input.scope)
-            .where("dedupe_key", "=", dedupeKey),
-        );
-        if (existing) {
-          executeQuery(
-            db,
-            durableDb
-              .updateTable("durable_runtime_dedupe_ledger")
-              .set({ last_seen_at: now, hit_count: Number(existing.hit_count) + 1 })
-              .where("ledger_id", "=", existing.ledger_id),
-          );
-          const row = queryFirst<DurableDedupeLedgerEntryRow>(
-            db,
-            durableDb
-              .selectFrom("durable_runtime_dedupe_ledger")
-              .selectAll()
-              .where("ledger_id", "=", existing.ledger_id),
-          );
-          return rowToDedupeLedgerEntry(row!);
-        }
-        executeQuery(
-          db,
-          durableDb.insertInto("durable_runtime_dedupe_ledger").values({
-            ledger_id: ledgerId,
-            scope: input.scope,
-            dedupe_key: dedupeKey,
-            subject_ref: optionalText(input.subjectRef),
-            operation_kind: optionalText(input.operationKind),
-            status: input.status ?? "recorded",
-            first_seen_at: now,
-            last_seen_at: now,
-            hit_count: 1,
-            metadata_json: serializeJson(input.metadata),
-          }),
-        );
-        const row = queryFirst<DurableDedupeLedgerEntryRow>(
-          db,
-          durableDb
-            .selectFrom("durable_runtime_dedupe_ledger")
-            .selectAll()
-            .where("ledger_id", "=", ledgerId),
-        );
-        return rowToDedupeLedgerEntry(row!);
-      });
-    },
-
-    listDedupeLedgerEntries(options?: {
-      scope?: DurableDedupeScope;
-      status?: DurableDedupeLedgerStatus;
-      limit?: number;
-    }): DurableDedupeLedgerEntry[] {
-      const rows = queryRows<DurableDedupeLedgerEntryRow>(
-        db,
-        durableDb
-          .selectFrom("durable_runtime_dedupe_ledger")
-          .selectAll()
-          .$if(Boolean(options?.scope), (qb) => qb.where("scope", "=", options!.scope!))
-          .$if(Boolean(options?.status), (qb) => qb.where("status", "=", options!.status!))
-          .orderBy("last_seen_at", "desc")
-          .orderBy("ledger_id", "desc")
-          .limit(normalizeQueryLimit(options?.limit, 500)),
-      );
-      return rows.map(rowToDedupeLedgerEntry);
-    },
-
-    recordDeliveryAttemptEvidence(
-      input: RecordDeliveryAttemptEvidenceInput,
-    ): DeliveryAttemptEvidence {
-      return recordDeliveryAttemptEvidenceRecord(input);
-    },
-
-    claimDeliveryAttemptEvidence(
-      input: ClaimDeliveryAttemptEvidenceInput,
+    completeWakeObligationClaim(
+      input: CompleteWakeObligationClaimInput,
     ): DeliveryAttemptEvidence | undefined {
-      return claimDeliveryAttemptEvidenceRecord(input);
-    },
-
-    renewDeliveryAttemptEvidenceClaim(
-      input: RenewDeliveryAttemptEvidenceClaimInput,
-    ): DeliveryAttemptEvidence | undefined {
-      return renewDeliveryAttemptEvidenceClaimRecord(input);
-    },
-
-    updateDeliveryAttemptEvidence(
-      input: UpdateDeliveryAttemptEvidenceInput,
-    ): DeliveryAttemptEvidence | undefined {
-      return updateDeliveryAttemptEvidenceRecord(input);
-    },
-
-    finalizeDeliveryAttemptEvidence(
-      input: FinalizeDeliveryAttemptEvidenceInput,
-    ): DeliveryAttemptEvidence | undefined {
-      return finalizeDeliveryAttemptEvidenceRecord(input);
-    },
-
-    supersedeDeliveryAttemptEvidence(
-      input: SupersedeDeliveryAttemptEvidenceInput,
-    ): DeliveryAttemptEvidence | undefined {
-      return supersedeDeliveryAttemptEvidenceRecord(input);
+      return completeWakeObligationClaimRecord(input);
     },
 
     getDeliveryAttemptEvidence(deliveryAttemptId: string): DeliveryAttemptEvidence | undefined {
@@ -2994,7 +2946,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       const wakeRows = queryRows<WakeObligationRow>(
         db,
         durableDb
-          .selectFrom("durable_runtime_wake_obligations")
+          .selectFrom("wake_obligations")
           .selectAll()
           .where("status", "in", ["pending", "delivered", "failed"])
           .orderBy("updated_at", "desc")
@@ -3003,6 +2955,8 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       ).map(
         (row): DurableUnresolvedObligationRow => ({
           obligation_id: `wake:${row.wake_id}`,
+          source_owner: row.source_owner,
+          source_ref: row.source_ref,
           kind: "pending_wake",
           runtime_run_id: row.source_run_id,
           step_id: null,
@@ -3019,7 +2973,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       const uncertaintyRows = queryRows<UncertaintyFactRow>(
         db,
         durableDb
-          .selectFrom("durable_runtime_uncertainty_facts")
+          .selectFrom("uncertainty_facts")
           .selectAll()
           .where("status", "=", "open")
           .orderBy("updated_at", "desc")
@@ -3028,6 +2982,8 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       ).map(
         (row): DurableUnresolvedObligationRow => ({
           obligation_id: `uncertainty:${row.fact_id}`,
+          source_owner: row.source_owner,
+          source_ref: row.source_ref,
           kind: "unresolved_uncertainty",
           runtime_run_id: row.source_run_id,
           step_id: row.step_id,
@@ -3044,7 +3000,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       const childRows = queryRows<DurableRuntimeLinkRow>(
         db,
         durableDb
-          .selectFrom("durable_runtime_links")
+          .selectFrom("durable_run_correlations")
           .selectAll()
           .where("status", "in", ["pending", "running"])
           .orderBy("updated_at", "desc")
@@ -3053,6 +3009,8 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       ).map(
         (row): DurableUnresolvedObligationRow => ({
           obligation_id: `child:${row.parent_runtime_run_id}:${row.parent_step_id}:${row.child_runtime_run_id}`,
+          source_owner: "durable_run_correlations",
+          source_ref: `${row.parent_runtime_run_id}:${row.parent_step_id}:${row.child_runtime_run_id}`,
           kind: "open_child",
           runtime_run_id: row.parent_runtime_run_id,
           step_id: row.parent_step_id,
@@ -3066,97 +3024,136 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
           metadata_json: row.metadata_json,
         }),
       );
-      const expiredRunClaimRows = queryRows<DurableRuntimeRunRow>(
+      const pendingSubagentDeliveryRows = queryRows<PendingSubagentDeliveryRow>(
         db,
         durableDb
-          .selectFrom("durable_runtime_runs")
-          .selectAll()
-          .where("claimed_by", "is not", null)
-          .where("claim_expires_at", "is not", null)
-          .where("claim_expires_at", "<=", now)
-          .where("status", "not in", ["succeeded", "failed", "cancelled", "lost"])
-          .orderBy("updated_at", "desc")
-          .orderBy("runtime_run_id", "desc")
+          .selectFrom("subagent_runs")
+          .select([
+            "run_id",
+            "requester_session_key",
+            "pending_final_delivery_created_at",
+            "pending_final_delivery_last_attempt_at",
+            "pending_final_delivery_attempt_count",
+            "pending_final_delivery_last_error",
+            "created_at",
+          ])
+          .where("pending_final_delivery", "=", 1)
+          .orderBy("pending_final_delivery_last_attempt_at", "desc")
+          .orderBy("run_id", "desc")
           .limit(limit),
       ).map(
         (row): DurableUnresolvedObligationRow => ({
-          obligation_id: `run-claim:${row.runtime_run_id}`,
-          kind: "expired_run_claim",
-          runtime_run_id: row.runtime_run_id,
+          obligation_id: `subagent-delivery:${row.run_id}`,
+          source_owner: "subagent_runs",
+          source_ref: row.run_id,
+          kind: "pending_subagent_delivery",
+          runtime_run_id: null,
           step_id: null,
           wake_id: null,
           uncertainty_fact_id: null,
-          subject_ref: row.claimed_by,
-          reason: row.recovery_state,
-          status: row.status,
-          created_at: row.created_at,
-          updated_at: row.updated_at,
-          metadata_json: row.metadata_json,
+          subject_ref: row.requester_session_key,
+          reason: row.pending_final_delivery_last_error ?? "pending_final_delivery",
+          status: "pending",
+          created_at: row.pending_final_delivery_created_at ?? row.created_at,
+          updated_at:
+            row.pending_final_delivery_last_attempt_at ??
+            row.pending_final_delivery_created_at ??
+            row.created_at,
+          metadata_json: JSON.stringify({
+            attemptCount: row.pending_final_delivery_attempt_count ?? 0,
+          }),
         }),
       );
-      const expiredStepClaimRows = queryRows<DurableRuntimeStepRow>(
+      const pendingDeliveryQueueRows = queryRows<PendingDeliveryQueueRow>(
         db,
         durableDb
-          .selectFrom("durable_runtime_steps")
-          .selectAll()
-          .where("claimed_by", "is not", null)
-          .where("claim_expires_at", "is not", null)
-          .where("claim_expires_at", "<=", now)
-          .where("status", "not in", ["succeeded", "failed", "cancelled", "lost", "skipped"])
+          .selectFrom("delivery_queue_entries")
+          .select([
+            "queue_name",
+            "id",
+            "status",
+            "session_key",
+            "channel",
+            "target",
+            "retry_count",
+            "last_attempt_at",
+            "last_error",
+            "recovery_state",
+            "enqueued_at",
+            "updated_at",
+          ])
+          .where("status", "in", ["pending", "failed"])
           .orderBy("updated_at", "desc")
-          .orderBy("runtime_run_id", "desc")
-          .orderBy("step_id", "desc")
+          .orderBy("queue_name", "asc")
+          .orderBy("id", "asc")
           .limit(limit),
       ).map(
         (row): DurableUnresolvedObligationRow => ({
-          obligation_id: `step-claim:${row.runtime_run_id}:${row.step_id}`,
-          kind: "expired_step_claim",
-          runtime_run_id: row.runtime_run_id,
-          step_id: row.step_id,
+          obligation_id: `delivery-queue:${row.queue_name}:${row.id}`,
+          source_owner: "delivery_queue_entries",
+          source_ref: `${row.queue_name}:${row.id}`,
+          kind: "pending_delivery_queue",
+          runtime_run_id: null,
+          step_id: null,
           wake_id: null,
           uncertainty_fact_id: null,
-          subject_ref: row.claimed_by,
-          reason: row.recovery_state,
+          subject_ref: row.session_key ?? row.target,
+          reason: row.last_error ?? row.recovery_state ?? "delivery_queued",
           status: row.status,
-          created_at: row.created_at,
+          created_at: row.enqueued_at,
           updated_at: row.updated_at,
-          metadata_json: row.metadata_json,
+          metadata_json: JSON.stringify({
+            channel: row.channel,
+            target: row.target,
+            retryCount: Number(row.retry_count),
+            lastAttemptAt: row.last_attempt_at,
+          }),
         }),
       );
-      const resultMailboxRows = queryRows<DurableRuntimeStepRow>(
+      const expiredStateLeaseRows = queryRows<ExpiredStateLeaseRow>(
         db,
         durableDb
-          .selectFrom("durable_runtime_steps")
+          .selectFrom("state_leases")
           .selectAll()
-          .where("step_type", "=", "result_mailbox")
-          .where("status", "not in", ["succeeded", "failed", "cancelled", "lost", "skipped"])
+          .where("scope", "=", DURABLE_STEP_LEASE_SCOPE)
+          .where("expires_at", "is not", null)
+          .where("expires_at", "<=", now)
           .orderBy("updated_at", "desc")
-          .orderBy("runtime_run_id", "desc")
-          .orderBy("step_id", "desc")
+          .orderBy("scope", "asc")
+          .orderBy("lease_key", "asc")
           .limit(limit),
-      ).map(
-        (row): DurableUnresolvedObligationRow => ({
-          obligation_id: `result-mailbox:${row.runtime_run_id}:${row.step_id}`,
-          kind: "pending_result_mailbox",
-          runtime_run_id: row.runtime_run_id,
-          step_id: row.step_id,
+      ).map((row): DurableUnresolvedObligationRow => {
+        const payload = parseJsonRecord(row.payload_json);
+        const runtimeRunId =
+          typeof payload?.runtimeRunId === "string" ? payload.runtimeRunId : null;
+        const stepId = typeof payload?.stepId === "string" ? payload.stepId : null;
+        return {
+          obligation_id: `state-lease:${row.scope}:${row.lease_key}`,
+          source_owner: "state_leases",
+          source_ref: `${row.scope}:${row.lease_key}`,
+          kind: "expired_state_lease",
+          runtime_run_id: runtimeRunId,
+          step_id: stepId,
           wake_id: null,
           uncertainty_fact_id: null,
-          subject_ref: row.idempotency_key,
-          reason: row.step_type,
-          status: row.status,
+          subject_ref: row.owner,
+          reason: "lease_expired",
+          status: "expired",
           created_at: row.created_at,
           updated_at: row.updated_at,
-          metadata_json: row.metadata_json,
-        }),
-      );
+          metadata_json: JSON.stringify({
+            expiresAt: row.expires_at,
+            heartbeatAt: row.heartbeat_at,
+          }),
+        };
+      });
       return [
         ...wakeRows,
         ...uncertaintyRows,
         ...childRows,
-        ...expiredRunClaimRows,
-        ...expiredStepClaimRows,
-        ...resultMailboxRows,
+        ...pendingSubagentDeliveryRows,
+        ...pendingDeliveryQueueRows,
+        ...expiredStateLeaseRows,
       ]
         .toSorted((left, right) => {
           const updated = Number(right.updated_at) - Number(left.updated_at);
@@ -3175,7 +3172,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       const rows = queryRows<DurableRuntimeEventRow>(
         db,
         durableDb
-          .selectFrom("durable_runtime_events")
+          .selectFrom("durable_event_evidence")
           .selectAll()
           .where("runtime_run_id", "=", runtimeRunId)
           .$if(afterEventSeq !== 0, (qb) => qb.where("event_seq", ">", afterEventSeq))
@@ -3192,7 +3189,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const run = queryFirst<DurableRuntimeRunRow>(
           db,
           durableDb
-            .selectFrom("durable_runtime_runs")
+            .selectFrom("durable_execution_records")
             .selectAll()
             .where("runtime_run_id", "=", input.runtimeRunId),
         );
@@ -3206,7 +3203,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const totalEvents = count(
           db,
           durableDb
-            .selectFrom("durable_runtime_events")
+            .selectFrom("durable_event_evidence")
             .select((eb) => eb.fn.countAll<number>().as("count"))
             .where("runtime_run_id", "=", input.runtimeRunId),
         );
@@ -3220,7 +3217,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const cutoff = queryFirst<{ event_seq: number | bigint }>(
           db,
           durableDb
-            .selectFrom("durable_runtime_events")
+            .selectFrom("durable_event_evidence")
             .select("event_seq")
             .where("runtime_run_id", "=", input.runtimeRunId)
             .orderBy("event_seq", "desc")
@@ -3238,7 +3235,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         const removedEvents = executeQuery(
           db,
           durableDb
-            .deleteFrom("durable_runtime_events")
+            .deleteFrom("durable_event_evidence")
             .where("runtime_run_id", "=", input.runtimeRunId)
             .where("event_seq", "<", cutoffSeq),
         );
@@ -3253,7 +3250,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
           (queryFirst<Pick<DurableRuntimeEventRow, "event_seq">>(
             db,
             durableDb
-              .selectFrom("durable_runtime_events")
+              .selectFrom("durable_event_evidence")
               .select("event_seq")
               .where("runtime_run_id", "=", input.runtimeRunId)
               .orderBy("event_seq", "desc")
@@ -3261,7 +3258,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
           )?.event_seq ?? 0) + 1;
         executeQuery(
           db,
-          durableDb.insertInto("durable_runtime_events").values({
+          durableDb.insertInto("durable_event_evidence").values({
             event_id: `evt_${randomUUID()}`,
             runtime_run_id: input.runtimeRunId,
             event_seq: nextSeq,
@@ -3298,39 +3295,39 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         runs: count(
           db,
           durableDb
-            .selectFrom("durable_runtime_runs")
+            .selectFrom("durable_execution_records")
             .select((eb) => eb.fn.countAll<number>().as("count")),
         ),
         events: count(
           db,
           durableDb
-            .selectFrom("durable_runtime_events")
+            .selectFrom("durable_event_evidence")
             .select((eb) => eb.fn.countAll<number>().as("count")),
         ),
         steps: count(
           db,
           durableDb
-            .selectFrom("durable_runtime_steps")
+            .selectFrom("durable_execution_steps")
             .select((eb) => eb.fn.countAll<number>().as("count")),
         ),
         openRuns: count(
           db,
           durableDb
-            .selectFrom("durable_runtime_runs")
+            .selectFrom("durable_execution_records")
             .select((eb) => eb.fn.countAll<number>().as("count"))
             .where("status", "not in", ["succeeded", "failed", "cancelled", "lost"]),
         ),
         pendingWakes: count(
           db,
           durableDb
-            .selectFrom("durable_runtime_wake_obligations")
+            .selectFrom("wake_obligations")
             .select((eb) => eb.fn.countAll<number>().as("count"))
             .where("status", "in", ["pending", "delivered", "failed"]),
         ),
         unresolvedUncertaintyFacts: count(
           db,
           durableDb
-            .selectFrom("durable_runtime_uncertainty_facts")
+            .selectFrom("uncertainty_facts")
             .select((eb) => eb.fn.countAll<number>().as("count"))
             .where("status", "=", "open"),
         ),

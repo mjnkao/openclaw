@@ -1,15 +1,41 @@
 import { createSubsystemLogger } from "../logging/subsystem.js";
 // Gateway startup integration for the durable runtime control plane.
-import { isDurableRuntimesEnabled, isDurableWorkerEnabled } from "./config.js";
 import {
-  reconcileDurableAgentTurnContinuationsOnGatewayStartup,
+  isDurableAuthorityEnabled,
+  isDurableRuntimesEnabled,
+  isDurableWorkerEnabled,
+} from "./config.js";
+import { recordDurableRuntimeHealthFailure, recordDurableRuntimeHealthSuccess } from "./health.js";
+import { reconcileDurableOwnerAttentionFacts } from "./owner-adapters.js";
+import {
   reconcileDurableAgentTurnsOnGatewayStartup,
   reconcileDurableChatSendsOnGatewayStartup,
-  reconcileDurableSubagentRunsOnGatewayStartup,
 } from "./recovery.js";
 import { openDurableRuntimeStore } from "./store-factory.js";
 
 const log = createSubsystemLogger("durable/runtimes");
+
+export function assertDurableRuntimeAuthorityAvailable(env: NodeJS.ProcessEnv = process.env): void {
+  if (!isDurableAuthorityEnabled(env)) {
+    return;
+  }
+  try {
+    const store = openDurableRuntimeStore({ env });
+    try {
+      store.getStats();
+      recordDurableRuntimeHealthSuccess();
+    } finally {
+      store.close();
+    }
+  } catch (error) {
+    recordDurableRuntimeHealthFailure({
+      component: "startup",
+      operation: "authority_preflight",
+      error,
+    });
+    throw new Error(`Durable authority unavailable: ${String(error)}`, { cause: error });
+  }
+}
 
 export async function maybeRecordDurableGatewayStartup(params: {
   processInstanceId: string;
@@ -32,13 +58,6 @@ export async function maybeRecordDurableGatewayStartup(params: {
           now: params.startupStartedAt,
         })
       : { scanned: 0, markedLost: 0 };
-    const continuationRecovery = recoveryEnabled
-      ? reconcileDurableAgentTurnContinuationsOnGatewayStartup({
-          store,
-          processInstanceId: params.processInstanceId,
-          now: params.startupStartedAt,
-        })
-      : { scanned: 0, queuedRuns: 0 };
     const chatSendRecovery = recoveryEnabled
       ? reconcileDurableChatSendsOnGatewayStartup({
           store,
@@ -46,20 +65,18 @@ export async function maybeRecordDurableGatewayStartup(params: {
           now: params.startupStartedAt,
         })
       : { scanned: 0, markedLost: 0 };
-    const subagentRecovery = recoveryEnabled
-      ? reconcileDurableSubagentRunsOnGatewayStartup({
+    const ownerAttentionRecovery = recoveryEnabled
+      ? reconcileDurableOwnerAttentionFacts({
           store,
-          processInstanceId: params.processInstanceId,
           now: params.startupStartedAt,
         })
-      : { scanned: 0, markedLost: 0 };
+      : { scanned: 0, created: 0, suspended: 0 };
     const run = store.createRun({
       operationKind: "openclaw.gateway.startup",
       operationVersion: "1",
       status: "succeeded",
       recoveryState: "terminal",
-      sourceType: "gateway",
-      sourceRef: params.processInstanceId,
+      rootOperationReason: "gateway_startup_recovery_pass",
       metadata: {
         processInstanceId: params.processInstanceId,
         startupStartedAt: params.startupStartedAt,
@@ -76,18 +93,28 @@ export async function maybeRecordDurableGatewayStartup(params: {
       },
     });
     const stats = store.getStats();
+    recordDurableRuntimeHealthSuccess();
     log.info("recorded durable gateway startup", {
       runtimeRunId: run.runtimeRunId,
       path: stats.path,
       runs: stats.runs,
       events: stats.events,
       reconciledLostAgentTurns: recovery.markedLost,
-      reconciledSupersededContinuations: continuationRecovery.queuedRuns ?? 0,
       reconciledLostChatSends: chatSendRecovery.markedLost,
-      reconciledLostSubagentRuns: subagentRecovery.markedLost,
+      ownerAttentionFactsScanned: ownerAttentionRecovery.scanned,
+      wakeObligationsCreated: ownerAttentionRecovery.created,
+      wakeObligationsSuspended: ownerAttentionRecovery.suspended,
     });
   } catch (err) {
+    recordDurableRuntimeHealthFailure({
+      component: "startup",
+      operation: "startup_reconciliation",
+      error: err,
+    });
     log.warn(`durable runtime startup record failed: ${String(err)}`);
+    if (isDurableAuthorityEnabled(env)) {
+      throw err;
+    }
   } finally {
     store?.close();
   }

@@ -1253,7 +1253,7 @@ describe("scheduleRestartSentinelWake", () => {
     expect(mocks.requestHeartbeat).not.toHaveBeenCalled();
   });
 
-  it("falls back to the internal session route when restart routing cannot resolve a destination", async () => {
+  it("falls back to a session wake when restart routing cannot resolve a destination", async () => {
     mocks.readRestartSentinel.mockResolvedValue({
       payload: {
         sessionKey: "agent:main:main",
@@ -1276,21 +1276,12 @@ describe("scheduleRestartSentinelWake", () => {
 
     await scheduleRestartSentinelWake({ deps: {} as never });
 
-    expect(mocks.deliverOutboundPayloads).not.toHaveBeenCalled();
-    expect(mocks.enqueueSystemEvent).not.toHaveBeenCalled();
-    expect(mocks.requestHeartbeat).not.toHaveBeenCalled();
-    expectContinuationDispatchFields(
-      {
-        channel: "webchat",
-        routeSessionKey: "agent:main:main",
-      },
-      {
-        Body: "continue",
-        Provider: "webchat",
-        OriginatingChannel: "webchat",
-        OriginatingTo: "agent:main:main",
-      },
-    );
+    expect(mocks.recordInboundSessionAndDispatchReply).not.toHaveBeenCalled();
+    expect(mockCallArg(mocks.enqueueSystemEvent, 1)).toBe("continue");
+    expectNthSystemEventFields(1, {
+      sessionKey: "agent:main:main",
+    });
+    expect(mocks.requestHeartbeat).toHaveBeenCalledTimes(2);
     expect(mocks.logWarn).not.toHaveBeenCalled();
   });
 
@@ -1468,52 +1459,6 @@ describe("scheduleRestartSentinelWake", () => {
     expect(mocks.deliverOutboundPayloads).not.toHaveBeenCalled();
     expect(mocks.enqueueDelivery).not.toHaveBeenCalled();
     expect(mocks.resolveOutboundTarget).not.toHaveBeenCalled();
-  });
-
-  it("runs route-less agentTurn continuations on the internal session route", async () => {
-    mocks.readRestartSentinel.mockResolvedValue({
-      payload: {
-        sessionKey: "agent:main:main",
-        ts: 123,
-        continuation: {
-          kind: "agentTurn",
-          message: "report after local restart",
-        },
-      },
-    } as Awaited<ReturnType<typeof mocks.readRestartSentinel>>);
-    mocks.deliveryContextFromSession.mockReturnValue(undefined);
-
-    await scheduleRestartSentinelWake({ deps: {} as never });
-
-    const enqueued = expectMockCallFields(mocks.enqueueSessionDelivery, {
-      kind: "agentTurn",
-      sessionKey: "agent:main:main",
-      message: "report after local restart",
-    });
-    expect(enqueued).not.toHaveProperty("route");
-    expect(mocks.deliverOutboundPayloads).not.toHaveBeenCalled();
-    expect(mocks.enqueueSystemEvent).not.toHaveBeenCalled();
-    expect(mocks.requestHeartbeat).not.toHaveBeenCalled();
-    expectContinuationDispatchFields(
-      {
-        channel: "webchat",
-        routeSessionKey: "agent:main:main",
-      },
-      {
-        Body: "report after local restart",
-        BodyForAgent: "report after local restart",
-        Provider: "webchat",
-        Surface: "webchat",
-        OriginatingChannel: "webchat",
-        OriginatingTo: "agent:main:main",
-        MessageThreadId: undefined,
-        InputProvenance: {
-          kind: "internal_system",
-          sourceChannel: "webchat",
-          sourceTool: "restart-sentinel",
-        },
-      },
-    );
   });
 
   it("resolves session routing before queueing the heartbeat wake", async () => {

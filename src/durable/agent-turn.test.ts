@@ -2,12 +2,33 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { startDurableAgentTurnLifecycle } from "./agent-turn.js";
+import { classifyDurableAgentTurnTerminal, startDurableAgentTurnLifecycle } from "./agent-turn.js";
 import { DURABLE_INTAKE_ENVELOPE_SCHEMA } from "./intake-envelope.js";
 import { DURABLE_AGENT_TURN_OPERATION_KIND } from "./runtime-ids.js";
 import { openDurableRuntimeStore } from "./store-factory.js";
 
 describe("durable agent turn lifecycle", () => {
+  it.each([
+    {
+      input: { aborted: false, livenessState: "working" },
+      expected: { status: "succeeded", eventType: "agent.turn.succeeded" },
+    },
+    {
+      input: { aborted: false, livenessState: "blocked" },
+      expected: { status: "failed", eventType: "agent.turn.blocked" },
+    },
+    {
+      input: { aborted: false, livenessState: "abandoned" },
+      expected: { status: "failed", eventType: "agent.turn.abandoned" },
+    },
+    {
+      input: { aborted: true, livenessState: "blocked" },
+      expected: { status: "cancelled", eventType: "agent.turn.cancelled" },
+    },
+  ])("classifies terminal liveness as $expected.eventType", ({ input, expected }) => {
+    expect(classifyDurableAgentTurnTerminal(input)).toEqual(expected);
+  });
+
   it("persists a bounded intake envelope on the run, input ref, and initial step", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-agent-turn-"));
     const env = {
@@ -40,7 +61,7 @@ describe("durable agent turn lifecycle", () => {
             intakeEnvelope: expect.objectContaining({
               schema: DURABLE_INTAKE_ENVELOPE_SCHEMA,
               runId: "agent-run-1",
-              sourceType: "agent.turn",
+              sourceOwner: "session_store",
               sessionKey: "agent:bo:main",
               message: expect.objectContaining({
                 preview: "summariz",
@@ -107,6 +128,8 @@ describe("durable agent turn lifecycle", () => {
         const [parent] = setupStore.listRuns({ limit: 10 });
         const child = setupStore.createRun({
           operationKind: "openclaw.subagent.run",
+          sourceOwner: "subagent_runs",
+          sourceRef: "agent-run-yielded-child",
           status: "running",
           recoveryState: "running",
           parentRuntimeRunId: parent!.runtimeRunId,

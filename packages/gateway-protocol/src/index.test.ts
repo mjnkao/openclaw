@@ -14,6 +14,8 @@ import {
   validateConnectParams,
   validateDurableCoordinationGetParams,
   validateDurableCoordinationGetResult,
+  validateDurableLimitParams,
+  validateDurableObligationsListResult,
   validateModelsListParams,
   validateNodeEventResult,
   validateNodePairRequestParams,
@@ -976,6 +978,46 @@ describe("validateDurableCoordinationGet", () => {
             canOpenTimeline: true,
           },
         },
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("validateDurableInspection", () => {
+  it("bounds list params and requires source-backed unresolved obligations", () => {
+    expect(validateDurableLimitParams({ limit: 50 })).toBe(true);
+    expect(validateDurableLimitParams({ limit: 0 })).toBe(false);
+    expect(validateDurableLimitParams({ limit: 501 })).toBe(false);
+    expect(
+      validateDurableObligationsListResult({
+        obligations: [
+          {
+            obligationId: "state-lease:durable_execution_step:run-1:step-1",
+            sourceOwner: "state_leases",
+            sourceRef: "durable_execution_step:run-1:step-1",
+            kind: "expired_state_lease",
+            runtimeRunId: "run-1",
+            stepId: "step-1",
+            subjectRef: "attempt-1",
+            reason: "lease_expired",
+            status: "expired",
+            createdAt: 100,
+            updatedAt: 110,
+          },
+        ],
+      }),
+    ).toBe(true);
+    expect(
+      validateDurableObligationsListResult({
+        obligations: [
+          {
+            obligationId: "wake:wake-1",
+            kind: "pending_wake",
+            status: "pending",
+            createdAt: 100,
+            updatedAt: 100,
+          },
+        ],
       }),
     ).toBe(false);
   });

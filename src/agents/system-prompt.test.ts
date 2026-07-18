@@ -350,6 +350,7 @@ describe("buildAgentSystemPrompt", () => {
     expect(prompt).toContain(
       "For long waits, avoid rapid poll loops: use exec with enough yieldMs or process(action=poll, timeout=<ms>).",
     );
+    expect(prompt).toContain("Larger work: use `sessions_spawn`; completion is push-based.");
     expect(prompt).toContain("Do not poll `subagents list` / `sessions_list` in a loop");
     expect(prompt).not.toContain("use `sessions_yield` when waiting");
     expect(prompt).toContain(
@@ -369,7 +370,6 @@ describe("buildAgentSystemPrompt", () => {
 
     expect(withoutYield).not.toContain("use `sessions_yield` when waiting");
     expect(withYield).toContain("use `sessions_yield` when waiting");
-    expect(withYield).not.toContain("Use `sessions_yield` only when");
   });
 
   it("lists available tools when provided", () => {
@@ -914,50 +914,15 @@ describe("buildAgentSystemPrompt", () => {
     expect(messagingPrompt).not.toContain("sessions_spawn(...)");
     expect(messagingPrompt).not.toContain("subagents(action=list)");
 
-    expect(spawnOnlyPrompt).not.toContain("Sub-agent orchestration");
-    expect(orchestrationPrompt).not.toContain("Sub-agent orchestration");
-    expect(orchestrationWaitPrompt).not.toContain("Sub-agent orchestration");
-    expect(spawnOnlyPrompt).not.toContain("manage already-spawned children");
-  });
-
-  it("renders durable sub-agent orchestration guidance only when explicitly enabled", () => {
-    const explicitPolicyPrompt = buildAgentSystemPrompt({
-      workspaceDir: "/tmp/openclaw",
-      toolNames: ["sessions_spawn", "subagents"],
-      durableOrchestrationPolicy: "auto",
-    });
-
-    expect(explicitPolicyPrompt).toContain(
-      "- Sub-agent orchestration -> start directly when the current context is enough; use `sessions_spawn(...)` when parallelism, specialist isolation, fault isolation, or long background work makes the run more reliable. Use `subagents(action=list)` only for on-demand status/debugging visibility, not wait loops.",
+    expect(spawnOnlyPrompt).toContain(
+      '- Sub-agent orchestration → use `sessions_spawn(...)` to start delegated work; include a clear objective/output/write-scope/verification brief and `taskName` when a stable handle helps; omit `context` for isolated children, set `context:"fork"` only when the child needs the current transcript.',
     );
-  });
+    expect(spawnOnlyPrompt).not.toContain("manage already-spawned children");
 
-  it("enables durable sub-agent orchestration guidance when durable runtime is enabled", () => {
-    const previousRuntime = process.env.OPENCLAW_DURABLE_RUNTIME;
-    const previousPolicy = process.env.OPENCLAW_DURABLE_ORCHESTRATION_POLICY;
-    process.env.OPENCLAW_DURABLE_RUNTIME = "1";
-    delete process.env.OPENCLAW_DURABLE_ORCHESTRATION_POLICY;
-    try {
-      const prompt = buildAgentSystemPrompt({
-        workspaceDir: "/tmp/openclaw",
-        toolNames: ["sessions_spawn", "sessions_yield", "subagents"],
-      });
-
-      expect(prompt).toContain(
-        "- Sub-agent orchestration -> start directly when the current context is enough; use `sessions_spawn(...)` when parallelism, specialist isolation, fault isolation, or long background work makes the run more reliable. Use `sessions_yield` only when",
-      );
-    } finally {
-      if (previousRuntime === undefined) {
-        delete process.env.OPENCLAW_DURABLE_RUNTIME;
-      } else {
-        process.env.OPENCLAW_DURABLE_RUNTIME = previousRuntime;
-      }
-      if (previousPolicy === undefined) {
-        delete process.env.OPENCLAW_DURABLE_ORCHESTRATION_POLICY;
-      } else {
-        process.env.OPENCLAW_DURABLE_ORCHESTRATION_POLICY = previousPolicy;
-      }
-    }
+    expect(orchestrationPrompt).toContain(
+      '- Sub-agent orchestration → use `sessions_spawn(...)` to start delegated work; include a clear objective/output/write-scope/verification brief and `taskName` when a stable handle helps; omit `context` for isolated children, set `context:"fork"` only when the child needs the current transcript; use `subagents(action=list)` only for on-demand status/debugging visibility.',
+    );
+    expect(orchestrationWaitPrompt).toContain("use `sessions_yield` to wait for completion events");
   });
 
   it("adds stronger sub-agent delegation guidance in prefer mode", () => {
@@ -976,7 +941,7 @@ describe("buildAgentSystemPrompt", () => {
     expect(preferPrompt).toContain("Mode: prefer");
     expect(preferPrompt).toContain("responsive coordinator");
     expect(preferPrompt).toContain(
-      "For non-trivial work, decide what stays local and what is delegated",
+      "Anything requiring more work than a direct reply should go through `sessions_spawn`",
     );
     expect(preferPrompt).toContain("objective, expected output, relevant files/inputs");
     expect(preferPrompt).toContain("keep it lowercase with underscores or hyphens");
@@ -1037,7 +1002,7 @@ describe("buildAgentSystemPrompt", () => {
     });
 
     expect(prompt).not.toContain("## Sub-Agent Delegation");
-    expect(prompt).not.toContain("Sub-agent orchestration");
+    expect(prompt).toContain("Sub-agent orchestration");
   });
 
   it("reapplies provider prompt contributions", () => {
@@ -1106,6 +1071,9 @@ describe("buildAgentSystemPrompt", () => {
     expect(telegramPrompt).toContain("pull quotes");
     expect(telegramPrompt).toContain('task lists via `<input type="checkbox"/>` inside `<li>`');
     expect(telegramPrompt).toContain("anchors/in-message links");
+    expect(telegramPrompt).toContain(
+      "formulas (inline `<tg-math>LaTeX</tg-math>`, block `<tg-math-block>LaTeX</tg-math-block>`; not `$...$` or `\\(...\\)`)",
+    );
     expect(telegramPrompt).toContain("maps/collages/slideshows");
     expect(telegramPrompt).toContain("use `<details>`, not legacy `<blockquote expandable>`");
     expect(telegramPrompt).toContain("use `<ul><li>...</li></ul>`, not literal bullet characters");

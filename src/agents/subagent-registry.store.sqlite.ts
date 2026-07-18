@@ -264,6 +264,38 @@ function readSubagentRegistryRows(): SubagentRunSqliteRow[] {
   ).rows;
 }
 
+export function getSubagentRunFromSqlite(runId: string): SubagentRunRecord | undefined {
+  const normalizedRunId = runId.trim();
+  if (!normalizedRunId) {
+    return undefined;
+  }
+  const { db } = openOpenClawStateDatabase();
+  const stateDb = getNodeSqliteKysely<SubagentRegistryDatabase>(db);
+  const row = executeSqliteQuerySync(
+    db,
+    stateDb.selectFrom("subagent_runs").selectAll().where("run_id", "=", normalizedRunId).limit(1),
+  ).rows[0];
+  return row ? (rowToSubagentRunRecord(row) ?? undefined) : undefined;
+}
+
+export function listSubagentRunsFromSqlite(options?: { limit?: number }): SubagentRunRecord[] {
+  const limit = Math.max(1, Math.min(5000, Math.trunc(options?.limit ?? 500)));
+  const { db } = openOpenClawStateDatabase();
+  const stateDb = getNodeSqliteKysely<SubagentRegistryDatabase>(db);
+  return executeSqliteQuerySync(
+    db,
+    stateDb
+      .selectFrom("subagent_runs")
+      .selectAll()
+      .orderBy("created_at", "desc")
+      .orderBy("run_id", "desc")
+      .limit(limit),
+  ).rows.flatMap((row) => {
+    const entry = rowToSubagentRunRecord(row);
+    return entry ? [entry] : [];
+  });
+}
+
 function removeLegacySubagentRegistryFile(): void {
   try {
     fs.unlinkSync(resolveSubagentRegistryPath());

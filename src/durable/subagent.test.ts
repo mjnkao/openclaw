@@ -1,1365 +1,161 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
-import {
-  DURABLE_AGENT_TURN_OPERATION_KIND,
-  DURABLE_SUBAGENT_RUN_OPERATION_KIND,
-} from "./runtime-ids.js";
-import { openDurableRuntimeSqliteStore } from "./sqlite-store.js";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { saveSubagentRegistryToSqlite } from "../agents/subagent-registry.store.sqlite.js";
+import type { SubagentRunRecord } from "../agents/subagent-registry.types.js";
+import { openDurableRuntimeStore } from "./store-factory.js";
 import {
   recordDurableSubagentAnnounceDelivery,
-  recordDurableSubagentProgress,
-  recordDurableSubagentRegistered,
+  recordDurableSubagentInterrupted,
   recordDurableSubagentTerminal,
 } from "./subagent.js";
 
-function withSqliteStore<T>(
-  dbPath: string,
-  callback: (store: ReturnType<typeof openDurableRuntimeSqliteStore>) => T,
-): T {
-  const store = openDurableRuntimeSqliteStore({ path: dbPath });
-  try {
-    return callback(store);
-  } finally {
-    store.close();
+describe("durable subagent owner projection", () => {
+  let stateDir: string;
+  let previousStateDir: string | undefined;
+  let previousEnabled: string | undefined;
+
+  beforeEach(() => {
+    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-subagent-"));
+    previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    previousEnabled = process.env.OPENCLAW_DURABLE_RUNTIME;
+    process.env.OPENCLAW_STATE_DIR = stateDir;
+    process.env.OPENCLAW_DURABLE_RUNTIME = "1";
+  });
+
+  afterEach(() => {
+    if (previousStateDir === undefined) {
+      delete process.env.OPENCLAW_STATE_DIR;
+    } else {
+      process.env.OPENCLAW_STATE_DIR = previousStateDir;
+    }
+    if (previousEnabled === undefined) {
+      delete process.env.OPENCLAW_DURABLE_RUNTIME;
+    } else {
+      process.env.OPENCLAW_DURABLE_RUNTIME = previousEnabled;
+    }
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+
+  function saveRun(overrides: Partial<SubagentRunRecord> = {}): SubagentRunRecord {
+    const run: SubagentRunRecord = {
+      runId: "child-run",
+      taskRunId: "child-run",
+      childSessionKey: "agent:worker:subagent:child",
+      requesterSessionKey: "agent:operator:main",
+      requesterRunId: "parent-agent-run",
+      requesterDisplayKey: "operator",
+      task: "long delegated task",
+      cleanup: "keep",
+      expectsCompletionMessage: true,
+      generation: 1,
+      createdAt: 100,
+      startedAt: 100,
+      endedAt: 200,
+      outcome: { status: "ok" },
+      execution: { status: "terminal", startedAt: 100, endedAt: 200, outcome: { status: "ok" } },
+      completion: { required: true, resultText: "done", capturedAt: 200 },
+      delivery: { status: "pending", createdAt: 200 },
+      ...overrides,
+    };
+    saveSubagentRegistryToSqlite(new Map([[run.runId, run]]));
+    return run;
   }
-}
 
-describe("durable subagent bridge", () => {
-  it("links children to the active requester run when same-session parents overlap", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-subagent-"));
-    const dbPath = path.join(dir, "state", "openclaw.sqlite");
-    const env = {
-      ...process.env,
-      OPENCLAW_DURABLE_RUNTIME: "1",
-      OPENCLAW_STATE_DIR: dir,
-    };
-    const parentSessionKey = "agent:bo:discord:channel:bo-main";
-
-    const { activeParentId, olderParentId } = withSqliteStore(dbPath, (setupStore) => {
-      const olderId = setupStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "running",
-        recoveryState: "running",
-        idempotencyKey: "run_parent_old",
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        metadata: { sessionKey: parentSessionKey },
-        now: 100,
-      }).runtimeRunId;
-      const activeId = setupStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "running",
-        recoveryState: "running",
-        idempotencyKey: "run_parent_active",
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        metadata: { sessionKey: parentSessionKey },
-        now: 200,
-      }).runtimeRunId;
-      return { activeParentId: activeId, olderParentId: olderId };
+  it("creates one wake from the canonical terminal owner and correlates the exact parent run", () => {
+    const store = openDurableRuntimeStore();
+    const parent = store.createRun({
+      operationKind: "openclaw.agent.turn",
+      idempotencyKey: "parent-agent-run",
+      sourceOwner: "session_store",
+      sourceRef: "agent:operator:main",
+      status: "waiting_child",
+      recoveryState: "waiting_child",
+      now: 90,
     });
+    store.close();
+    saveRun();
 
-    recordDurableSubagentRegistered({
-      runId: "run_child",
-      childSessionKey: "agent:bo:subagent:active-child",
-      requesterSessionKey: parentSessionKey,
-      requesterRunId: "run_parent_active",
-      task: "Check active parent binding",
-      label: "active parent",
-      agentId: "bo",
-      requesterAgentId: "bo",
-      env,
-    });
+    recordDurableSubagentTerminal({ runId: "child-run" });
+    recordDurableSubagentTerminal({ runId: "child-run" });
 
-    const assertStore = openDurableRuntimeSqliteStore({ path: dbPath });
+    const verify = openDurableRuntimeStore();
     try {
-      const child = assertStore
-        .listRuns({ limit: 20 })
-        .find((run) => run.operationKind === DURABLE_SUBAGENT_RUN_OPERATION_KIND);
-      expect(child).toBeDefined();
-      expect(child?.parentRuntimeRunId).toBe(activeParentId);
-      expect(child?.parentRuntimeRunId).not.toBe(olderParentId);
-      expect(assertStore.listChildLinks(activeParentId)).toMatchObject([
-        {
-          childRuntimeRunId: child?.runtimeRunId,
-          status: "running",
-          metadata: {
-            fanInGroupId: expect.any(String),
-          },
-        },
+      expect(verify.listRuns()).toHaveLength(1);
+      expect(verify.listWakeObligations()).toEqual([
+        expect.objectContaining({
+          sourceOwner: "subagent_runs",
+          sourceRef: "child-run",
+          parentRunId: parent.runtimeRunId,
+          parentSessionKey: "agent:operator:main",
+          reason: "child_terminal",
+          status: "pending",
+        }),
       ]);
-      expect(assertStore.listChildLinks(olderParentId)).toEqual([]);
     } finally {
-      assertStore.close();
-      fs.rmSync(dir, { recursive: true, force: true });
+      verify.close();
     }
   });
 
-  it("falls back to the newest same-session parent when requester run id is unavailable", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-subagent-"));
-    const dbPath = path.join(dir, "state", "openclaw.sqlite");
-    const env = {
-      ...process.env,
-      OPENCLAW_DURABLE_RUNTIME: "1",
-      OPENCLAW_STATE_DIR: dir,
-    };
-    const parentSessionKey = "agent:bo:discord:channel:bo-main";
-
-    const newerParentId = withSqliteStore(dbPath, (setupStore) => {
-      setupStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "running",
-        recoveryState: "running",
-        idempotencyKey: "run_parent_old",
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        metadata: { sessionKey: parentSessionKey },
-        now: 100,
-      });
-      return setupStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "running",
-        recoveryState: "running",
-        idempotencyKey: "run_parent_new",
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        metadata: { sessionKey: parentSessionKey },
-        now: 200,
-      }).runtimeRunId;
+  it("records restart interruption as uncertainty without inventing a mirrored child run", () => {
+    saveRun({
+      endedAt: undefined,
+      outcome: undefined,
+      execution: {
+        status: "interrupted",
+        interruptedAt: 300,
+        interruptionReason: "gateway-restart",
+      },
     });
 
-    recordDurableSubagentRegistered({
-      runId: "run_child",
-      childSessionKey: "agent:bo:subagent:newest-child",
-      requesterSessionKey: parentSessionKey,
-      task: "Check newest parent binding",
-      label: "newest parent",
-      agentId: "bo",
-      requesterAgentId: "bo",
-      env,
+    recordDurableSubagentInterrupted({
+      runId: "child-run",
+      childSessionKey: "agent:worker:subagent:child",
+      requesterSessionKey: "agent:operator:main",
+      reason: "gateway-restart",
+      interruptedAt: 300,
     });
 
-    const assertStore = openDurableRuntimeSqliteStore({ path: dbPath });
+    const verify = openDurableRuntimeStore();
     try {
-      const child = assertStore
-        .listRuns({ limit: 20 })
-        .find((run) => run.operationKind === DURABLE_SUBAGENT_RUN_OPERATION_KIND);
-      expect(child).toBeDefined();
-      expect(child?.parentRuntimeRunId).toBe(newerParentId);
-    } finally {
-      assertStore.close();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("does not attach a child to a stale same-session parent when requester run id is missing from durable state", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-subagent-"));
-    const dbPath = path.join(dir, "state", "openclaw.sqlite");
-    const env = {
-      ...process.env,
-      OPENCLAW_DURABLE_RUNTIME: "1",
-      OPENCLAW_STATE_DIR: dir,
-    };
-    const parentSessionKey = "agent:bo:discord:channel:bo-main";
-
-    const staleParentId = withSqliteStore(dbPath, (setupStore) => {
-      const staleId = setupStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "queued",
-        recoveryState: "runnable",
-        idempotencyKey: "announce:v1:agent:bo-product:subagent:old-child:old-child-run",
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        metadata: { sessionKey: parentSessionKey },
-        now: 100,
-      }).runtimeRunId;
-      setupStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "running",
-        recoveryState: "running",
-        idempotencyKey: "run_parent_previous_user_turn",
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        metadata: { sessionKey: parentSessionKey },
-        now: 200,
-      });
-      return staleId;
-    });
-
-    recordDurableSubagentRegistered({
-      runId: "run_child_current",
-      childSessionKey: "agent:bo-operator:subagent:current-child",
-      requesterSessionKey: parentSessionKey,
-      requesterRunId: "run_parent_current_not_recorded",
-      task: "Fix /pair QR",
-      label: "pair QR",
-      agentId: "bo-operator",
-      requesterAgentId: "bo",
-      env,
-    });
-
-    const assertStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      const child = assertStore
-        .listRuns({ limit: 20 })
-        .find((run) => run.operationKind === DURABLE_SUBAGENT_RUN_OPERATION_KIND);
-      expect(child).toBeDefined();
-      expect(child?.parentRuntimeRunId).toBeUndefined();
-      expect(child?.parentStepId).toBeUndefined();
-      expect(child?.metadata).toMatchObject({
-        requesterRunId: "run_parent_current_not_recorded",
-        parentBinding: {
-          status: "missing",
-          reason: "requester_run_id_not_found",
-          candidateCount: 1,
-        },
-      });
-      expect(assertStore.listChildLinks(staleParentId)).toEqual([]);
-      expect(assertStore.getTimeline(child!.runtimeRunId)).toContainEqual(
+      expect(verify.listRuns()).toHaveLength(0);
+      expect(verify.listUnresolvedUncertaintyFacts()).toEqual([
         expect.objectContaining({
-          eventType: "subagent.parent.binding_missing",
-          agentInvocationId: "run_child_current",
-          payload: expect.objectContaining({
-            reason: "requester_run_id_not_found",
-            requesterRunId: "run_parent_current_not_recorded",
-          }),
+          sourceOwner: "subagent_runs",
+          sourceRef: "child-run",
+          kind: "requires_owner_decision",
         }),
-      );
-    } finally {
-      assertStore.close();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("does not use an announce continuation as the newest same-session fallback parent", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-subagent-"));
-    const dbPath = path.join(dir, "state", "openclaw.sqlite");
-    const env = {
-      ...process.env,
-      OPENCLAW_DURABLE_RUNTIME: "1",
-      OPENCLAW_STATE_DIR: dir,
-    };
-    const parentSessionKey = "agent:bo:discord:channel:bo-main";
-
-    const { announceContinuationId, realParentId } = withSqliteStore(dbPath, (setupStore) => {
-      const realId = setupStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "running",
-        recoveryState: "running",
-        idempotencyKey: "run_parent_real",
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        metadata: { sessionKey: parentSessionKey },
-        now: 100,
-      }).runtimeRunId;
-      const continuationId = setupStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "queued",
-        recoveryState: "runnable",
-        idempotencyKey: "announce:v1:agent:bo-worker:subagent:older-child:older-child-run",
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        metadata: { sessionKey: parentSessionKey },
-        now: 300,
-      }).runtimeRunId;
-      return { announceContinuationId: continuationId, realParentId: realId };
-    });
-
-    recordDurableSubagentRegistered({
-      runId: "run_child",
-      childSessionKey: "agent:bo:subagent:newest-child",
-      requesterSessionKey: parentSessionKey,
-      task: "Check newest parent binding",
-      label: "newest parent",
-      agentId: "bo",
-      requesterAgentId: "bo",
-      env,
-    });
-
-    const assertStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      const child = assertStore
-        .listRuns({ limit: 20 })
-        .find((run) => run.operationKind === DURABLE_SUBAGENT_RUN_OPERATION_KIND);
-      expect(child).toBeDefined();
-      expect(child?.parentRuntimeRunId).toBe(realParentId);
-      expect(child?.parentRuntimeRunId).not.toBe(announceContinuationId);
-      expect(assertStore.listChildLinks(announceContinuationId)).toEqual([]);
-    } finally {
-      assertStore.close();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("preserves background task and taskflow bindings on child runs and parent links", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-subagent-"));
-    const dbPath = path.join(dir, "state", "openclaw.sqlite");
-    const env = {
-      ...process.env,
-      OPENCLAW_DURABLE_RUNTIME: "1",
-      OPENCLAW_STATE_DIR: dir,
-    };
-    const parentSessionKey = "agent:bo:discord:channel:bo-main";
-    const childSessionKey = "agent:bo:subagent:workboard-default-card";
-
-    const setupStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      setupStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "running",
-        recoveryState: "running",
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        metadata: { sessionKey: parentSessionKey },
-        now: 100,
-      });
-    } finally {
-      setupStore.close();
-    }
-
-    recordDurableSubagentRegistered({
-      runId: "run_child",
-      childSessionKey,
-      requesterSessionKey: parentSessionKey,
-      taskId: "task_child",
-      taskFlowId: "flow_child",
-      task: "Summarize durable bridge",
-      label: "durable bridge",
-      agentId: "bo",
-      requesterAgentId: "bo",
-      env,
-    });
-
-    recordDurableSubagentTerminal({
-      runId: "run_child",
-      childSessionKey,
-      status: "success",
-      summary: "done",
-      env,
-    });
-
-    const assertStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      const child = assertStore
-        .listRuns({ limit: 20 })
-        .find((run) => run.operationKind === DURABLE_SUBAGENT_RUN_OPERATION_KIND);
-      expect(child).toMatchObject({
-        status: "succeeded",
-        metadata: {
-          runId: "run_child",
-          taskId: "task_child",
-          taskFlowId: "flow_child",
-          taskHash: expect.any(String),
-          childSessionKey,
-          agentId: "bo",
-          requesterAgentId: "bo",
-          summary: "done",
-        },
-      });
-      expect(child).toBeDefined();
-      const parentLink = assertStore.listParentLinks(child!.runtimeRunId)[0];
-      expect(parentLink).toMatchObject({
-        status: "succeeded",
-        metadata: {
-          runId: "run_child",
-          taskId: "task_child",
-          taskFlowId: "flow_child",
-          taskHash: expect.any(String),
-          childSessionKey,
-          summary: "done",
-        },
-      });
-      expect(child?.metadata?.task).toBeUndefined();
-      expect(parentLink?.metadata?.task).toBeUndefined();
-    } finally {
-      assertStore.close();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("records running child progress without closing parent fan-in", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-subagent-"));
-    const dbPath = path.join(dir, "state", "openclaw.sqlite");
-    const env = {
-      ...process.env,
-      OPENCLAW_DURABLE_RUNTIME: "1",
-      OPENCLAW_STATE_DIR: dir,
-    };
-    const parentSessionKey = "agent:bo:discord:channel:bo-main";
-    const childSessionKey = "agent:bo-worker:subagent:slow-child";
-
-    const parentRuntimeRunId = withSqliteStore(
-      dbPath,
-      (setupStore) =>
-        setupStore.createRun({
-          operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-          status: "running",
-          recoveryState: "running",
-          idempotencyKey: "run_parent",
-          sourceType: "agent_turn",
-          sourceRef: parentSessionKey,
-          metadata: { sessionKey: parentSessionKey },
-          now: 100,
-        }).runtimeRunId,
-    );
-
-    recordDurableSubagentRegistered({
-      runId: "run_child_slow",
-      childSessionKey,
-      requesterSessionKey: parentSessionKey,
-      requesterRunId: "run_parent",
-      task: "Run a long command",
-      label: "slow branch",
-      env,
-    });
-    recordDurableSubagentProgress({
-      runId: "run_child_slow",
-      childSessionKey,
-      status: "running",
-      reason: "wait_timeout",
-      detail: "child still running after durable wait checkpoint",
-      elapsedMs: 180_000,
-      env,
-    });
-
-    const assertStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      const child = assertStore
-        .listRuns({ limit: 20 })
-        .find((run) => run.operationKind === DURABLE_SUBAGENT_RUN_OPERATION_KIND);
-      expect(child).toMatchObject({
-        status: "running",
-        recoveryState: "running",
-        metadata: {
-          childSessionKey,
-          lastProgress: {
-            status: "running",
-            reason: "wait_timeout",
-            detail: "child still running after durable wait checkpoint",
-            elapsedMs: 180_000,
-          },
-        },
-      });
-      expect(assertStore.listChildLinks(parentRuntimeRunId)).toMatchObject([
-        {
-          childRuntimeRunId: child?.runtimeRunId,
-          status: "running",
-          metadata: {
-            lastProgress: {
-              status: "running",
-              reason: "wait_timeout",
-              elapsedMs: 180_000,
-            },
-          },
-        },
       ]);
-      expect(assertStore.listSteps(parentRuntimeRunId)).toContainEqual(
-        expect.objectContaining({
-          stepId: "subagents",
-          status: "waiting",
-          recoveryState: "waiting_child",
-        }),
-      );
+      expect(verify.listWakeObligations()).toEqual([
+        expect.objectContaining({ reason: "restart_interrupted", status: "pending" }),
+      ]);
     } finally {
-      assertStore.close();
-      fs.rmSync(dir, { recursive: true, force: true });
+      verify.close();
     }
   });
 
-  it("normalizes runtime ok terminal status to durable success", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-subagent-"));
-    const dbPath = path.join(dir, "state", "openclaw.sqlite");
-    const env = {
-      ...process.env,
-      OPENCLAW_DURABLE_RUNTIME: "1",
-      OPENCLAW_STATE_DIR: dir,
-    };
-    const parentSessionKey = "agent:bo:discord:channel:bo-main";
-    const childSessionKey = "agent:bo:subagent:ok-child";
-
-    const setupStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      setupStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "running",
-        recoveryState: "running",
-        idempotencyKey: "run_parent_ok",
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        metadata: { sessionKey: parentSessionKey },
-        now: 100,
-      });
-    } finally {
-      setupStore.close();
-    }
-
-    recordDurableSubagentRegistered({
-      runId: "run_child_ok",
-      childSessionKey,
-      requesterSessionKey: parentSessionKey,
-      requesterRunId: "run_parent_ok",
-      task: "Return ok",
-      env,
+  it("does not infer requester acknowledgement from route delivery", () => {
+    saveRun();
+    recordDurableSubagentTerminal({ runId: "child-run" });
+    saveRun({
+      delivery: { status: "delivered", deliveredAt: 250, announcedAt: 250, attemptCount: 1 },
     });
-    recordDurableSubagentTerminal({
-      runId: "run_child_ok",
-      childSessionKey,
-      status: "ok",
-      summary: "done",
-      env,
-    });
-
-    const assertStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      const child = assertStore
-        .listRuns({ limit: 20 })
-        .find((run) => run.operationKind === DURABLE_SUBAGENT_RUN_OPERATION_KIND);
-      expect(child).toMatchObject({
-        status: "succeeded",
-        recoveryState: "terminal",
-        metadata: {
-          status: "ok",
-          summary: "done",
-        },
-      });
-      expect(child).toBeDefined();
-      expect(assertStore.listSteps(child!.runtimeRunId)).toContainEqual(
-        expect.objectContaining({
-          stepId: "subagent_run",
-          status: "succeeded",
-          recoveryState: "terminal",
-          metadata: expect.objectContaining({
-            status: "ok",
-            summary: "done",
-          }),
-        }),
-      );
-
-      const parentLink = assertStore.listParentLinks(child!.runtimeRunId)[0];
-      expect(parentLink).toMatchObject({
-        status: "succeeded",
-        metadata: {
-          status: "ok",
-          summary: "done",
-        },
-      });
-
-      const parent = assertStore
-        .listRuns({ limit: 20 })
-        .find((run) => run.operationKind === DURABLE_AGENT_TURN_OPERATION_KIND);
-      expect(parent).toMatchObject({
-        status: "queued",
-        recoveryState: "runnable",
-      });
-      expect(assertStore.listSteps(parent!.runtimeRunId)).toContainEqual(
-        expect.objectContaining({
-          stepId: "subagents",
-          status: "succeeded",
-          recoveryState: "terminal",
-          metadata: expect.objectContaining({
-            total: 1,
-            succeeded: 1,
-            failed: 0,
-            terminal: 1,
-          }),
-        }),
-      );
-      const mailbox = assertStore
-        .listSteps(parent!.runtimeRunId)
-        .find((step) => step.stepType === "result_mailbox");
-      expect(mailbox).toMatchObject({
-        status: "queued",
-        recoveryState: "runnable",
-        metadata: {
-          kind: "child_result_mailbox",
-          status: "pending_parent_ack",
-          childRuntimeRunId: child?.runtimeRunId,
-          childSessionKey,
-          outcome: {
-            linkStatus: "succeeded",
-            terminalStatus: "ok",
-            terminalOutcome: "succeeded",
-            summary: "done",
-          },
-          ack: {
-            status: "pending",
-          },
-        },
-      });
-      expect(assertStore.getTimeline(parent!.runtimeRunId)).toContainEqual(
-        expect.objectContaining({
-          eventType: "subagent.child.result_mailbox_queued",
-        }),
-      );
-    } finally {
-      assertStore.close();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("marks a yielded parent terminal after direct continuation succeeds", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-subagent-"));
-    const dbPath = path.join(dir, "state", "openclaw.sqlite");
-    const env = {
-      ...process.env,
-      OPENCLAW_DURABLE_RUNTIME: "1",
-      OPENCLAW_STATE_DIR: dir,
-    };
-    const parentSessionKey = "agent:bo:discord:channel:bo-main";
-    const directIdempotencyKey = "announce:run_child_ok";
-    const setupStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      const parent = setupStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "running",
-        recoveryState: "running",
-        idempotencyKey: "run_parent",
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        metadata: { sessionKey: parentSessionKey },
-        now: 100,
-      });
-      setupStore.createStep({
-        runtimeRunId: parent.runtimeRunId,
-        stepId: "agent_invocation",
-        stepType: "agent",
-        status: "running",
-        recoveryState: "running",
-        idempotencyKey: "run_parent",
-        metadata: { sessionKey: parentSessionKey },
-        now: 100,
-      });
-    } finally {
-      setupStore.close();
-    }
-
-    recordDurableSubagentRegistered({
-      runId: "run_child_ok",
-      childSessionKey: "agent:bo:subagent:ok-child",
-      requesterSessionKey: parentSessionKey,
-      requesterRunId: "run_parent",
-      task: "Check direct continuation",
-      env,
-    });
-    recordDurableSubagentTerminal({
-      runId: "run_child_ok",
-      childSessionKey: "agent:bo:subagent:ok-child",
-      status: "ok",
-      summary: "done",
-      env,
-    });
-
-    const directStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      directStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "succeeded",
-        recoveryState: "terminal",
-        idempotencyKey: directIdempotencyKey,
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        completedAt: 200,
-        metadata: { sessionKey: parentSessionKey },
-        now: 200,
-      });
-    } finally {
-      directStore.close();
-    }
 
     recordDurableSubagentAnnounceDelivery({
-      runId: "run_child_ok",
-      childSessionKey: "agent:bo:subagent:ok-child",
-      directIdempotencyKey,
+      runId: "child-run",
       delivered: true,
       path: "direct",
-      env,
-    });
-    recordDurableSubagentTerminal({
-      runId: "run_child_ok",
-      childSessionKey: "agent:bo:subagent:ok-child",
-      status: "ok",
-      summary: "duplicate terminal after ack",
-      env,
+      directIdempotencyKey: "announce-turn",
     });
 
-    const assertStore = openDurableRuntimeSqliteStore({ path: dbPath });
+    const verify = openDurableRuntimeStore();
     try {
-      const parent = assertStore
-        .listRuns({ limit: 20 })
-        .find(
-          (run) =>
-            run.operationKind === DURABLE_AGENT_TURN_OPERATION_KIND &&
-            run.idempotencyKey === "run_parent",
-        );
-      expect(parent).toMatchObject({
-        status: "succeeded",
-        recoveryState: "terminal",
-      });
-      expect(parent?.completedAt).toBeDefined();
-      expect(assertStore.listSteps(parent!.runtimeRunId)).toContainEqual(
-        expect.objectContaining({
-          stepId: "agent_invocation",
-          status: "succeeded",
-          recoveryState: "terminal",
-        }),
-      );
-      expect(assertStore.getTimeline(parent!.runtimeRunId)).toContainEqual(
-        expect.objectContaining({
-          eventType: "agent.turn.continuation_succeeded",
-          agentInvocationId: directIdempotencyKey,
-        }),
-      );
-      const mailbox = assertStore
-        .listSteps(parent!.runtimeRunId)
-        .find((step) => step.stepType === "result_mailbox");
-      expect(mailbox).toMatchObject({
-        status: "succeeded",
-        recoveryState: "terminal",
-        metadata: {
-          status: "acknowledged",
-          delivery: {
-            status: "acknowledged",
-            delivered: true,
-            acknowledged: true,
-            path: "direct",
-            directIdempotencyKey,
-          },
-          ack: {
-            status: "acknowledged",
-            directIdempotencyKey,
-          },
-        },
-      });
-      expect(assertStore.getTimeline(parent!.runtimeRunId)).toContainEqual(
-        expect.objectContaining({
-          eventType: "result_mailbox.consumed",
-        }),
-      );
-      expect(
-        assertStore
-          .getTimeline(parent!.runtimeRunId)
-          .filter((event) => event.eventType === "subagent.child.result_mailbox_queued"),
-      ).toHaveLength(1);
+      const [wake] = verify.listWakeObligations();
+      expect(wake?.status).not.toBe("acked");
+      expect(verify.listDeliveryAttemptEvidence({ wakeId: wake!.wakeId })).toEqual([]);
     } finally {
-      assertStore.close();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("does not acknowledge result mailbox when announce is queued but continuation has not completed", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-subagent-"));
-    const dbPath = path.join(dir, "state", "openclaw.sqlite");
-    const env = {
-      ...process.env,
-      OPENCLAW_DURABLE_RUNTIME: "1",
-      OPENCLAW_STATE_DIR: dir,
-    };
-    const parentSessionKey = "agent:bo:discord:channel:bo-main";
-    const directIdempotencyKey = "announce:queued-not-acked";
-    const setupStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      const parent = setupStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "running",
-        recoveryState: "running",
-        idempotencyKey: "run_parent",
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        metadata: { sessionKey: parentSessionKey },
-        now: 100,
-      });
-      setupStore.createStep({
-        runtimeRunId: parent.runtimeRunId,
-        stepId: "agent_invocation",
-        stepType: "agent",
-        status: "running",
-        recoveryState: "running",
-        idempotencyKey: "run_parent",
-        metadata: { sessionKey: parentSessionKey },
-        now: 100,
-      });
-    } finally {
-      setupStore.close();
-    }
-
-    recordDurableSubagentRegistered({
-      runId: "run_child_ok",
-      childSessionKey: "agent:bo:subagent:ok-child",
-      requesterSessionKey: parentSessionKey,
-      requesterRunId: "run_parent",
-      task: "Check queued completion",
-      env,
-    });
-    recordDurableSubagentTerminal({
-      runId: "run_child_ok",
-      childSessionKey: "agent:bo:subagent:ok-child",
-      status: "ok",
-      summary: "done",
-      env,
-    });
-
-    const directStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      directStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "queued",
-        recoveryState: "runnable",
-        idempotencyKey: directIdempotencyKey,
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        metadata: { sessionKey: parentSessionKey },
-        now: 200,
-      });
-    } finally {
-      directStore.close();
-    }
-
-    recordDurableSubagentAnnounceDelivery({
-      runId: "run_child_ok",
-      childSessionKey: "agent:bo:subagent:ok-child",
-      directIdempotencyKey,
-      delivered: true,
-      path: "direct",
-      env,
-    });
-
-    const assertStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      const parent = assertStore
-        .listRuns({ limit: 20 })
-        .find(
-          (run) =>
-            run.operationKind === DURABLE_AGENT_TURN_OPERATION_KIND &&
-            run.idempotencyKey === "run_parent",
-        );
-      expect(parent).toMatchObject({
-        status: "queued",
-        recoveryState: "runnable",
-      });
-      expect(parent?.completedAt).toBeUndefined();
-      const mailbox = assertStore
-        .listSteps(parent!.runtimeRunId)
-        .find((step) => step.stepType === "result_mailbox");
-      expect(mailbox).toMatchObject({
-        status: "queued",
-        recoveryState: "runnable",
-        metadata: {
-          status: "pending_parent_ack",
-          delivery: {
-            status: "attempted",
-            delivered: true,
-            acknowledged: false,
-            path: "direct",
-            directIdempotencyKey,
-          },
-          ack: {
-            status: "pending",
-          },
-        },
-      });
-      expect(assertStore.getTimeline(parent!.runtimeRunId)).toContainEqual(
-        expect.objectContaining({
-          eventType: "result_mailbox.delivery_attempted",
-        }),
-      );
-      expect(assertStore.getTimeline(parent!.runtimeRunId)).not.toContainEqual(
-        expect.objectContaining({
-          eventType: "agent.turn.continuation_succeeded",
-        }),
-      );
-    } finally {
-      assertStore.close();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("closes earlier child announce continuations after parent fan-in reaches terminal", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-subagent-"));
-    const dbPath = path.join(dir, "state", "openclaw.sqlite");
-    const env = {
-      ...process.env,
-      OPENCLAW_DURABLE_RUNTIME: "1",
-      OPENCLAW_STATE_DIR: dir,
-    };
-    const parentSessionKey = "agent:bo:discord:channel:bo-main";
-    const childASessionKey = "agent:bo-worker:subagent:child-a";
-    const childBSessionKey = "agent:bo-worker:subagent:child-b";
-    const childARunId = "child-a-run";
-    const childBRunId = "child-b-run";
-    const childAAnnounceKey = `announce:v1:${childASessionKey}:${childARunId}`;
-    const childBAnnounceKey = `announce:v1:${childBSessionKey}:${childBRunId}`;
-
-    const setupStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      const parent = setupStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "running",
-        recoveryState: "running",
-        idempotencyKey: "run_parent",
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        metadata: { sessionKey: parentSessionKey },
-        now: 100,
-      });
-      setupStore.createStep({
-        runtimeRunId: parent.runtimeRunId,
-        stepId: "agent_invocation",
-        stepType: "agent",
-        status: "running",
-        recoveryState: "running",
-        idempotencyKey: "run_parent",
-        metadata: { sessionKey: parentSessionKey },
-        now: 100,
-      });
-    } finally {
-      setupStore.close();
-    }
-
-    recordDurableSubagentRegistered({
-      runId: childARunId,
-      childSessionKey: childASessionKey,
-      requesterSessionKey: parentSessionKey,
-      requesterRunId: "run_parent",
-      task: "Check branch A",
-      env,
-    });
-    recordDurableSubagentRegistered({
-      runId: childBRunId,
-      childSessionKey: childBSessionKey,
-      requesterSessionKey: parentSessionKey,
-      requesterRunId: "run_parent",
-      task: "Check branch B",
-      env,
-    });
-    recordDurableSubagentTerminal({
-      runId: childARunId,
-      childSessionKey: childASessionKey,
-      status: "ok",
-      summary: "branch A done",
-      env,
-    });
-
-    const childADirectStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      const childADirect = childADirectStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "waiting_signal",
-        recoveryState: "waiting_signal",
-        idempotencyKey: childAAnnounceKey,
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        metadata: { sessionKey: parentSessionKey },
-        now: 200,
-      });
-      childADirectStore.createStep({
-        runtimeRunId: childADirect.runtimeRunId,
-        stepId: "agent_invocation",
-        stepType: "agent",
-        status: "waiting",
-        recoveryState: "waiting_signal",
-        idempotencyKey: childAAnnounceKey,
-        metadata: { sessionKey: parentSessionKey },
-        now: 200,
-      });
-    } finally {
-      childADirectStore.close();
-    }
-
-    recordDurableSubagentAnnounceDelivery({
-      runId: childARunId,
-      childSessionKey: childASessionKey,
-      directIdempotencyKey: childAAnnounceKey,
-      delivered: true,
-      path: "direct",
-      env,
-    });
-    recordDurableSubagentTerminal({
-      runId: childBRunId,
-      childSessionKey: childBSessionKey,
-      status: "ok",
-      summary: "branch B done",
-      env,
-    });
-
-    const childBDirectStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      childBDirectStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "succeeded",
-        recoveryState: "terminal",
-        idempotencyKey: childBAnnounceKey,
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        completedAt: 300,
-        metadata: { sessionKey: parentSessionKey },
-        now: 300,
-      });
-    } finally {
-      childBDirectStore.close();
-    }
-
-    recordDurableSubagentAnnounceDelivery({
-      runId: childBRunId,
-      childSessionKey: childBSessionKey,
-      directIdempotencyKey: childBAnnounceKey,
-      delivered: true,
-      path: "direct",
-      env,
-    });
-
-    const assertStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      const runs = assertStore.listRuns({ limit: 50 });
-      const parent = runs.find(
-        (run) =>
-          run.operationKind === DURABLE_AGENT_TURN_OPERATION_KIND &&
-          run.idempotencyKey === "run_parent",
-      );
-      const childADirect = runs.find((run) => run.idempotencyKey === childAAnnounceKey);
-      expect(parent).toMatchObject({
-        status: "succeeded",
-        recoveryState: "terminal",
-      });
-      expect(childADirect).toMatchObject({
-        status: "succeeded",
-        recoveryState: "terminal",
-      });
-      expect(childADirect?.completedAt).toBeDefined();
-      expect(assertStore.listSteps(childADirect!.runtimeRunId)).toContainEqual(
-        expect.objectContaining({
-          stepId: "agent_invocation",
-          status: "succeeded",
-          recoveryState: "terminal",
-        }),
-      );
-      expect(assertStore.getTimeline(childADirect!.runtimeRunId)).toContainEqual(
-        expect.objectContaining({
-          eventType: "agent.turn.continuation_superseded",
-        }),
-      );
-    } finally {
-      assertStore.close();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("keeps parent waiting when a child announce succeeds before sibling fan-in is complete", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-subagent-"));
-    const dbPath = path.join(dir, "state", "openclaw.sqlite");
-    const env = {
-      ...process.env,
-      OPENCLAW_DURABLE_RUNTIME: "1",
-      OPENCLAW_STATE_DIR: dir,
-    };
-    const parentSessionKey = "agent:bo:discord:channel:bo-main";
-    const childASessionKey = "agent:bo-worker:subagent:child-a";
-    const childBSessionKey = "agent:bo-worker:subagent:child-b";
-    const childARunId = "child-a-run";
-    const childBRunId = "child-b-run";
-    const childAAnnounceKey = `announce:v1:${childASessionKey}:${childARunId}`;
-
-    const setupStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      const parent = setupStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "running",
-        recoveryState: "running",
-        idempotencyKey: "run_parent",
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        metadata: { sessionKey: parentSessionKey },
-        now: 100,
-      });
-      setupStore.createStep({
-        runtimeRunId: parent.runtimeRunId,
-        stepId: "agent_invocation",
-        stepType: "agent",
-        status: "running",
-        recoveryState: "running",
-        idempotencyKey: "run_parent",
-        metadata: { sessionKey: parentSessionKey },
-        now: 100,
-      });
-    } finally {
-      setupStore.close();
-    }
-
-    recordDurableSubagentRegistered({
-      runId: childARunId,
-      childSessionKey: childASessionKey,
-      requesterSessionKey: parentSessionKey,
-      requesterRunId: "run_parent",
-      task: "Check branch A",
-      env,
-    });
-    recordDurableSubagentRegistered({
-      runId: childBRunId,
-      childSessionKey: childBSessionKey,
-      requesterSessionKey: parentSessionKey,
-      requesterRunId: "run_parent",
-      task: "Check branch B",
-      env,
-    });
-    recordDurableSubagentTerminal({
-      runId: childARunId,
-      childSessionKey: childASessionKey,
-      status: "ok",
-      summary: "branch A done",
-      env,
-    });
-
-    const directStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      directStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "succeeded",
-        recoveryState: "terminal",
-        idempotencyKey: childAAnnounceKey,
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        completedAt: 200,
-        metadata: { sessionKey: parentSessionKey },
-        now: 200,
-      });
-    } finally {
-      directStore.close();
-    }
-
-    recordDurableSubagentAnnounceDelivery({
-      runId: childARunId,
-      childSessionKey: childASessionKey,
-      directIdempotencyKey: childAAnnounceKey,
-      delivered: true,
-      path: "direct",
-      env,
-    });
-
-    const assertStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      const parent = assertStore
-        .listRuns({ limit: 50 })
-        .find(
-          (run) =>
-            run.operationKind === DURABLE_AGENT_TURN_OPERATION_KIND &&
-            run.idempotencyKey === "run_parent",
-        );
-      expect(parent).toMatchObject({
-        status: "waiting_child",
-        recoveryState: "waiting_child",
-      });
-      expect(parent?.completedAt).toBeUndefined();
-      expect(assertStore.listChildLinks(parent!.runtimeRunId)).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({ status: "succeeded" }),
-          expect.objectContaining({ status: "running" }),
-        ]),
-      );
-      expect(assertStore.getTimeline(parent!.runtimeRunId)).not.toContainEqual(
-        expect.objectContaining({
-          eventType: "agent.turn.continuation_succeeded",
-        }),
-      );
-    } finally {
-      assertStore.close();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("records failed continuation delivery without marking parent terminal", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-subagent-"));
-    const dbPath = path.join(dir, "state", "openclaw.sqlite");
-    const env = {
-      ...process.env,
-      OPENCLAW_DURABLE_RUNTIME: "1",
-      OPENCLAW_STATE_DIR: dir,
-    };
-    const parentSessionKey = "agent:bo:discord:channel:bo-main";
-    const setupStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      const parent = setupStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "running",
-        recoveryState: "running",
-        idempotencyKey: "run_parent",
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        metadata: { sessionKey: parentSessionKey },
-        now: 100,
-      });
-      setupStore.createStep({
-        runtimeRunId: parent.runtimeRunId,
-        stepId: "agent_invocation",
-        stepType: "agent",
-        status: "running",
-        recoveryState: "running",
-        idempotencyKey: "run_parent",
-        metadata: { sessionKey: parentSessionKey },
-        now: 100,
-      });
-    } finally {
-      setupStore.close();
-    }
-
-    recordDurableSubagentRegistered({
-      runId: "run_child_failed_delivery",
-      childSessionKey: "agent:bo:subagent:failed-delivery-child",
-      requesterSessionKey: parentSessionKey,
-      requesterRunId: "run_parent",
-      task: "Check failed delivery",
-      env,
-    });
-    recordDurableSubagentTerminal({
-      runId: "run_child_failed_delivery",
-      childSessionKey: "agent:bo:subagent:failed-delivery-child",
-      status: "ok",
-      summary: "done",
-      env,
-    });
-    recordDurableSubagentAnnounceDelivery({
-      runId: "run_child_failed_delivery",
-      childSessionKey: "agent:bo:subagent:failed-delivery-child",
-      directIdempotencyKey: "announce:failed-delivery",
-      delivered: false,
-      path: "direct",
-      error: "gateway unavailable",
-      env,
-    });
-
-    const assertStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      const parent = assertStore
-        .listRuns({ limit: 20 })
-        .find(
-          (run) =>
-            run.operationKind === DURABLE_AGENT_TURN_OPERATION_KIND &&
-            run.idempotencyKey === "run_parent",
-        );
-      expect(parent).toMatchObject({
-        status: "queued",
-        recoveryState: "runnable",
-      });
-      expect(parent?.completedAt).toBeUndefined();
-      expect(parent?.metadata?.lastSubagentAnnounceDelivery).toMatchObject({
-        delivered: false,
-        acknowledged: false,
-        path: "direct",
-        error: "gateway unavailable",
-      });
-      const mailbox = assertStore
-        .listSteps(parent!.runtimeRunId)
-        .find((step) => step.stepType === "result_mailbox");
-      expect(mailbox).toMatchObject({
-        status: "queued",
-        recoveryState: "runnable",
-        metadata: {
-          status: "pending_parent_ack",
-          delivery: {
-            status: "failed",
-            delivered: false,
-            acknowledged: false,
-            path: "direct",
-            error: "gateway unavailable",
-          },
-          ack: {
-            status: "pending",
-          },
-        },
-      });
-      expect(assertStore.getTimeline(parent!.runtimeRunId)).toContainEqual(
-        expect.objectContaining({
-          eventType: "subagent.child.announce_delivery_failed",
-        }),
-      );
-      expect(assertStore.getTimeline(parent!.runtimeRunId)).toContainEqual(
-        expect.objectContaining({
-          eventType: "result_mailbox.delivery_failed",
-        }),
-      );
-    } finally {
-      assertStore.close();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("reopens parent fan-in when a later child starts after an earlier child completed", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-subagent-"));
-    const dbPath = path.join(dir, "state", "openclaw.sqlite");
-    const env = {
-      ...process.env,
-      OPENCLAW_DURABLE_RUNTIME: "1",
-      OPENCLAW_STATE_DIR: dir,
-    };
-    const parentSessionKey = "agent:bo:discord:channel:bo-main";
-    const setupStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      setupStore.createRun({
-        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-        status: "running",
-        recoveryState: "running",
-        idempotencyKey: "run_parent",
-        sourceType: "agent_turn",
-        sourceRef: parentSessionKey,
-        metadata: { sessionKey: parentSessionKey },
-        now: 100,
-      });
-    } finally {
-      setupStore.close();
-    }
-
-    recordDurableSubagentRegistered({
-      runId: "run_child_a",
-      childSessionKey: "agent:bo:subagent:child-a",
-      requesterSessionKey: parentSessionKey,
-      requesterRunId: "run_parent",
-      task: "First child",
-      env,
-    });
-    recordDurableSubagentTerminal({
-      runId: "run_child_a",
-      childSessionKey: "agent:bo:subagent:child-a",
-      status: "success",
-      summary: "child a done",
-      env,
-    });
-    recordDurableSubagentRegistered({
-      runId: "run_child_b",
-      childSessionKey: "agent:bo:subagent:child-b",
-      requesterSessionKey: parentSessionKey,
-      requesterRunId: "run_parent",
-      task: "Second child",
-      env,
-    });
-
-    const assertStore = openDurableRuntimeSqliteStore({ path: dbPath });
-    try {
-      const parent = assertStore
-        .listRuns({ limit: 20 })
-        .find((run) => run.operationKind === DURABLE_AGENT_TURN_OPERATION_KIND);
-      expect(parent).toMatchObject({
-        status: "waiting_child",
-        recoveryState: "waiting_child",
-      });
-      expect(parent?.completedAt).toBeUndefined();
-      const fanInStep = assertStore
-        .listSteps(parent!.runtimeRunId)
-        .find((step) => step.stepId === "subagents");
-      expect(fanInStep).toMatchObject({
-        stepId: "subagents",
-        status: "waiting",
-        recoveryState: "waiting_child",
-      });
-      expect(fanInStep?.completedAt).toBeUndefined();
-      expect(assertStore.listChildLinks(parent!.runtimeRunId)).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({ status: "succeeded" }),
-          expect.objectContaining({ status: "running" }),
-        ]),
-      );
-    } finally {
-      assertStore.close();
-      fs.rmSync(dir, { recursive: true, force: true });
+      verify.close();
     }
   });
 });

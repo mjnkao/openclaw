@@ -1621,6 +1621,95 @@ export async function maybeDeliverTaskStateChangeUpdate(
   }
 }
 
+export type TaskAttentionDeliveryResult =
+  | { status: "delivered"; mode: "terminal" | "progress"; deliveryStatus?: TaskDeliveryStatus }
+  | { status: "deferred"; reason: string; deliveryStatus?: TaskDeliveryStatus }
+  | { status: "suspended"; reason: string; deliveryStatus?: TaskDeliveryStatus }
+  | { status: "superseded"; reason: string; deliveryStatus?: TaskDeliveryStatus }
+  | { status: "missing" };
+
+/** Owner-controlled delivery entry point used by durable attention reconciliation. */
+export async function requestTaskAttentionDelivery(params: {
+  taskId: string;
+  now?: number;
+}): Promise<TaskAttentionDeliveryResult> {
+  ensureTaskRegistryReady();
+  const current = tasks.get(params.taskId);
+  if (!current) {
+    return { status: "missing" };
+  }
+  if (current.notifyPolicy === "silent" || current.deliveryStatus === "not_applicable") {
+    return {
+      status: "superseded",
+      reason: "task_notification_not_required",
+      deliveryStatus: current.deliveryStatus,
+    };
+  }
+
+  if (isTerminalTaskStatus(current.status)) {
+    if (current.deliveryStatus === "delivered" || current.deliveryStatus === "session_queued") {
+      return { status: "delivered", mode: "terminal", deliveryStatus: current.deliveryStatus };
+    }
+    const retryable =
+      current.deliveryStatus === "failed" || current.deliveryStatus === "parent_missing";
+    if (retryable && !updateTask(current.taskId, { deliveryStatus: "pending" })) {
+      return {
+        status: "deferred",
+        reason: "task_delivery_retry_persistence_failed",
+        deliveryStatus: current.deliveryStatus,
+      };
+    }
+    const delivered = await maybeDeliverTaskTerminalUpdate(current.taskId);
+    if (!delivered) {
+      return { status: "missing" };
+    }
+    if (delivered.deliveryStatus === "delivered" || delivered.deliveryStatus === "session_queued") {
+      return { status: "delivered", mode: "terminal", deliveryStatus: delivered.deliveryStatus };
+    }
+    if (delivered.deliveryStatus === "not_applicable") {
+      return {
+        status: "superseded",
+        reason: "task_notification_not_required",
+        deliveryStatus: delivered.deliveryStatus,
+      };
+    }
+    if (delivered.deliveryStatus === "parent_missing") {
+      return {
+        status: "suspended",
+        reason: "task_parent_missing",
+        deliveryStatus: delivered.deliveryStatus,
+      };
+    }
+    return {
+      status: "deferred",
+      reason: "task_terminal_delivery_pending",
+      deliveryStatus: delivered.deliveryStatus,
+    };
+  }
+
+  const now = params.now ?? Date.now();
+  const text = formatTaskStateChangeMessage(current, {
+    at: now,
+    kind: "progress",
+    summary:
+      normalizeTaskSummary(current.progressSummary) ??
+      (current.status === "queued" ? "Task is still queued." : "Task is still running."),
+  });
+  if (!text || !queueTaskSystemEvent(current, text)) {
+    return {
+      status: "suspended",
+      reason: "task_parent_missing",
+      deliveryStatus: current.deliveryStatus,
+    };
+  }
+  upsertTaskDeliveryState({
+    taskId: current.taskId,
+    requesterOrigin: taskDeliveryStates.get(current.taskId)?.requesterOrigin,
+    lastNotifiedEventAt: now,
+  });
+  return { status: "delivered", mode: "progress", deliveryStatus: current.deliveryStatus };
+}
+
 export function setTaskCleanupAfterById(params: {
   taskId: string;
   cleanupAfter: number;

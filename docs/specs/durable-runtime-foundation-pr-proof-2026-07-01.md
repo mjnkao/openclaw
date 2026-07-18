@@ -1,5 +1,10 @@
 # Durable Runtime Foundation PR Proof - 2026-07-01
 
+> Historical PR2 proof. Superseded by
+> [Durable Core Residual-Gap Architecture](./durable-core-architecture.md) and
+> the companion 7.1 gap analysis. Legacy table names and the separate durable
+> schema-version ledger below are not the current implementation contract.
+
 ## Scope
 
 This proof covers the durable runtime foundation slice only. It intentionally

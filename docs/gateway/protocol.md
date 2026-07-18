@@ -600,6 +600,36 @@ opening or migrating durable runtime state.
   - The projection includes runtime identity, status, recovery state, current
     step, waiting reason, external task/session/run bindings, child counts, ref
     summaries, and supported controls.
+- `durable.obligations.list` returns a bounded unified view of unresolved owner
+  rows, wake obligations, uncertainty, child correlations, and expired durable
+  leases.
+- `durable.wakes.list` returns source-backed wake obligations;
+  `durable.wakes.inspect` adds target resolution, delivery evidence, and open
+  uncertainty for one wake.
+- `durable.uncertainty.list` returns unresolved uncertainty facts.
+- `durable.delivery-attempts.list` returns bounded delivery evidence for one
+  `wakeId`.
+- `durable.health.get` returns enablement, authority mode, process health, and
+  bounded store counters.
+
+Explicit control methods require `operator.write`:
+
+- `durable.wakes.acknowledge` records target consumption;
+- `durable.wakes.resume` requeues an explicitly suspended wake;
+- `durable.wakes.supersede` records that a newer fact or operator decision
+  replaced the obligation;
+- `durable.uncertainty.resolve` resolves or supersedes one uncertainty fact
+  with a required resolution kind.
+
+Wake controls accept optional `expectedSourceRevision`; uncertainty resolution
+accepts optional `expectedUpdatedAt`. A mismatch rejects the mutation without
+changing durable state.
+
+The gateway derives actor identity from the authenticated client/device. It
+does not accept actor identity from request params.
+
+All durable inspection methods require `operator.read`. They are read-only and
+reject invalid or disabled requests before opening durable state.
 
 ## Operator helper methods
 

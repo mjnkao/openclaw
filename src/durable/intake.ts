@@ -30,8 +30,9 @@ export type DurableRuntimeIntakeInput = {
   operationVersion?: string;
   idempotencyKey?: string;
   requestHash?: string;
-  sourceType?: string;
+  sourceOwner?: string;
   sourceRef?: string;
+  rootOperationReason?: string;
   messageId?: string;
   turnId?: string;
   workUnitId?: string;
@@ -69,8 +70,9 @@ export function acceptDurableRuntimeIntake(
     recoveryState: "runnable",
     idempotencyKey: params.idempotencyKey,
     requestHash: params.requestHash,
-    sourceType: params.sourceType,
+    sourceOwner: params.sourceOwner,
     sourceRef: params.sourceRef,
+    rootOperationReason: params.rootOperationReason,
     inputRef: inputRefId,
     messageId: params.messageId,
     turnId: params.turnId,

@@ -50,12 +50,19 @@ export type OpenClawStateDatabaseOptions = {
   path?: string;
 };
 
+export type OpenClawStateDatabaseLease = {
+  database: OpenClawStateDatabase;
+  release: () => void;
+};
+
 export type OpenClawStateDatabaseSchemaMigration = {
   kind: "agent-databases-composite-primary-key";
   path: string;
 };
 
 const cachedDatabases = new Map<string, OpenClawStateDatabase>();
+const cachedDatabaseLeaseCounts = new Map<string, number>();
+const cachedDatabasePendingClosePaths = new Set<string>();
 
 type OpenClawStateMetadataDatabase = Pick<OpenClawStateKyselyDatabase, "schema_meta">;
 
@@ -267,6 +274,13 @@ function assertCanonicalStateSchemaShape(db: DatabaseSync, pathname: string): vo
   );
 }
 
+function canApplyCanonicalStateSchema(db: DatabaseSync): boolean {
+  if (tableExists(db, "cron_jobs") && !tableHasColumn(db, "cron_jobs", "store_key")) {
+    return false;
+  }
+  return true;
+}
+
 export function detectOpenClawStateDatabaseSchemaMigrations(
   options: OpenClawStateDatabaseOptions = {},
 ): OpenClawStateDatabaseSchemaMigration[] {
@@ -472,6 +486,16 @@ function failureDestinationField(
 }
 
 function migrateLegacyCronDeliveryThreadIds(db: DatabaseSync): void {
+  if (
+    !tableExists(db, "cron_jobs") ||
+    !tableHasColumn(db, "cron_jobs", "store_key") ||
+    !tableHasColumn(db, "cron_jobs", "job_id") ||
+    !tableHasColumn(db, "cron_jobs", "job_json") ||
+    !tableHasColumn(db, "cron_jobs", "delivery_thread_id") ||
+    !tableHasColumn(db, "cron_jobs", "delivery_thread_id_type")
+  ) {
+    return;
+  }
   const rows = db
     .prepare(
       `SELECT store_key, job_id, job_json, delivery_thread_id
@@ -514,7 +538,11 @@ function migrateLegacyCronDeliveryThreadIds(db: DatabaseSync): void {
 function backfillCronJobsFromJobJson(db: DatabaseSync): void {
   if (
     !tableExists(db, "cron_jobs") ||
+    !tableHasColumn(db, "cron_jobs", "store_key") ||
+    !tableHasColumn(db, "cron_jobs", "job_id") ||
     !tableHasColumn(db, "cron_jobs", "job_json") ||
+    !tableHasColumn(db, "cron_jobs", "updated_at") ||
+    !tableHasColumn(db, "cron_jobs", "name") ||
     !tableHasColumn(db, "cron_jobs", "schedule_kind") ||
     !tableHasColumn(db, "cron_jobs", "payload_kind")
   ) {
@@ -767,6 +795,7 @@ function backfillDeliveryQueueEntriesFromEntryJson(db: DatabaseSync): void {
 }
 
 function ensureAdditiveStateColumns(db: DatabaseSync): void {
+  ensureColumn(db, "diagnostic_events", "event_key TEXT");
   ensureColumn(db, "node_pairing_pending", "client_id TEXT");
   ensureColumn(db, "node_pairing_pending", "client_mode TEXT");
   ensureColumn(db, "node_pairing_paired", "client_id TEXT");
@@ -860,6 +889,7 @@ function ensureAdditiveStateColumns(db: DatabaseSync): void {
   ensureColumn(db, "cron_jobs", "runtime_updated_at_ms INTEGER");
   ensureColumn(db, "cron_jobs", "schedule_identity TEXT");
   ensureColumn(db, "cron_jobs", "sort_order INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "cron_jobs", "updated_at INTEGER NOT NULL DEFAULT 0");
   backfillCronJobsFromJobJson(db);
   runSqliteImmediateTransactionSync(db, () => {
     const addedDeliveryThreadIdType = ensureColumn(db, "cron_jobs", "delivery_thread_id_type TEXT");
@@ -936,13 +966,23 @@ function ensureAdditiveStateColumns(db: DatabaseSync): void {
     repairLegacyTaskDeliveryStatuses(db);
   });
   ensureColumn(db, "subagent_runs", "task_name TEXT");
+  ensureColumn(db, "durable_execution_records", "parent_runtime_run_id TEXT");
+  ensureColumn(db, "durable_execution_records", "parent_step_id TEXT");
+  ensureColumn(db, "durable_execution_records", "message_id TEXT");
+  ensureColumn(db, "durable_execution_records", "turn_id TEXT");
+  ensureColumn(db, "durable_execution_records", "work_unit_id TEXT");
+  ensureColumn(db, "durable_execution_records", "report_route_id TEXT");
+  ensureColumn(db, "durable_execution_records", "heartbeat_at INTEGER");
 }
 
 function ensureSchema(db: DatabaseSync, pathname: string): void {
   assertSupportedSchemaVersion(db, pathname);
+  ensureStartupMigrationCheckpointSchema(db, pathname);
   ensureAdditiveStateColumns(db);
   assertCanonicalStateSchemaShape(db, pathname);
-  db.exec(OPENCLAW_STATE_SCHEMA_SQL);
+  if (canApplyCanonicalStateSchema(db)) {
+    db.exec(OPENCLAW_STATE_SCHEMA_SQL);
+  }
   ensureAdditiveStateColumns(db);
   db.exec(`PRAGMA user_version = ${OPENCLAW_STATE_SCHEMA_VERSION};`);
   const now = Date.now();
@@ -1017,7 +1057,43 @@ export function openOpenClawStateDatabase(
   ensureOpenClawStatePermissions(pathname, env);
   const database = { db, path: pathname, walMaintenance };
   cachedDatabases.set(pathname, database);
+  cachedDatabaseLeaseCounts.set(pathname, 0);
   return database;
+}
+
+function closeOpenClawStateDatabaseHandle(pathname: string, database: OpenClawStateDatabase): void {
+  database.walMaintenance.close();
+  clearNodeSqliteKyselyCacheForDatabase(database.db);
+  if (database.db.isOpen) {
+    database.db.close();
+  }
+  cachedDatabases.delete(pathname);
+  cachedDatabaseLeaseCounts.delete(pathname);
+  cachedDatabasePendingClosePaths.delete(pathname);
+}
+
+export function acquireOpenClawStateDatabaseLease(
+  options: OpenClawStateDatabaseOptions,
+): OpenClawStateDatabaseLease {
+  const database = openOpenClawStateDatabase(options);
+  const pathname = database.path;
+  cachedDatabaseLeaseCounts.set(pathname, (cachedDatabaseLeaseCounts.get(pathname) ?? 0) + 1);
+  let released = false;
+
+  return {
+    database,
+    release: () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      const leaseCount = Math.max((cachedDatabaseLeaseCounts.get(pathname) ?? 1) - 1, 0);
+      cachedDatabaseLeaseCounts.set(pathname, leaseCount);
+      if (leaseCount === 0 && cachedDatabasePendingClosePaths.has(pathname)) {
+        closeOpenClawStateDatabaseHandle(pathname, database);
+      }
+    },
+  };
 }
 
 /** Run a synchronous immediate transaction against the shared state database. */
@@ -1025,15 +1101,21 @@ export function runOpenClawStateWriteTransaction<T>(
   operation: (database: OpenClawStateDatabase) => T,
   options: OpenClawStateDatabaseOptions = {},
 ): T {
-  const database = openOpenClawStateDatabase(options);
-  const result = runSqliteImmediateTransactionSync(database.db, () => operation(database));
+  const lease = acquireOpenClawStateDatabaseLease(options);
   try {
-    ensureOpenClawStatePermissions(database.path, options.env ?? process.env);
-  } catch {
-    // The write already committed; permission hardening is best-effort here so
-    // callers never retry an operation that is durable in SQLite.
+    const result = runSqliteImmediateTransactionSync(lease.database.db, () =>
+      operation(lease.database),
+    );
+    try {
+      ensureOpenClawStatePermissions(lease.database.path, options.env ?? process.env);
+    } catch {
+      // The write already committed; permission hardening is best-effort here so
+      // callers never retry an operation that is durable in SQLite.
+    }
+    return result;
+  } finally {
+    lease.release();
   }
-  return result;
 }
 
 /** Close all cached shared state database handles. */
@@ -1046,6 +1128,26 @@ export function closeOpenClawStateDatabase(): void {
     }
   }
   cachedDatabases.clear();
+  cachedDatabaseLeaseCounts.clear();
+  cachedDatabasePendingClosePaths.clear();
+}
+
+/** Close one cached shared state database handle resolved from the provided options. */
+export function closeOpenClawStateDatabaseForPath(
+  options: OpenClawStateDatabaseOptions = {},
+): void {
+  const pathname = resolveDatabasePath(options);
+  const database = cachedDatabases.get(pathname);
+  if (!database) {
+    return;
+  }
+  const leaseCount = cachedDatabaseLeaseCounts.get(pathname) ?? 0;
+  if (leaseCount > 0) {
+    cachedDatabasePendingClosePaths.add(pathname);
+    database.walMaintenance.checkpoint();
+    return;
+  }
+  closeOpenClawStateDatabaseHandle(pathname, database);
 }
 
 /** Test whether any cached shared state database handle is still open. */

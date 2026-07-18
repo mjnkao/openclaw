@@ -1,5 +1,10 @@
 # Durable Runtime Agent/Session Wiring PR Proof - 2026-07-01
 
+> Historical PR3 proof. Superseded by
+> [Durable Core Residual-Gap Architecture](./durable-core-architecture.md).
+> Child-run mirroring, the parallel result-mailbox/fan-in lifecycle, and legacy
+> orchestration-policy claims below are not the current implementation contract.
+
 ## Scope
 
 This proof covers the PR3 agent/session wiring slice stacked on the durable

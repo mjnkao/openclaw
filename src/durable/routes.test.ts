@@ -25,6 +25,7 @@ describe("durable report routes", () => {
     try {
       const run = store.createRun({
         operationKind: "route.runtime",
+        rootOperationReason: "report_route_test_fixture",
         status: "running",
         recoveryState: "running",
       });

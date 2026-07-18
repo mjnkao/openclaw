@@ -35,6 +35,7 @@ describe("durable runtime executor", () => {
       });
       const run = store.createRun({
         operationKind: "test.runtime",
+        rootOperationReason: "test_fixture",
         status: "queued",
         recoveryState: "runnable",
         now: 100,
@@ -102,6 +103,7 @@ describe("durable runtime executor", () => {
       );
       const run = store.createRun({
         operationKind: "test.runtime",
+        rootOperationReason: "test_fixture",
         status: "queued",
         recoveryState: "runnable",
         now: 100,
@@ -155,12 +157,18 @@ describe("durable runtime executor", () => {
     try {
       const registry = createDurableRuntimeRegistry();
       registry.registerStepHandler("tool", (context) => {
-        context.store.updateStep({
+        const previousClaimToken = context.step.claimedBy!;
+        context.store.releaseStepClaim({
           runtimeRunId: context.step.runtimeRunId,
           stepId: context.step.stepId,
-          claimedBy: "worker-2",
-          claimExpiresAt: 1_000,
-          now: 300,
+          workerId: previousClaimToken,
+          now: 201,
+        });
+        context.store.claimNextRunnableStep({
+          operationKind: "test.runtime",
+          workerId: "worker-2",
+          claimTtlMs: 1_000,
+          now: 202,
         });
         return {
           kind: "succeeded",
@@ -170,6 +178,7 @@ describe("durable runtime executor", () => {
       });
       const run = store.createRun({
         operationKind: "test.runtime",
+        rootOperationReason: "test_fixture",
         status: "queued",
         recoveryState: "runnable",
         now: 100,
@@ -204,9 +213,9 @@ describe("durable runtime executor", () => {
       expect(store.listSteps(run.runtimeRunId)).toMatchObject([
         {
           stepId: step.stepId,
-          status: "running",
-          recoveryState: "running",
-          claimedBy: "worker-2",
+          status: "queued",
+          recoveryState: "claimed",
+          claimedBy: expect.stringMatching(/^claim_/),
         },
       ]);
       expect(store.getTimeline(run.runtimeRunId).map((event) => event.eventType)).toEqual([
@@ -229,6 +238,7 @@ describe("durable runtime executor", () => {
       }));
       const run = store.createRun({
         operationKind: "test.runtime",
+        rootOperationReason: "test_fixture",
         status: "queued",
         recoveryState: "runnable",
         now: 100,
@@ -275,6 +285,7 @@ describe("durable runtime executor", () => {
       const registry = createDurableRuntimeRegistry();
       const run = store.createRun({
         operationKind: "test.runtime",
+        rootOperationReason: "test_fixture",
         status: "queued",
         recoveryState: "runnable",
         now: 100,

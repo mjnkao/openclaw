@@ -26,6 +26,7 @@ describe("durable human signal gates", () => {
     try {
       const run = store.createRun({
         operationKind: "human.runtime",
+        rootOperationReason: "human_signal_test_fixture",
         status: "running",
         recoveryState: "running",
         now: 100,

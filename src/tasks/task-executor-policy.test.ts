@@ -1,5 +1,6 @@
 // Verifies task executor delivery policy and terminal message formatting.
 import { describe, expect, it } from "vitest";
+import { SUBAGENT_KILL_TASK_ERROR } from "./detached-task-runtime-contract.js";
 import {
   formatTaskBlockedFollowupMessage,
   formatTaskStateChangeMessage,
@@ -71,6 +72,11 @@ describe("task-executor-policy", () => {
     expect(formatTaskBlockedFollowupMessage(blockedTask)).toBe(
       "Task needs follow-up: ACP import (run run-1234). Needs login.",
     );
+    expect(
+      formatTaskTerminalMessage(
+        createTask({ runtime: "subagent", status: "cancelled", runId: "run-34567890" }),
+      ),
+    ).toBe("Background task cancellation requested: Subagent task (run run-3456).");
     expect(formatTaskStateChangeMessage(blockedTask, progressEvent)).toBe(
       "Background task update: ACP import. No output for 60s.",
     );
@@ -156,8 +162,18 @@ describe("task-executor-policy", () => {
       shouldAutoDeliverTaskTerminalUpdate(
         createTask({
           runtime: "subagent",
-          status: "succeeded",
-          terminalOutcome: "blocked",
+          status: "cancelled",
+          error: SUBAGENT_KILL_TASK_ERROR,
+          deliveryStatus: "pending",
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      shouldAutoDeliverTaskTerminalUpdate(
+        createTask({
+          runtime: "subagent",
+          status: "cancelled",
+          error: "Cancelled by operator.",
           deliveryStatus: "pending",
         }),
       ),
@@ -192,6 +208,17 @@ describe("task-executor-policy", () => {
     expect(
       shouldSuppressDuplicateTerminalDelivery({
         task: createTask({
+          runtime: "subagent",
+          status: "cancelled",
+          runId: "run-duplicate",
+        }),
+        preferredTaskId: "task-1",
+        peerDeliveryCovered: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldSuppressDuplicateTerminalDelivery({
+        task: createTask({
           runtime: "acp",
           runId: "run-duplicate",
         }),
@@ -207,6 +234,16 @@ describe("task-executor-policy", () => {
         preferredTaskId: undefined,
       }),
     ).toBe(false);
+    expect(
+      shouldSuppressDuplicateTerminalDelivery({
+        task: createTask({
+          runtime: "subagent",
+          status: "cancelled",
+          runId: "run-duplicate",
+        }),
+        preferredTaskId: "task-2",
+      }),
+    ).toBe(true);
     expect(
       shouldUseParentReviewTaskTerminalMessage(
         createTask({

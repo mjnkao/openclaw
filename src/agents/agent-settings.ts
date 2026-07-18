@@ -7,6 +7,7 @@ import { MIN_PROMPT_BUDGET_RATIO, MIN_PROMPT_BUDGET_TOKENS } from "./agent-compa
 import { resolveProviderEndpoint } from "./provider-attribution.js";
 
 export const DEFAULT_AGENT_COMPACTION_RESERVE_TOKENS_FLOOR = 20_000;
+const MANUAL_COMPACTION_CHECKPOINT_KEEP_RECENT_TOKENS = 1;
 
 type AgentSettingsManagerLike = {
   getCompactionReserveTokens: () => number;
@@ -108,6 +109,24 @@ export function applyAgentCompactionSettingsFromConfig(params: {
       keepRecentTokens: targetKeepRecentTokens,
     },
   };
+}
+
+/** Makes manual compaction a hard checkpoint unless the operator configured a retained tail. */
+export function applyManualCompactionCheckpointSettings(params: {
+  settingsManager: AgentSettingsManagerLike;
+  cfg?: OpenClawConfig;
+  trigger: "budget" | "manual" | "overflow";
+}): boolean {
+  if (
+    params.trigger !== "manual" ||
+    typeof params.cfg?.agents?.defaults?.compaction?.keepRecentTokens === "number"
+  ) {
+    return false;
+  }
+  params.settingsManager.applyOverrides({
+    compaction: { keepRecentTokens: MANUAL_COMPACTION_CHECKPOINT_KEEP_RECENT_TOKENS },
+  });
+  return true;
 }
 
 /** Resolve the compaction mode after provider-backed safeguard promotion. */

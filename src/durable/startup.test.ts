@@ -19,6 +19,8 @@ describe("durable gateway startup integration", () => {
     try {
       const running = setupStore.createRun({
         operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
+        sourceOwner: "session_store",
+        sourceRef: "agent:test:startup-inspection",
         status: "running",
         recoveryState: "running",
         now: 100,
@@ -82,6 +84,8 @@ describe("durable gateway startup integration", () => {
     try {
       const running = setupStore.createRun({
         operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
+        sourceOwner: "session_store",
+        sourceRef: "agent:test:startup-worker",
         status: "running",
         recoveryState: "running",
         now: 100,

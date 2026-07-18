@@ -229,6 +229,36 @@ import {
   DurableCoordinationGetResultSchema,
   type DurableCoordinationProjection,
   DurableCoordinationProjectionSchema,
+  type DurableHealthGetParams,
+  DurableHealthGetParamsSchema,
+  type DurableHealthResult,
+  DurableHealthResultSchema,
+  type DurableLimitParams,
+  DurableLimitParamsSchema,
+  type DurableObligationsListResult,
+  DurableObligationsListResultSchema,
+  type WakeObligationListResult,
+  WakeObligationListResultSchema,
+  type WakeObligationIdParams,
+  WakeObligationIdParamsSchema,
+  type WakeObligationInspectResult,
+  WakeObligationInspectResultSchema,
+  type WakeObligationControlParams,
+  WakeObligationControlParamsSchema,
+  type WakeObligationControlResult,
+  WakeObligationControlResultSchema,
+  type WakeObligationSupersedeParams,
+  WakeObligationSupersedeParamsSchema,
+  type UncertaintyFactListResult,
+  UncertaintyFactListResultSchema,
+  type UncertaintyFactResolveParams,
+  UncertaintyFactResolveParamsSchema,
+  type UncertaintyFactResolveResult,
+  UncertaintyFactResolveResultSchema,
+  type DeliveryAttemptEvidenceListParams,
+  DeliveryAttemptEvidenceListParamsSchema,
+  type DeliveryAttemptEvidenceListResult,
+  DeliveryAttemptEvidenceListResultSchema,
   type ExecApprovalsGetParams,
   ExecApprovalsGetParamsSchema,
   type ExecApprovalsNodeGetParams,
@@ -847,6 +877,46 @@ export const validateDurableCoordinationGetParams = lazyCompile<DurableCoordinat
 export const validateDurableCoordinationGetResult = lazyCompile<DurableCoordinationGetResult>(
   DurableCoordinationGetResultSchema,
 );
+export const validateDurableHealthGetParams = lazyCompile<DurableHealthGetParams>(
+  DurableHealthGetParamsSchema,
+);
+export const validateDurableHealthResult =
+  lazyCompile<DurableHealthResult>(DurableHealthResultSchema);
+export const validateDurableLimitParams = lazyCompile<DurableLimitParams>(DurableLimitParamsSchema);
+export const validateDurableObligationsListResult = lazyCompile<DurableObligationsListResult>(
+  DurableObligationsListResultSchema,
+);
+export const validateWakeObligationListResult = lazyCompile<WakeObligationListResult>(
+  WakeObligationListResultSchema,
+);
+export const validateWakeObligationIdParams = lazyCompile<WakeObligationIdParams>(
+  WakeObligationIdParamsSchema,
+);
+export const validateWakeObligationInspectResult = lazyCompile<WakeObligationInspectResult>(
+  WakeObligationInspectResultSchema,
+);
+export const validateWakeObligationControlParams = lazyCompile<WakeObligationControlParams>(
+  WakeObligationControlParamsSchema,
+);
+export const validateWakeObligationSupersedeParams = lazyCompile<WakeObligationSupersedeParams>(
+  WakeObligationSupersedeParamsSchema,
+);
+export const validateWakeObligationControlResult = lazyCompile<WakeObligationControlResult>(
+  WakeObligationControlResultSchema,
+);
+export const validateUncertaintyFactListResult = lazyCompile<UncertaintyFactListResult>(
+  UncertaintyFactListResultSchema,
+);
+export const validateUncertaintyFactResolveParams = lazyCompile<UncertaintyFactResolveParams>(
+  UncertaintyFactResolveParamsSchema,
+);
+export const validateUncertaintyFactResolveResult = lazyCompile<UncertaintyFactResolveResult>(
+  UncertaintyFactResolveResultSchema,
+);
+export const validateDeliveryAttemptEvidenceListParams =
+  lazyCompile<DeliveryAttemptEvidenceListParams>(DeliveryAttemptEvidenceListParamsSchema);
+export const validateDeliveryAttemptEvidenceListResult =
+  lazyCompile<DeliveryAttemptEvidenceListResult>(DeliveryAttemptEvidenceListResultSchema);
 export const validateConfigGetParams = lazyCompile<ConfigGetParams>(ConfigGetParamsSchema);
 export const validateConfigSetParams = lazyCompile<ConfigSetParams>(ConfigSetParamsSchema);
 export const validateConfigApplyParams = lazyCompile<ConfigApplyParams>(ConfigApplyParamsSchema);
@@ -1264,6 +1334,21 @@ export {
   DurableCoordinationGetParamsSchema,
   DurableCoordinationProjectionSchema,
   DurableCoordinationGetResultSchema,
+  DurableHealthGetParamsSchema,
+  DurableHealthResultSchema,
+  DurableLimitParamsSchema,
+  DurableObligationsListResultSchema,
+  WakeObligationListResultSchema,
+  WakeObligationIdParamsSchema,
+  WakeObligationInspectResultSchema,
+  WakeObligationControlParamsSchema,
+  WakeObligationSupersedeParamsSchema,
+  WakeObligationControlResultSchema,
+  UncertaintyFactListResultSchema,
+  UncertaintyFactResolveParamsSchema,
+  UncertaintyFactResolveResultSchema,
+  DeliveryAttemptEvidenceListParamsSchema,
+  DeliveryAttemptEvidenceListResultSchema,
   ConfigGetParamsSchema,
   ConfigSetParamsSchema,
   ConfigApplyParamsSchema,
@@ -1656,6 +1741,21 @@ export type {
   DurableCoordinationGetParams,
   DurableCoordinationProjection,
   DurableCoordinationGetResult,
+  DurableHealthGetParams,
+  DurableHealthResult,
+  DurableLimitParams,
+  DurableObligationsListResult,
+  WakeObligationListResult,
+  WakeObligationIdParams,
+  WakeObligationInspectResult,
+  WakeObligationControlParams,
+  WakeObligationSupersedeParams,
+  WakeObligationControlResult,
+  UncertaintyFactListResult,
+  UncertaintyFactResolveParams,
+  UncertaintyFactResolveResult,
+  DeliveryAttemptEvidenceListParams,
+  DeliveryAttemptEvidenceListResult,
   CronJob,
   CronListParams,
   CronStatusParams,

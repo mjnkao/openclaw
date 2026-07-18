@@ -14,8 +14,8 @@ export type DurableIntakeEnvelope = {
   schema: typeof DURABLE_INTAKE_ENVELOPE_SCHEMA;
   operationKind: string;
   runId: string;
-  sourceType: string;
-  sourceRef?: string;
+  sourceOwner: string;
+  sourceRef: string;
   agentId?: string;
   sessionKey?: string;
   transport?: string;
@@ -69,8 +69,8 @@ function previewText(value: string, limit: number): { preview?: string; truncate
 export function buildDurableIntakeEnvelope(params: {
   operationKind: string;
   runId: string;
-  sourceType: string;
-  sourceRef?: string;
+  sourceOwner: string;
+  sourceRef: string;
   agentId?: string;
   sessionKey?: string;
   transport?: string;
@@ -114,8 +114,8 @@ export function buildDurableIntakeEnvelope(params: {
     schema: DURABLE_INTAKE_ENVELOPE_SCHEMA,
     operationKind: params.operationKind,
     runId: params.runId,
-    sourceType: params.sourceType,
-    ...(params.sourceRef ? { sourceRef: params.sourceRef } : {}),
+    sourceOwner: params.sourceOwner,
+    sourceRef: params.sourceRef,
     ...(params.agentId ? { agentId: params.agentId } : {}),
     ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
     ...(params.transport ? { transport: params.transport } : {}),

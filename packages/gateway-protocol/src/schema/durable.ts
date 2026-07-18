@@ -44,9 +44,16 @@ type DurableCoordinationWaitingReason =
   | "retry"
   | "worker"
   | "unknown";
-type WakeObligationStatus = "pending" | "delivered" | "acked" | "failed" | "superseded";
+type WakeObligationStatus =
+  | "pending"
+  | "delivered"
+  | "acked"
+  | "failed"
+  | "suspended"
+  | "superseded";
 type WakeObligationReason =
   | "child_terminal"
+  | "child_overdue"
   | "fan_in_incomplete"
   | "restart_interrupted"
   | "delivery_unknown"
@@ -149,7 +156,7 @@ type DurableCoordinationProjection = {
   operationVersion: string;
   status: DurableRuntimeRunStatus;
   recoveryState: DurableRecoveryState;
-  sourceType?: string;
+  sourceOwner?: string;
   sourceRef?: string;
   parentRuntimeRunId?: string;
   parentStepId?: string;
@@ -168,6 +175,8 @@ type DurableCoordinationProjection = {
 };
 type WakeObligation = {
   wakeId: string;
+  sourceOwner: string;
+  sourceRef: string;
   parentRunId?: string;
   parentSessionKey?: string;
   targetAgent?: string;
@@ -195,6 +204,8 @@ type WakeObligation = {
 };
 type DeliveryAttemptEvidence = {
   deliveryAttemptId: string;
+  sourceOwner: string;
+  sourceRef: string;
   wakeId: string;
   dedupeKey: string;
   replayPassId?: string;
@@ -210,18 +221,22 @@ type DeliveryAttemptEvidence = {
   deliveredAt?: TimestampMs;
   failedAt?: TimestampMs;
   unknownAt?: TimestampMs;
+  deliveryClaimedBy?: string;
+  deliveryClaimExpiresAt?: TimestampMs;
   createdAt: TimestampMs;
   updatedAt: TimestampMs;
   metadata?: JsonRecord;
 };
 type UncertaintyFact = {
   factId: string;
+  sourceOwner: string;
+  sourceRef: string;
   kind:
     | "unknown_after_side_effect"
     | "interrupted_during_tool"
     | "lost_after_dispatch"
     | "delivery_unknown"
-    | "requires_parent_decision";
+    | "requires_owner_decision";
   sourceRunId?: string;
   stepId?: string;
   eventId?: string;
@@ -239,13 +254,15 @@ type UncertaintyFact = {
 };
 type DurableUnresolvedObligation = {
   obligationId: string;
+  sourceOwner: string;
+  sourceRef: string;
   kind:
     | "pending_wake"
     | "unresolved_uncertainty"
     | "open_child"
-    | "expired_run_claim"
-    | "expired_step_claim"
-    | "pending_result_mailbox";
+    | "pending_subagent_delivery"
+    | "pending_delivery_queue"
+    | "expired_state_lease";
   runtimeRunId?: string;
   stepId?: string;
   wakeId?: string;
@@ -275,11 +292,38 @@ type WakeObligationInspection = {
   deliveryAttemptEvidence: DeliveryAttemptEvidence[];
   unresolvedUncertaintyFacts: UncertaintyFact[];
   sourceRefs: {
+    sourceOwner: string;
+    sourceRef: string;
     factsRef?: string;
     sourceRunId?: string;
     dedupeKey: string;
     parentRunId?: string;
     parentSessionKey?: string;
+  };
+};
+type DurableHealthResult = {
+  enabled: boolean;
+  authority: boolean;
+  process: {
+    status: "healthy" | "degraded";
+    lastSuccessAt?: TimestampMs;
+    lastFailure?: {
+      component: string;
+      operation: string;
+      message: string;
+      failedAt: TimestampMs;
+      failureCount: number;
+    };
+  };
+  store?: {
+    path: string;
+    schemaVersion: number;
+    runs: number;
+    events: number;
+    steps: number;
+    openRuns: number;
+    pendingWakes: number;
+    unresolvedUncertaintyFacts: number;
   };
 };
 
@@ -433,7 +477,7 @@ export const DurableCoordinationProjectionSchema = Type.Unsafe<DurableCoordinati
       operationVersion: NonEmptyString,
       status: DurableRuntimeRunStatusSchema,
       recoveryState: DurableRecoveryStateSchema,
-      sourceType: Type.Optional(Type.String()),
+      sourceOwner: Type.Optional(Type.String()),
       sourceRef: Type.Optional(Type.String()),
       parentRuntimeRunId: Type.Optional(Type.String()),
       parentStepId: Type.Optional(Type.String()),
@@ -466,11 +510,13 @@ export const WakeObligationStatusSchema = Type.Union([
   Type.Literal("delivered"),
   Type.Literal("acked"),
   Type.Literal("failed"),
+  Type.Literal("suspended"),
   Type.Literal("superseded"),
 ]);
 
 export const WakeObligationReasonSchema = Type.Union([
   Type.Literal("child_terminal"),
+  Type.Literal("child_overdue"),
   Type.Literal("fan_in_incomplete"),
   Type.Literal("restart_interrupted"),
   Type.Literal("delivery_unknown"),
@@ -525,6 +571,8 @@ export const WakeObligationSchema = Type.Unsafe<WakeObligation>(
   Type.Object(
     {
       wakeId: NonEmptyString,
+      sourceOwner: NonEmptyString,
+      sourceRef: NonEmptyString,
       parentRunId: Type.Optional(Type.String()),
       parentSessionKey: Type.Optional(Type.String()),
       targetAgent: Type.Optional(Type.String()),
@@ -558,6 +606,8 @@ export const DeliveryAttemptEvidenceSchema = Type.Unsafe<DeliveryAttemptEvidence
   Type.Object(
     {
       deliveryAttemptId: NonEmptyString,
+      sourceOwner: NonEmptyString,
+      sourceRef: NonEmptyString,
       wakeId: NonEmptyString,
       dedupeKey: NonEmptyString,
       replayPassId: Type.Optional(Type.String()),
@@ -573,6 +623,8 @@ export const DeliveryAttemptEvidenceSchema = Type.Unsafe<DeliveryAttemptEvidence
       deliveredAt: Type.Optional(TimestampMsSchema),
       failedAt: Type.Optional(TimestampMsSchema),
       unknownAt: Type.Optional(TimestampMsSchema),
+      deliveryClaimedBy: Type.Optional(Type.String()),
+      deliveryClaimExpiresAt: Type.Optional(TimestampMsSchema),
       createdAt: TimestampMsSchema,
       updatedAt: TimestampMsSchema,
       metadata: Type.Optional(JsonRecordSchema),
@@ -585,12 +637,14 @@ export const UncertaintyFactSchema = Type.Unsafe<UncertaintyFact>(
   Type.Object(
     {
       factId: NonEmptyString,
+      sourceOwner: NonEmptyString,
+      sourceRef: NonEmptyString,
       kind: Type.Union([
         Type.Literal("unknown_after_side_effect"),
         Type.Literal("interrupted_during_tool"),
         Type.Literal("lost_after_dispatch"),
         Type.Literal("delivery_unknown"),
-        Type.Literal("requires_parent_decision"),
+        Type.Literal("requires_owner_decision"),
       ]),
       sourceRunId: Type.Optional(Type.String()),
       stepId: Type.Optional(Type.String()),
@@ -619,13 +673,15 @@ export const DurableUnresolvedObligationSchema = Type.Unsafe<DurableUnresolvedOb
   Type.Object(
     {
       obligationId: NonEmptyString,
+      sourceOwner: NonEmptyString,
+      sourceRef: NonEmptyString,
       kind: Type.Union([
         Type.Literal("pending_wake"),
         Type.Literal("unresolved_uncertainty"),
         Type.Literal("open_child"),
-        Type.Literal("expired_run_claim"),
-        Type.Literal("expired_step_claim"),
-        Type.Literal("pending_result_mailbox"),
+        Type.Literal("pending_subagent_delivery"),
+        Type.Literal("pending_delivery_queue"),
+        Type.Literal("expired_state_lease"),
       ]),
       runtimeRunId: Type.Optional(Type.String()),
       stepId: Type.Optional(Type.String()),
@@ -666,6 +722,8 @@ export const WakeObligationInspectionSchema = Type.Unsafe<WakeObligationInspecti
       unresolvedUncertaintyFacts: Type.Array(UncertaintyFactSchema),
       sourceRefs: Type.Object(
         {
+          sourceOwner: NonEmptyString,
+          sourceRef: NonEmptyString,
           factsRef: Type.Optional(Type.String()),
           sourceRunId: Type.Optional(Type.String()),
           dedupeKey: NonEmptyString,
@@ -692,6 +750,41 @@ export const WakeObligationIdParamsSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+
+const WakeControlFields = {
+  wakeId: NonEmptyString,
+  reason: Type.Optional(Type.String()),
+  decisionRef: Type.Optional(Type.String()),
+  idempotencyKey: Type.Optional(Type.String()),
+  expectedSourceRevision: Type.Optional(NonEmptyString),
+  evidence: Type.Optional(JsonRecordSchema),
+};
+
+export const WakeObligationControlParamsSchema = Type.Object(WakeControlFields, {
+  additionalProperties: false,
+});
+
+export const WakeObligationSupersedeParamsSchema = Type.Object(
+  {
+    ...WakeControlFields,
+    supersededByRef: Type.Optional(Type.String()),
+  },
+  { additionalProperties: false },
+);
+
+export const UncertaintyFactResolveParamsSchema = Type.Object(
+  {
+    factId: NonEmptyString,
+    status: Type.Union([Type.Literal("resolved"), Type.Literal("superseded")]),
+    resolutionKind: NonEmptyString,
+    resolutionRef: Type.Optional(Type.String()),
+    expectedUpdatedAt: Type.Optional(Type.Integer({ minimum: 0 })),
+    metadata: Type.Optional(JsonRecordSchema),
+  },
+  { additionalProperties: false },
+);
+
+export const DurableHealthGetParamsSchema = Type.Object({}, { additionalProperties: false });
 
 export const DeliveryAttemptEvidenceListParamsSchema = Type.Object(
   {
@@ -722,9 +815,74 @@ export const WakeObligationInspectResultSchema = Type.Object(
   { additionalProperties: false },
 );
 
+export const WakeObligationControlResultSchema = Type.Object(
+  {
+    wake: WakeObligationSchema,
+  },
+  { additionalProperties: false },
+);
+
+export const UncertaintyFactResolveResultSchema = Type.Object(
+  {
+    uncertaintyFact: UncertaintyFactSchema,
+  },
+  { additionalProperties: false },
+);
+
+export const DurableHealthResultSchema = Type.Unsafe<DurableHealthResult>(
+  Type.Object(
+    {
+      enabled: Type.Boolean(),
+      authority: Type.Boolean(),
+      process: Type.Object(
+        {
+          status: Type.Union([Type.Literal("healthy"), Type.Literal("degraded")]),
+          lastSuccessAt: Type.Optional(TimestampMsSchema),
+          lastFailure: Type.Optional(
+            Type.Object(
+              {
+                component: NonEmptyString,
+                operation: NonEmptyString,
+                message: Type.String(),
+                failedAt: TimestampMsSchema,
+                failureCount: Type.Integer({ minimum: 1 }),
+              },
+              { additionalProperties: false },
+            ),
+          ),
+        },
+        { additionalProperties: false },
+      ),
+      store: Type.Optional(
+        Type.Object(
+          {
+            path: Type.String(),
+            schemaVersion: Type.Integer({ minimum: 0 }),
+            runs: Type.Integer({ minimum: 0 }),
+            events: Type.Integer({ minimum: 0 }),
+            steps: Type.Integer({ minimum: 0 }),
+            openRuns: Type.Integer({ minimum: 0 }),
+            pendingWakes: Type.Integer({ minimum: 0 }),
+            unresolvedUncertaintyFacts: Type.Integer({ minimum: 0 }),
+          },
+          { additionalProperties: false },
+        ),
+      ),
+    },
+    { additionalProperties: false },
+  ),
+);
+
 export const DeliveryAttemptEvidenceListResultSchema = Type.Object(
   {
     deliveryAttemptEvidence: Type.Array(DeliveryAttemptEvidenceSchema),
+  },
+  { additionalProperties: false },
+);
+
+export const UncertaintyFactListResultSchema = Type.Object(
+  {
+    uncertaintyFacts: Type.Array(UncertaintyFactSchema),
   },
   { additionalProperties: false },
 );

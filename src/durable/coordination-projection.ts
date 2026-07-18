@@ -86,7 +86,7 @@ export type DurableCoordinationProjection = {
   operationVersion: string;
   status: DurableRuntimeRunStatus;
   recoveryState: DurableRecoveryState;
-  sourceType?: string;
+  sourceOwner?: string;
   sourceRef?: string;
   parentRuntimeRunId?: string;
   parentStepId?: string;
@@ -153,7 +153,7 @@ function stringArray(value: unknown): string[] | undefined {
 }
 
 function latestStep(steps: readonly DurableRuntimeStep[]): DurableRuntimeStep | undefined {
-  return [...steps].sort((left, right) => right.updatedAt - left.updatedAt)[0];
+  return [...steps].toSorted((left, right) => right.updatedAt - left.updatedAt)[0];
 }
 
 function latestOpenStep(steps: readonly DurableRuntimeStep[]): DurableRuntimeStep | undefined {
@@ -166,7 +166,7 @@ function latestOpenStep(steps: readonly DurableRuntimeStep[]): DurableRuntimeSte
         step.status !== "lost" &&
         step.status !== "skipped",
     )
-    .sort((left, right) => right.updatedAt - left.updatedAt)[0];
+    .toSorted((left, right) => right.updatedAt - left.updatedAt)[0];
 }
 
 function inferWaitingReason(params: {
@@ -192,9 +192,6 @@ function inferWaitingReason(params: {
     return "unknown";
   }
   if (params.currentStep?.stepType === "fan_in" && params.currentStep.status === "waiting") {
-    return "child";
-  }
-  if (params.currentStep?.stepType === "result_mailbox") {
     return "child";
   }
   if (params.currentStep?.stepType === "signal" && params.currentStep.status === "waiting") {
@@ -275,11 +272,11 @@ export function extractDurableCoordinationExternalRefs(
   const workboardCardId = firstString(metadata.workboardCardId, metadata.cardId);
   const sessionKey = firstString(
     metadata.sessionKey,
-    run.sourceType === "agent_turn" ? run.sourceRef : undefined,
+    run.sourceOwner === "session_store" ? run.sourceRef : undefined,
   );
   const childSessionKey = firstString(
     metadata.childSessionKey,
-    run.sourceType === "subagent" ? run.sourceRef : undefined,
+    run.sourceOwner === "subagent_runs" ? run.sourceRef : undefined,
   );
   const runId = firstString(metadata.runId, run.idempotencyKey);
   const agentId = firstString(metadata.agentId);
@@ -399,7 +396,7 @@ export function buildDurableCoordinationProjection(
     operationVersion: input.run.operationVersion,
     status: input.run.status,
     recoveryState: input.run.recoveryState,
-    ...(input.run.sourceType ? { sourceType: input.run.sourceType } : {}),
+    ...(input.run.sourceOwner ? { sourceOwner: input.run.sourceOwner } : {}),
     ...(input.run.sourceRef ? { sourceRef: input.run.sourceRef } : {}),
     ...(input.run.parentRuntimeRunId ? { parentRuntimeRunId: input.run.parentRuntimeRunId } : {}),
     ...(input.run.parentStepId ? { parentStepId: input.run.parentStepId } : {}),

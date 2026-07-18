@@ -1,6 +1,9 @@
 // Durable runtime lifecycle helpers for one agent turn.
 import { createHash } from "node:crypto";
-import { isDurableRuntimesEnabled } from "./config.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
+import { isAbandonedLivenessState, isBlockedLivenessState } from "../shared/agent-liveness.js";
+import { isDurableAuthorityEnabled, isDurableRuntimesEnabled } from "./config.js";
+import { recordDurableRuntimeHealthFailure, recordDurableRuntimeHealthSuccess } from "./health.js";
 import { buildDurableIntakeEnvelope } from "./intake-envelope.js";
 import { DURABLE_AGENT_TURN_OPERATION_KIND } from "./runtime-ids.js";
 import { openDurableRuntimeStore } from "./store-factory.js";
@@ -24,6 +27,33 @@ export type DurableAgentTurnLifecycle = {
   close(): void;
 };
 
+export type DurableAgentTurnTerminalClassification = {
+  status: Extract<DurableRuntimeRunStatus, "cancelled" | "failed" | "succeeded">;
+  eventType:
+    | "agent.turn.abandoned"
+    | "agent.turn.blocked"
+    | "agent.turn.cancelled"
+    | "agent.turn.succeeded";
+};
+
+const log = createSubsystemLogger("durable/agent-turn");
+
+export function classifyDurableAgentTurnTerminal(params: {
+  aborted: boolean;
+  livenessState?: unknown;
+}): DurableAgentTurnTerminalClassification {
+  if (params.aborted) {
+    return { status: "cancelled", eventType: "agent.turn.cancelled" };
+  }
+  if (isBlockedLivenessState(params.livenessState)) {
+    return { status: "failed", eventType: "agent.turn.blocked" };
+  }
+  if (isAbandonedLivenessState(params.livenessState)) {
+    return { status: "failed", eventType: "agent.turn.abandoned" };
+  }
+  return { status: "succeeded", eventType: "agent.turn.succeeded" };
+}
+
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -35,11 +65,25 @@ function compactErrorPayload(error: unknown): Record<string, unknown> {
   };
 }
 
-function safeCall(action: () => void): void {
+function recordLifecycleMutation(params: {
+  action: () => void;
+  env: NodeJS.ProcessEnv;
+  operation: string;
+  failBeforeAcceptance?: boolean;
+}): void {
   try {
-    action();
-  } catch {
-    // Durable recording must never make the user-facing turn fail.
+    params.action();
+    recordDurableRuntimeHealthSuccess();
+  } catch (error) {
+    recordDurableRuntimeHealthFailure({
+      component: "agent_turn",
+      operation: params.operation,
+      error,
+    });
+    log.error(`durable agent turn ${params.operation} failed: ${String(error)}`);
+    if (params.failBeforeAcceptance && isDurableAuthorityEnabled(params.env)) {
+      throw error;
+    }
   }
 }
 
@@ -97,17 +141,7 @@ function createNoopLifecycle(): DurableAgentTurnLifecycle {
   };
 }
 
-function resolveHeartbeatIntervalMs(env: NodeJS.ProcessEnv): number {
-  const raw = env.OPENCLAW_DURABLE_AGENT_TURN_HEARTBEAT_MS;
-  if (raw === undefined || raw.trim() === "") {
-    return 30_000;
-  }
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    return 30_000;
-  }
-  return Math.trunc(parsed);
-}
+const AGENT_TURN_HEARTBEAT_INTERVAL_MS = 30_000;
 
 export function startDurableAgentTurnLifecycle(params: {
   runId: string;
@@ -131,11 +165,13 @@ export function startDurableAgentTurnLifecycle(params: {
   const stepId = "agent_invocation";
   const messageHash = sha256(params.message);
   const inputRefId = `agent-turn:${params.runId}:input`;
+  const sourceOwner = params.sessionKey ? "session_store" : "agent_runtime";
+  const sourceRef = params.sessionKey ?? params.runId;
   const intakeEnvelope = buildDurableIntakeEnvelope({
     operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
     runId: params.runId,
-    sourceType: "agent.turn",
-    sourceRef: params.sessionKey ?? params.agentId ?? "unknown",
+    sourceOwner,
+    sourceRef,
     agentId: params.agentId,
     sessionKey: params.sessionKey,
     transport: params.transport,
@@ -170,8 +206,8 @@ export function startDurableAgentTurnLifecycle(params: {
       recoveryState: "runnable",
       idempotencyKey: params.runId,
       requestHash: messageHash,
-      sourceType: "agent",
-      sourceRef: params.sessionKey ?? params.agentId ?? "unknown",
+      sourceOwner,
+      sourceRef,
       inputRef: inputRefId,
       metadata,
     });
@@ -206,8 +242,18 @@ export function startDurableAgentTurnLifecycle(params: {
       payload: metadata,
       payloadHash: messageHash,
     });
-  } catch {
+    recordDurableRuntimeHealthSuccess();
+  } catch (error) {
     store?.close();
+    recordDurableRuntimeHealthFailure({
+      component: "intake",
+      operation: "agent_turn_intake",
+      error,
+    });
+    log.error(`durable agent turn intake failed: ${String(error)}`);
+    if (isDurableAuthorityEnabled(env)) {
+      throw error;
+    }
     return createNoopLifecycle();
   }
 
@@ -219,209 +265,221 @@ export function startDurableAgentTurnLifecycle(params: {
   }
 
   function recordHeartbeat(payload?: Record<string, unknown>): void {
-    safeCall(() => {
-      if (!store || !run) {
-        return;
-      }
-      const now = Date.now();
-      store.updateRun({
-        runtimeRunId: run.runtimeRunId,
-        heartbeatAt: now,
-        metadata,
-        now,
-      });
-      store.updateStep({
-        runtimeRunId: run.runtimeRunId,
-        stepId,
-        heartbeatAt: now,
-        metadata,
-        now,
-      });
-      store.appendEvent({
-        runtimeRunId: run.runtimeRunId,
-        eventType: "agent.turn.heartbeat",
-        eventTime: now,
-        stepId,
-        agentInvocationId: params.runId,
-        idempotencyKey: `${params.runId}:heartbeat:${now}`,
-        correlationId: params.sessionKey,
-        payload: payload ?? { heartbeatAt: now },
-      });
+    recordLifecycleMutation({
+      env,
+      operation: "heartbeat",
+      action: () => {
+        if (!store || !run) {
+          return;
+        }
+        const now = Date.now();
+        store.updateRun({
+          runtimeRunId: run.runtimeRunId,
+          heartbeatAt: now,
+          metadata,
+          now,
+        });
+        store.updateStep({
+          runtimeRunId: run.runtimeRunId,
+          stepId,
+          heartbeatAt: now,
+          metadata,
+          now,
+        });
+        store.appendEvent({
+          runtimeRunId: run.runtimeRunId,
+          eventType: "agent.turn.heartbeat",
+          eventTime: now,
+          stepId,
+          agentInvocationId: params.runId,
+          idempotencyKey: `${params.runId}:heartbeat:${now}`,
+          correlationId: params.sessionKey,
+          payload: payload ?? { heartbeatAt: now },
+        });
+      },
     });
   }
 
   function startHeartbeat(): void {
-    const intervalMs = resolveHeartbeatIntervalMs(env);
-    if (intervalMs <= 0 || heartbeatTimer) {
+    if (heartbeatTimer) {
       return;
     }
     heartbeatTimer = setInterval(() => {
       recordHeartbeat();
-    }, intervalMs);
+    }, AGENT_TURN_HEARTBEAT_INTERVAL_MS);
     heartbeatTimer.unref?.();
   }
 
   return {
     runtimeRunId: run.runtimeRunId,
     markRunning(payload?: Record<string, unknown>): void {
-      safeCall(() => {
-        if (!store || !run) {
-          return;
-        }
-        store.updateRun({
-          runtimeRunId: run.runtimeRunId,
-          status: "running",
-          recoveryState: "running",
-          heartbeatAt: Date.now(),
-          metadata,
-        });
-        store.updateStep({
-          runtimeRunId: run.runtimeRunId,
-          stepId,
-          status: "running",
-          recoveryState: "running",
-          startedAt: Date.now(),
-          heartbeatAt: Date.now(),
-          metadata,
-        });
-        store.appendEvent({
-          runtimeRunId: run.runtimeRunId,
-          eventType: "agent.turn.running",
-          stepId: "agent_invocation",
-          agentInvocationId: params.runId,
-          idempotencyKey: params.runId,
-          correlationId: params.sessionKey,
-          payload,
-        });
-        startHeartbeat();
-      });
-    },
-    recordHeartbeat,
-    markTerminal(paramsTerminal): void {
-      safeCall(() => {
-        if (!store || !run) {
-          return;
-        }
-        stopHeartbeat();
-        const now = Date.now();
-        const terminalPayload = isRecord(paramsTerminal.payload)
-          ? paramsTerminal.payload
-          : undefined;
-        if (paramsTerminal.status === "succeeded" && isYieldedAgentTurnPayload(terminalPayload)) {
-          const waitState = resolveYieldedAgentTurnWaitState({
-            store,
-            runtimeRunId: run.runtimeRunId,
-          });
-          const yieldPayload = compactYieldPayload(terminalPayload);
-          const checkpointRef = store.createRef({
-            runtimeRunId: run.runtimeRunId,
-            stepId,
-            refKind: "artifact",
-            mediaType: "application/vnd.openclaw.agent-turn-yield+json",
-            storageKind: "external",
-            storageUri: `agent-turn:${params.runId}:yield`,
-            metadata: yieldPayload,
-            now,
-          });
-          const waitMetadata = {
-            ...metadata,
-            lastYield: yieldPayload,
-          };
+      recordLifecycleMutation({
+        env,
+        operation: "mark_running",
+        failBeforeAcceptance: true,
+        action: () => {
+          if (!store || !run) {
+            return;
+          }
           store.updateRun({
             runtimeRunId: run.runtimeRunId,
-            status: waitState.status,
-            recoveryState: waitState.recoveryState,
-            checkpointRef: checkpointRef.refId,
-            completedAt: null,
-            metadata: waitMetadata,
-            now,
+            status: "running",
+            recoveryState: "running",
+            heartbeatAt: Date.now(),
+            metadata,
           });
           store.updateStep({
             runtimeRunId: run.runtimeRunId,
             stepId,
-            status: "waiting",
-            recoveryState: waitState.recoveryState,
-            checkpointRef: checkpointRef.refId,
-            completedAt: null,
-            metadata: waitMetadata,
-            now,
+            status: "running",
+            recoveryState: "running",
+            startedAt: Date.now(),
+            heartbeatAt: Date.now(),
+            metadata,
           });
           store.appendEvent({
             runtimeRunId: run.runtimeRunId,
-            eventType: "agent.turn.yielded",
-            eventTime: now,
-            stepId,
+            eventType: "agent.turn.running",
+            stepId: "agent_invocation",
             agentInvocationId: params.runId,
-            idempotencyKey: `${params.runId}:yield`,
+            idempotencyKey: params.runId,
             correlationId: params.sessionKey,
-            payload: {
-              ...yieldPayload,
+            payload,
+          });
+          startHeartbeat();
+        },
+      });
+    },
+    recordHeartbeat,
+    markTerminal(paramsTerminal): void {
+      recordLifecycleMutation({
+        env,
+        operation: "mark_terminal",
+        action: () => {
+          if (!store || !run) {
+            return;
+          }
+          stopHeartbeat();
+          const now = Date.now();
+          const terminalPayload = isRecord(paramsTerminal.payload)
+            ? paramsTerminal.payload
+            : undefined;
+          if (paramsTerminal.status === "succeeded" && isYieldedAgentTurnPayload(terminalPayload)) {
+            const waitState = resolveYieldedAgentTurnWaitState({
+              store,
+              runtimeRunId: run.runtimeRunId,
+            });
+            const yieldPayload = compactYieldPayload(terminalPayload);
+            const checkpointRef = store.createRef({
+              runtimeRunId: run.runtimeRunId,
+              stepId,
+              refKind: "artifact",
+              mediaType: "application/vnd.openclaw.agent-turn-yield+json",
+              storageKind: "external",
+              storageUri: `agent-turn:${params.runId}:yield`,
+              metadata: yieldPayload,
+              now,
+            });
+            const waitMetadata = {
+              ...metadata,
+              lastYield: yieldPayload,
+            };
+            store.updateRun({
+              runtimeRunId: run.runtimeRunId,
               status: waitState.status,
               recoveryState: waitState.recoveryState,
-            },
+              checkpointRef: checkpointRef.refId,
+              completedAt: null,
+              metadata: waitMetadata,
+              now,
+            });
+            store.updateStep({
+              runtimeRunId: run.runtimeRunId,
+              stepId,
+              status: "waiting",
+              recoveryState: waitState.recoveryState,
+              checkpointRef: checkpointRef.refId,
+              completedAt: null,
+              metadata: waitMetadata,
+              now,
+            });
+            store.appendEvent({
+              runtimeRunId: run.runtimeRunId,
+              eventType: "agent.turn.yielded",
+              eventTime: now,
+              stepId,
+              agentInvocationId: params.runId,
+              idempotencyKey: `${params.runId}:yield`,
+              correlationId: params.sessionKey,
+              payload: {
+                ...yieldPayload,
+                status: waitState.status,
+                recoveryState: waitState.recoveryState,
+              },
+            });
+            return;
+          }
+          const completedAt = now;
+          store.updateRun({
+            runtimeRunId: run.runtimeRunId,
+            status: paramsTerminal.status,
+            recoveryState: paramsTerminal.recoveryState ?? "terminal",
+            completedAt,
+            metadata,
+            now: completedAt,
           });
-          return;
-        }
-        const completedAt = now;
-        store.updateRun({
-          runtimeRunId: run.runtimeRunId,
-          status: paramsTerminal.status,
-          recoveryState: paramsTerminal.recoveryState ?? "terminal",
-          completedAt,
-          metadata,
-          now: completedAt,
-        });
-        const ref =
-          paramsTerminal.status === "succeeded"
-            ? store.createRef({
-                runtimeRunId: run.runtimeRunId,
-                stepId,
-                refKind: "output",
-                mediaType: "application/vnd.openclaw.agent-turn-result+json",
-                storageKind: "external",
-                storageUri: `agent-turn:${params.runId}:output`,
-                metadata: paramsTerminal.payload,
-                now: completedAt,
-              })
-            : store.createRef({
-                runtimeRunId: run.runtimeRunId,
-                stepId,
-                refKind: "error",
-                mediaType: "application/vnd.openclaw.agent-turn-error+json",
-                storageKind: "external",
-                storageUri: `agent-turn:${params.runId}:error`,
-                metadata: paramsTerminal.payload,
-                now: completedAt,
-              });
-        store.updateStep({
-          runtimeRunId: run.runtimeRunId,
-          stepId,
-          status:
+          const ref =
             paramsTerminal.status === "succeeded"
-              ? "succeeded"
-              : paramsTerminal.status === "cancelled"
-                ? "cancelled"
-                : paramsTerminal.status === "lost"
-                  ? "lost"
-                  : "failed",
-          recoveryState: paramsTerminal.recoveryState ?? "terminal",
-          ...(paramsTerminal.status === "succeeded"
-            ? { outputRef: ref.refId }
-            : { errorRef: ref.refId }),
-          completedAt,
-          metadata,
-          now: completedAt,
-        });
-        store.appendEvent({
-          runtimeRunId: run.runtimeRunId,
-          eventType: paramsTerminal.eventType,
-          eventTime: completedAt,
-          stepId: "terminal",
-          agentInvocationId: params.runId,
-          idempotencyKey: params.runId,
-          correlationId: params.sessionKey,
-          payload: paramsTerminal.payload,
-        });
+              ? store.createRef({
+                  runtimeRunId: run.runtimeRunId,
+                  stepId,
+                  refKind: "output",
+                  mediaType: "application/vnd.openclaw.agent-turn-result+json",
+                  storageKind: "external",
+                  storageUri: `agent-turn:${params.runId}:output`,
+                  metadata: paramsTerminal.payload,
+                  now: completedAt,
+                })
+              : store.createRef({
+                  runtimeRunId: run.runtimeRunId,
+                  stepId,
+                  refKind: "error",
+                  mediaType: "application/vnd.openclaw.agent-turn-error+json",
+                  storageKind: "external",
+                  storageUri: `agent-turn:${params.runId}:error`,
+                  metadata: paramsTerminal.payload,
+                  now: completedAt,
+                });
+          store.updateStep({
+            runtimeRunId: run.runtimeRunId,
+            stepId,
+            status:
+              paramsTerminal.status === "succeeded"
+                ? "succeeded"
+                : paramsTerminal.status === "cancelled"
+                  ? "cancelled"
+                  : paramsTerminal.status === "lost"
+                    ? "lost"
+                    : "failed",
+            recoveryState: paramsTerminal.recoveryState ?? "terminal",
+            ...(paramsTerminal.status === "succeeded"
+              ? { outputRef: ref.refId }
+              : { errorRef: ref.refId }),
+            completedAt,
+            metadata,
+            now: completedAt,
+          });
+          store.appendEvent({
+            runtimeRunId: run.runtimeRunId,
+            eventType: paramsTerminal.eventType,
+            eventTime: completedAt,
+            stepId: "terminal",
+            agentInvocationId: params.runId,
+            idempotencyKey: params.runId,
+            correlationId: params.sessionKey,
+            payload: paramsTerminal.payload,
+          });
+        },
       });
     },
     close(): void {

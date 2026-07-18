@@ -38,8 +38,7 @@ export type DurableRuntimeStepType =
   | "signal"
   | "child_runtime"
   | "checkpoint"
-  | "fan_in"
-  | "result_mailbox";
+  | "fan_in";
 
 export type DurableRuntimeStepStatus =
   | "pending"
@@ -73,10 +72,17 @@ export type DurableRuntimeLinkStatus =
 export type DurableRuntimeTimerStatus = "pending" | "fired" | "cancelled";
 export type DurableRuntimeSignalStatus = "pending" | "consumed";
 
-export type WakeObligationStatus = "pending" | "delivered" | "acked" | "failed" | "superseded";
+export type WakeObligationStatus =
+  | "pending"
+  | "delivered"
+  | "acked"
+  | "failed"
+  | "suspended"
+  | "superseded";
 
 export type WakeObligationReason =
   | "child_terminal"
+  | "child_overdue"
   | "fan_in_incomplete"
   | "restart_interrupted"
   | "delivery_unknown"
@@ -119,22 +125,9 @@ export type UncertaintyFactKind =
   | "interrupted_during_tool"
   | "lost_after_dispatch"
   | "delivery_unknown"
-  | "requires_parent_decision";
+  | "requires_owner_decision";
 
 export type UncertaintyFactStatus = "open" | "resolved" | "superseded";
-
-export type DurableContinuationCleanupTargetKind =
-  | "timer"
-  | "signal"
-  | "result_mailbox"
-  | "wake"
-  | "continuation_cursor";
-
-export type DurableContinuationCleanupStatus = "superseded" | "noop";
-
-export type DurableDedupeScope = "wake" | "wake_delivery" | "result_mailbox" | "recovery_pass";
-
-export type DurableDedupeLedgerStatus = "recorded" | "applied" | "conflict" | "superseded";
 
 export type DeliveryAttemptEvidenceStatus =
   | "pending"
@@ -144,11 +137,18 @@ export type DeliveryAttemptEvidenceStatus =
   | "unknown"
   | "superseded";
 
-export type WakeObligationControlActorKind = "external" | "parent" | "operator";
+export type WakeObligationControlActorKind =
+  | "owner"
+  | "requester"
+  | "controller"
+  | "operator"
+  | "system_worker"
+  | "admin";
 
 export type WakeObligationControlDecisionKind =
   | "acknowledged"
   | "superseded"
+  | "resumed"
   | "inspected"
   | "requires_human_decision"
   | "requires_operator_decision";
@@ -160,6 +160,7 @@ export type WakeObligationControlDecision = {
   reason?: string;
   decisionRef?: string;
   idempotencyKey?: string;
+  expectedSourceRevision?: string;
   evidence?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
   decidedAt: number;
@@ -180,8 +181,6 @@ export type DurableRuntimeRun = {
   recoveryState: DurableRecoveryState;
   idempotencyKey?: string;
   requestHash?: string;
-  /** @deprecated Prefer sourceOwner in public durable-core APIs; storage remains source_type. */
-  sourceType?: string;
   sourceOwner?: string;
   sourceRef?: string;
   rootOperationReason?: string;
@@ -193,8 +192,6 @@ export type DurableRuntimeRun = {
   turnId?: string;
   workUnitId?: string;
   reportRouteId?: string;
-  claimedBy?: string;
-  claimExpiresAt?: number;
   heartbeatAt?: number;
   metadata?: Record<string, unknown>;
   createdAt: number;
@@ -304,6 +301,8 @@ export type DurableRuntimeEvent = {
 
 export type WakeObligation = {
   wakeId: string;
+  sourceOwner: string;
+  sourceRef: string;
   parentRunId?: string;
   parentSessionKey?: string;
   targetAgent?: string;
@@ -334,6 +333,8 @@ export type AttentionObligation = WakeObligation;
 
 export type UncertaintyFact = {
   factId: string;
+  sourceOwner: string;
+  sourceRef: string;
   kind: UncertaintyFactKind;
   sourceRunId?: string;
   stepId?: string;
@@ -351,36 +352,10 @@ export type UncertaintyFact = {
   updatedAt: number;
 };
 
-export type DurableContinuationCleanupAudit = {
-  cleanupId: string;
-  targetKind: DurableContinuationCleanupTargetKind;
-  targetId: string;
-  runtimeRunId?: string;
-  stepId?: string;
-  supersededByRef?: string;
-  reason?: string;
-  requestedBy?: string;
-  dedupeKey: string;
-  status: DurableContinuationCleanupStatus;
-  metadata?: Record<string, unknown>;
-  createdAt: number;
-};
-
-export type DurableDedupeLedgerEntry = {
-  ledgerId: string;
-  scope: DurableDedupeScope;
-  dedupeKey: string;
-  subjectRef?: string;
-  operationKind?: string;
-  status: DurableDedupeLedgerStatus;
-  firstSeenAt: number;
-  lastSeenAt: number;
-  hitCount: number;
-  metadata?: Record<string, unknown>;
-};
-
 export type DeliveryAttemptEvidence = {
   deliveryAttemptId: string;
+  sourceOwner: string;
+  sourceRef: string;
   wakeId: string;
   dedupeKey: string;
   replayPassId?: string;
@@ -423,6 +398,8 @@ export type WakeObligationInspection = {
   deliveryAttemptEvidence: DeliveryAttemptEvidence[];
   unresolvedUncertaintyFacts: UncertaintyFact[];
   sourceRefs: {
+    sourceOwner: string;
+    sourceRef: string;
     factsRef?: string;
     sourceRunId?: string;
     dedupeKey: string;
@@ -435,12 +412,14 @@ export type DurableUnresolvedObligationKind =
   | "pending_wake"
   | "unresolved_uncertainty"
   | "open_child"
-  | "expired_run_claim"
-  | "expired_step_claim"
-  | "pending_result_mailbox";
+  | "pending_subagent_delivery"
+  | "pending_delivery_queue"
+  | "expired_state_lease";
 
 export type DurableUnresolvedObligation = {
   obligationId: string;
+  sourceOwner: string;
+  sourceRef: string;
   kind: DurableUnresolvedObligationKind;
   runtimeRunId?: string;
   stepId?: string;
@@ -462,8 +441,6 @@ export type CreateDurableRuntimeRunInput = {
   recoveryState?: DurableRecoveryState;
   idempotencyKey?: string;
   requestHash?: string;
-  /** @deprecated Prefer sourceOwner in public durable-core APIs; storage remains source_type. */
-  sourceType?: string;
   sourceOwner?: string;
   sourceRef?: string;
   /** Required by source-ref contract only for root durable operations with no source owner/ref. */
@@ -505,8 +482,6 @@ export type UpdateDurableRuntimeRunInput = {
   checkpointRef?: string | null;
   workUnitId?: string | null;
   reportRouteId?: string | null;
-  claimedBy?: string | null;
-  claimExpiresAt?: number | null;
   heartbeatAt?: number | null;
   metadata?: Record<string, unknown>;
   now?: number;
@@ -617,6 +592,8 @@ export type CreateDurableRuntimeSignalInput = {
 
 export type CreateWakeObligationInput = {
   wakeId?: string;
+  sourceOwner: string;
+  sourceRef: string;
   parentRunId?: string;
   parentSessionKey?: string;
   targetAgent?: string;
@@ -645,6 +622,21 @@ export type UpdateWakeObligationInput = {
   ackedAt?: number | null;
   failedReason?: string | null;
   metadata?: Record<string, unknown>;
+  factsRef?: string;
+  now?: number;
+};
+
+export type UpdateWakeObligationProjectionInput = {
+  wakeId: string;
+  metadata: Record<string, unknown>;
+  factsRef?: string;
+  now?: number;
+};
+
+export type SuspendWakeObligationInput = {
+  wakeId: string;
+  failedReason: string;
+  metadata?: Record<string, unknown>;
   now?: number;
 };
 
@@ -657,6 +649,7 @@ export type WakeObligationControlInput = {
   evidence?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
   idempotencyKey?: string;
+  expectedSourceRevision?: string;
   now?: number;
 };
 
@@ -671,13 +664,12 @@ export type MarkWakeObligationDecisionRequiredInput = WakeObligationControlInput
   >;
 };
 
-export type SupersedeDeliveryAttemptEvidenceInput = WakeObligationControlInput & {
-  deliveryAttemptId: string;
-  supersededByRef?: string;
-};
+export type ResumeWakeObligationInput = WakeObligationControlInput;
 
 export type CreateUncertaintyFactInput = {
   factId?: string;
+  sourceOwner: string;
+  sourceRef: string;
   kind: UncertaintyFactKind;
   sourceRunId?: string;
   stepId?: string;
@@ -695,97 +687,45 @@ export type ResolveUncertaintyFactInput = {
   status: Extract<UncertaintyFactStatus, "resolved" | "superseded">;
   resolutionKind?: string;
   resolutionRef?: string;
+  expectedUpdatedAt?: number;
   metadata?: Record<string, unknown>;
   now?: number;
 };
 
-export type RecordDurableContinuationCleanupInput = {
-  cleanupId?: string;
-  targetKind: DurableContinuationCleanupTargetKind;
-  targetId: string;
-  runtimeRunId?: string;
-  stepId?: string;
-  supersededByRef?: string;
-  reason?: string;
-  requestedBy?: string;
-  dedupeKey: string;
-  status?: DurableContinuationCleanupStatus;
-  metadata?: Record<string, unknown>;
-  now?: number;
+export type WakeObligationClaim = {
+  wake: WakeObligation;
+  deliveryAttempt: DeliveryAttemptEvidence;
+  claimToken: string;
+  claimExpiresAt: number;
 };
 
-export type RecordDurableDedupeLedgerInput = {
-  ledgerId?: string;
-  scope: DurableDedupeScope;
-  dedupeKey: string;
-  subjectRef?: string;
-  operationKind?: string;
-  status?: DurableDedupeLedgerStatus;
-  metadata?: Record<string, unknown>;
-  now?: number;
-};
-
-export type RecordDeliveryAttemptEvidenceInput = {
-  deliveryAttemptId?: string;
-  wakeId: string;
-  dedupeKey: string;
-  replayPassId?: string;
-  targetKind?: WakeObligationTargetKind;
-  targetRef?: string;
-  routeKind?: WakeObligationTargetKind;
-  routeRef?: string;
-  status?: DeliveryAttemptEvidenceStatus;
-  evidence?: Record<string, unknown>;
-  error?: string;
-  attemptedAt?: number | null;
-  deliveredAt?: number | null;
-  failedAt?: number | null;
-  unknownAt?: number | null;
-  metadata?: Record<string, unknown>;
-  now?: number;
-};
-
-export type UpdateDeliveryAttemptEvidenceInput = {
-  deliveryAttemptId: string;
-  status: DeliveryAttemptEvidenceStatus;
-  expectedClaimedBy?: string;
-  evidence?: Record<string, unknown>;
-  error?: string | null;
-  attemptedAt?: number | null;
-  deliveredAt?: number | null;
-  failedAt?: number | null;
-  unknownAt?: number | null;
-  metadata?: Record<string, unknown>;
-  now?: number;
-};
-
-export type FinalizeDeliveryAttemptEvidenceInput = UpdateDeliveryAttemptEvidenceInput & {
-  wakeStatus: Extract<WakeObligationStatus, "delivered" | "failed">;
-  wakeAttemptCount?: number;
-  wakeLastAttemptAt?: number | null;
-  wakeFailedReason?: string | null;
-};
-
-export type ClaimDeliveryAttemptEvidenceInput = {
-  deliveryAttemptId: string;
-  replayPassId: string;
-  claimTtlMs: number;
-  evidence?: Record<string, unknown>;
-  metadata?: Record<string, unknown>;
-  now?: number;
-};
-
-export type RenewDeliveryAttemptEvidenceClaimInput = {
-  deliveryAttemptId: string;
-  replayPassId: string;
-  claimTtlMs: number;
-  now?: number;
-};
-
-export type ClaimDurableRuntimeRunInput = {
-  operationKind?: string;
+export type ClaimNextWakeObligationInput = {
   workerId: string;
   claimTtlMs: number;
+  retryBaseMs: number;
+  retryMaxMs: number;
+  now?: number;
+};
+
+export type RenewWakeObligationClaimInput = {
+  wakeId: string;
+  deliveryAttemptId: string;
+  claimToken: string;
+  claimTtlMs: number;
+  now?: number;
+};
+
+export type CompleteWakeObligationClaimInput = {
+  wakeId: string;
+  deliveryAttemptId: string;
+  claimToken: string;
+  attemptStatus: Extract<
+    DeliveryAttemptEvidenceStatus,
+    "delivered" | "failed" | "unknown" | "superseded"
+  >;
+  wakeStatus: Extract<WakeObligationStatus, "delivered" | "failed" | "suspended" | "superseded">;
+  evidence?: Record<string, unknown>;
+  error?: string;
   now?: number;
 };
 
@@ -832,15 +772,16 @@ export type DurableRuntimeStore = {
   appendEvent(input: AppendDurableRuntimeEventInput): DurableRuntimeEvent;
   listRuns(options?: { limit?: number }): DurableRuntimeRun[];
   listOpenRuns(options?: { operationKind?: string; limit?: number }): DurableRuntimeRun[];
-  claimNextRunnableRun(input: ClaimDurableRuntimeRunInput): DurableRuntimeRun | undefined;
-  releaseRunClaim(input: {
-    runtimeRunId: string;
-    workerId: string;
-    now?: number;
-  }): DurableRuntimeRun | undefined;
   createStep(input: CreateDurableRuntimeStepInput): DurableRuntimeStep;
   updateStep(input: UpdateDurableRuntimeStepInput): DurableRuntimeStep | undefined;
   claimNextRunnableStep(input: ClaimDurableRuntimeStepInput): DurableRuntimeStep | undefined;
+  renewStepClaim(input: {
+    runtimeRunId: string;
+    stepId: string;
+    workerId: string;
+    claimTtlMs: number;
+    now?: number;
+  }): DurableRuntimeStep | undefined;
   releaseStepClaim(input: {
     runtimeRunId: string;
     stepId: string;
@@ -864,15 +805,21 @@ export type DurableRuntimeStore = {
   listPendingSignals(options?: { limit?: number }): DurableRuntimeSignal[];
   listSignals(runtimeRunId: string): DurableRuntimeSignal[];
   createWakeObligation(input: CreateWakeObligationInput): WakeObligation;
-  updateWakeObligation(input: UpdateWakeObligationInput): WakeObligation | undefined;
+  updateWakeObligationProjection(
+    input: UpdateWakeObligationProjectionInput,
+  ): WakeObligation | undefined;
+  suspendWakeObligation(input: SuspendWakeObligationInput): WakeObligation | undefined;
   acknowledgeWakeObligation(input: WakeObligationControlInput): WakeObligation | undefined;
   supersedeWakeObligation(input: SupersedeWakeObligationInput): WakeObligation | undefined;
+  resumeWakeObligation(input: ResumeWakeObligationInput): WakeObligation | undefined;
   markWakeObligationDecisionRequired(
     input: MarkWakeObligationDecisionRequiredInput,
   ): WakeObligation | undefined;
   getWakeObligation(wakeId: string): WakeObligation | undefined;
   getWakeObligationInspection(wakeId: string): WakeObligationInspection | undefined;
   listWakeObligations(options?: {
+    sourceOwner?: string;
+    sourceRef?: string;
     parentRunId?: string;
     parentSessionKey?: string;
     targetKind?: WakeObligationTargetKind;
@@ -884,48 +831,19 @@ export type DurableRuntimeStore = {
     status?: WakeObligationStatus;
     limit?: number;
   }): WakeObligation[];
-  recordUncertaintyFact(
-    input: CreateUncertaintyFactInput,
-  ): UncertaintyFact;
-  resolveUncertaintyFact(
-    input: ResolveUncertaintyFactInput,
-  ): UncertaintyFact | undefined;
+  recordUncertaintyFact(input: CreateUncertaintyFactInput): UncertaintyFact;
+  resolveUncertaintyFact(input: ResolveUncertaintyFactInput): UncertaintyFact | undefined;
   listUncertaintyFacts(options?: {
+    sourceOwner?: string;
+    sourceRef?: string;
     sourceRunId?: string;
     status?: UncertaintyFactStatus;
     limit?: number;
   }): UncertaintyFact[];
-  recordContinuationCleanup(
-    input: RecordDurableContinuationCleanupInput,
-  ): DurableContinuationCleanupAudit;
-  listContinuationCleanupAudit(options?: {
-    runtimeRunId?: string;
-    targetKind?: DurableContinuationCleanupTargetKind;
-    limit?: number;
-  }): DurableContinuationCleanupAudit[];
-  recordDedupeLedgerEntry(input: RecordDurableDedupeLedgerInput): DurableDedupeLedgerEntry;
-  listDedupeLedgerEntries(options?: {
-    scope?: DurableDedupeScope;
-    status?: DurableDedupeLedgerStatus;
-    limit?: number;
-  }): DurableDedupeLedgerEntry[];
-  recordDeliveryAttemptEvidence(
-    input: RecordDeliveryAttemptEvidenceInput,
-  ): DeliveryAttemptEvidence;
-  claimDeliveryAttemptEvidence(
-    input: ClaimDeliveryAttemptEvidenceInput,
-  ): DeliveryAttemptEvidence | undefined;
-  renewDeliveryAttemptEvidenceClaim(
-    input: RenewDeliveryAttemptEvidenceClaimInput,
-  ): DeliveryAttemptEvidence | undefined;
-  updateDeliveryAttemptEvidence(
-    input: UpdateDeliveryAttemptEvidenceInput,
-  ): DeliveryAttemptEvidence | undefined;
-  finalizeDeliveryAttemptEvidence(
-    input: FinalizeDeliveryAttemptEvidenceInput,
-  ): DeliveryAttemptEvidence | undefined;
-  supersedeDeliveryAttemptEvidence(
-    input: SupersedeDeliveryAttemptEvidenceInput,
+  claimNextWakeObligation(input: ClaimNextWakeObligationInput): WakeObligationClaim | undefined;
+  renewWakeObligationClaim(input: RenewWakeObligationClaimInput): boolean;
+  completeWakeObligationClaim(
+    input: CompleteWakeObligationClaimInput,
   ): DeliveryAttemptEvidence | undefined;
   getDeliveryAttemptEvidence(deliveryAttemptId: string): DeliveryAttemptEvidence | undefined;
   listDeliveryAttemptEvidence(options?: {

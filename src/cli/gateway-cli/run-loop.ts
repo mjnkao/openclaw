@@ -3,7 +3,10 @@ import { randomUUID } from "node:crypto";
 import net from "node:net";
 import { clearRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import { startDurableRecoveryWorker } from "../../durable/recovery.js";
-import { maybeRecordDurableGatewayStartup } from "../../durable/startup.js";
+import {
+  assertDurableRuntimeAuthorityAvailable,
+  maybeRecordDurableGatewayStartup,
+} from "../../durable/startup.js";
 import {
   captureGatewayRestartTraceHandoff,
   createGatewayRestartTraceHandoffEnv,
@@ -929,6 +932,7 @@ export async function runGatewayLoop(params: {
       let startupFailedBeforeServerHandle = false;
       try {
         await params.beginBoot?.(startupStartedAt);
+        assertDurableRuntimeAuthorityAvailable();
         server = await params.start({ startupStartedAt });
         await maybeRecordDurableGatewayStartup({
           processInstanceId,

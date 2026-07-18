@@ -64,6 +64,7 @@ import {
 import {
   applyAgentAutoCompactionGuard,
   applyAgentCompactionSettingsFromConfig,
+  applyManualCompactionCheckpointSettings,
   isSilentOverflowProneModel,
 } from "../agent-settings.js";
 import { createOpenClawCodingTools, resolveProcessToolScopeKey } from "../agent-tools.js";
@@ -1311,6 +1312,11 @@ async function compactEmbeddedAgentSessionDirectOnce(
         settingsManager,
         cfg: params.config,
         contextTokenBudget,
+      });
+      applyManualCompactionCheckpointSettings({
+        settingsManager,
+        cfg: params.config,
+        trigger,
       });
       // contextEngineInfo is intentionally omitted: this guard runs inside the
       // compaction LLM session, which is not the user-facing agent session and

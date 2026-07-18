@@ -11,13 +11,16 @@ import {
 } from "./sqlite-store.js";
 
 const DURABLE_TABLES = [
-  "durable_runtime_events",
-  "durable_runtime_links",
-  "durable_runtime_refs",
-  "durable_runtime_runs",
-  "durable_runtime_signals",
-  "durable_runtime_steps",
-  "durable_runtime_timers",
+  "delivery_attempt_evidence",
+  "durable_event_evidence",
+  "durable_execution_records",
+  "durable_execution_steps",
+  "durable_payload_refs",
+  "durable_run_correlations",
+  "durable_signal_evidence",
+  "durable_timer_obligations",
+  "uncertainty_facts",
+  "wake_obligations",
 ] as const;
 
 describe("durable runtime sqlite store", () => {
@@ -42,25 +45,14 @@ describe("durable runtime sqlite store", () => {
     const { DatabaseSync } = requireNodeSqlite();
     const db = new DatabaseSync(dbPath);
     try {
-      db.exec(`
-        CREATE TABLE durable_schema_migrations (
-          schema_name TEXT NOT NULL PRIMARY KEY,
-          version INTEGER NOT NULL,
-          applied_at INTEGER NOT NULL,
-          metadata_json TEXT
-        );
-      `);
-      db.prepare(
-        `INSERT INTO durable_schema_migrations (schema_name, version, applied_at, metadata_json)
-         VALUES (?, ?, ?, ?)`,
-      ).run("durable_runtime", DURABLE_RUNTIME_SQLITE_SCHEMA_VERSION + 1, 100, null);
+      db.exec(`PRAGMA user_version = ${Number(DURABLE_RUNTIME_SQLITE_SCHEMA_VERSION) + 1};`);
     } finally {
       db.close();
     }
 
     try {
       expect(() => openDurableRuntimeSqliteStore({ path: dbPath })).toThrow(
-        /newer than supported version/,
+        /uses newer schema version .* supports/,
       );
       const verifyDb = new DatabaseSync(dbPath);
       try {
@@ -68,7 +60,7 @@ describe("durable runtime sqlite store", () => {
           .prepare(
             `SELECT name FROM sqlite_master
                WHERE type = 'table'
-                 AND name LIKE 'durable_runtime_%'
+                 AND name IN (${DURABLE_TABLES.map(() => "?").join(", ")})
                ORDER BY name`,
           )
           .all();
@@ -89,20 +81,28 @@ describe("durable runtime sqlite store", () => {
     try {
       db.exec(`
         CREATE TABLE schema_meta (
-          key TEXT NOT NULL PRIMARY KEY,
-          value TEXT NOT NULL
+          meta_key TEXT NOT NULL PRIMARY KEY,
+          role TEXT NOT NULL,
+          schema_version INTEGER NOT NULL,
+          agent_id TEXT,
+          app_version TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
         );
         CREATE TABLE cron_jobs (
-          job_id TEXT NOT NULL PRIMARY KEY,
+          store_key TEXT NOT NULL PRIMARY KEY,
+          job_id TEXT NOT NULL,
           definition_json TEXT NOT NULL,
           enabled INTEGER NOT NULL
         );
       `);
-      db.prepare("INSERT INTO schema_meta (key, value) VALUES (?, ?)").run(
-        "openclaw_state_schema_version",
-        "2026.6.8",
-      );
-      db.prepare("INSERT INTO cron_jobs (job_id, definition_json, enabled) VALUES (?, ?, ?)").run(
+      db.prepare(
+        "INSERT INTO schema_meta (meta_key, role, schema_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+      ).run("primary", "global", 1, 100, 100);
+      db.prepare(
+        "INSERT INTO cron_jobs (store_key, job_id, definition_json, enabled) VALUES (?, ?, ?, ?)",
+      ).run(
+        "legacy-job",
         "legacy-job",
         JSON.stringify({ schedule: "*/5 * * * *", task: "legacy" }),
         1,
@@ -121,14 +121,14 @@ describe("durable runtime sqlite store", () => {
         idempotencyKey: "upgrade-smoke",
         status: "succeeded",
         recoveryState: "terminal",
-        sourceType: "chat.send",
+        sourceOwner: "session_store",
         sourceRef: "agent:upgrade:test",
         now: 100,
       });
       store.appendEvent({
         runtimeRunId: run.runtimeRunId,
         eventType: "upgrade.smoke",
-        now: 100,
+        eventTime: 100,
       });
     } finally {
       store.close();
@@ -138,30 +138,23 @@ describe("durable runtime sqlite store", () => {
     try {
       expect(
         verifyDb
-          .prepare("SELECT value FROM schema_meta WHERE key = ?")
-          .get("openclaw_state_schema_version"),
-      ).toEqual({ value: "2026.6.8" });
+          .prepare("SELECT meta_key, role, schema_version FROM schema_meta WHERE meta_key = ?")
+          .get("primary"),
+      ).toEqual({ meta_key: "primary", role: "global", schema_version: 1 });
       expect(verifyDb.prepare("SELECT job_id, enabled FROM cron_jobs").all()).toEqual([
         { job_id: "legacy-job", enabled: 1 },
       ]);
-      const migration = verifyDb
-        .prepare(
-          "SELECT version, metadata_json FROM durable_schema_migrations WHERE schema_name = ?",
-        )
-        .get("durable_runtime") as { version: number; metadata_json: string };
-      expect(migration.version).toBe(DURABLE_RUNTIME_SQLITE_SCHEMA_VERSION);
-      expect(JSON.parse(migration.metadata_json)).toMatchObject({
-        kind: "fresh-install",
-        previousVersion: 0,
+      expect(verifyDb.prepare("PRAGMA user_version").get()).toEqual({
+        user_version: DURABLE_RUNTIME_SQLITE_SCHEMA_VERSION,
       });
       const runtimeTables = verifyDb
         .prepare(
           `SELECT name FROM sqlite_master
              WHERE type = 'table'
-               AND name LIKE 'durable_runtime_%'
+               AND name IN (${DURABLE_TABLES.map(() => "?").join(", ")})
              ORDER BY name`,
         )
-        .all() as Array<{ name: string }>;
+        .all(...DURABLE_TABLES) as Array<{ name: string }>;
       expect(runtimeTables.map((row) => row.name)).toEqual([...DURABLE_TABLES]);
     } finally {
       verifyDb.close();
@@ -176,22 +169,14 @@ describe("durable runtime sqlite store", () => {
     const db = new DatabaseSync(dbPath);
     try {
       db.exec(`
-        CREATE TABLE durable_schema_migrations (
-          schema_name TEXT NOT NULL PRIMARY KEY,
-          version INTEGER NOT NULL,
-          applied_at INTEGER NOT NULL,
-          metadata_json TEXT
-        );
-        INSERT INTO durable_schema_migrations (schema_name, version, applied_at, metadata_json)
-          VALUES ('durable_runtime', ${DURABLE_RUNTIME_SQLITE_SCHEMA_VERSION}, 100, '{"kind":"early-durable"}');
-        CREATE TABLE durable_runtime_runs (
+        CREATE TABLE durable_execution_records (
           runtime_run_id TEXT NOT NULL PRIMARY KEY,
           operation_kind TEXT NOT NULL,
           operation_version TEXT NOT NULL DEFAULT '1',
           idempotency_key TEXT,
           request_hash TEXT,
           status TEXT NOT NULL,
-          source_type TEXT,
+          source_owner TEXT,
           source_ref TEXT,
           input_ref TEXT,
           created_at INTEGER NOT NULL,
@@ -201,9 +186,9 @@ describe("durable runtime sqlite store", () => {
           checkpoint_ref TEXT,
           metadata_json TEXT
         );
-        INSERT INTO durable_runtime_runs (
+        INSERT INTO durable_execution_records (
           runtime_run_id, operation_kind, operation_version, idempotency_key, request_hash,
-          status, source_type, source_ref, input_ref, created_at, updated_at, completed_at,
+          status, source_owner, source_ref, input_ref, created_at, updated_at, completed_at,
           recovery_state, checkpoint_ref, metadata_json
         ) VALUES (
           'run_legacy_partial', 'openclaw.agent.turn', '1', 'legacy-partial', NULL,
@@ -222,6 +207,7 @@ describe("durable runtime sqlite store", () => {
         operationKind: "openclaw.agent.turn",
         status: "running",
         recoveryState: "running",
+        sourceOwner: "agent",
         sourceRef: "agent:legacy:main",
         metadata: { legacy: true },
       });
@@ -244,29 +230,25 @@ describe("durable runtime sqlite store", () => {
 
     const verifyDb = new DatabaseSync(dbPath);
     try {
-      const columns = verifyDb.prepare("PRAGMA table_info(durable_runtime_runs)").all() as Array<{
+      const columns = verifyDb
+        .prepare("PRAGMA table_info(durable_execution_records)")
+        .all() as Array<{
         name: string;
       }>;
       expect(columns.map((column) => column.name)).toEqual(
-        expect.arrayContaining([
-          "work_unit_id",
-          "report_route_id",
-          "claimed_by",
-          "claim_expires_at",
-          "heartbeat_at",
-        ]),
+        expect.arrayContaining(["work_unit_id", "report_route_id", "heartbeat_at"]),
       );
       const indexes = verifyDb
         .prepare(
           `SELECT name FROM sqlite_master
              WHERE type = 'index'
-               AND name IN ('idx_durable_runtime_runs_work_unit', 'idx_durable_runtime_runs_report_route')
+               AND name IN ('idx_durable_execution_records_work_unit', 'idx_durable_execution_records_report_route')
              ORDER BY name`,
         )
         .all();
       expect(indexes).toEqual([
-        { name: "idx_durable_runtime_runs_report_route" },
-        { name: "idx_durable_runtime_runs_work_unit" },
+        { name: "idx_durable_execution_records_report_route" },
+        { name: "idx_durable_execution_records_work_unit" },
       ]);
     } finally {
       verifyDb.close();
@@ -299,8 +281,17 @@ describe("durable runtime sqlite store", () => {
       path: path.join(dir, "openclaw.sqlite"),
     });
     try {
+      expect(() =>
+        store.createRun({
+          operationKind: "test.invalid-source",
+          sourceOwner: "session_store",
+          sourceRef: "agent:test:main",
+          rootOperationReason: "not-a-root-operation",
+        }),
+      ).toThrow(/not both/);
       const first = store.createRun({
         operationKind: "test.runtime",
+        rootOperationReason: "test-root",
         idempotencyKey: "request-1",
         requestHash: "hash-1",
         workUnitId: "wu:test:card-1",
@@ -310,6 +301,7 @@ describe("durable runtime sqlite store", () => {
       });
       const duplicate = store.createRun({
         operationKind: "test.runtime",
+        rootOperationReason: "test-root",
         idempotencyKey: "request-1",
         requestHash: "hash-1",
         now: 200,
@@ -365,7 +357,7 @@ describe("durable runtime sqlite store", () => {
     }
   });
 
-  it("stores core runtime primitives for steps, refs, links, timers, signals, and claims", () => {
+  it("stores core runtime primitives for steps, refs, links, timers, and signals", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-store-"));
     const store = openDurableRuntimeSqliteStore({
       path: path.join(dir, "openclaw.sqlite"),
@@ -373,6 +365,7 @@ describe("durable runtime sqlite store", () => {
     try {
       const parent = store.createRun({
         operationKind: "test.runtime",
+        rootOperationReason: "test-root",
         status: "queued",
         recoveryState: "runnable",
         idempotencyKey: "parent",
@@ -380,34 +373,13 @@ describe("durable runtime sqlite store", () => {
       });
       const child = store.createRun({
         operationKind: "test.runtime",
+        rootOperationReason: "test-root",
         status: "queued",
         recoveryState: "runnable",
         idempotencyKey: "child",
         parentRuntimeRunId: parent.runtimeRunId,
         now: 110,
       });
-      const claimed = store.claimNextRunnableRun({
-        operationKind: "test.runtime",
-        workerId: "worker-1",
-        claimTtlMs: 1_000,
-        now: 120,
-      });
-      expect(claimed).toMatchObject({
-        runtimeRunId: parent.runtimeRunId,
-        claimedBy: "worker-1",
-        recoveryState: "claimed",
-        claimExpiresAt: 1_120,
-      });
-      const released = store.releaseRunClaim({
-        runtimeRunId: parent.runtimeRunId,
-        workerId: "worker-1",
-        now: 130,
-      });
-      expect(released).toMatchObject({
-        runtimeRunId: parent.runtimeRunId,
-        recoveryState: "runnable",
-      });
-
       const inputRef = store.createRef({
         runtimeRunId: parent.runtimeRunId,
         refKind: "input",
@@ -478,14 +450,14 @@ describe("durable runtime sqlite store", () => {
         stepId: executableStep.stepId,
         status: "queued",
         recoveryState: "claimed",
-        claimedBy: "worker-1",
+        claimedBy: expect.stringMatching(/^claim_/),
         claimExpiresAt: 1_176,
       });
       expect(
         store.releaseStepClaim({
           runtimeRunId: parent.runtimeRunId,
           stepId: executableStep.stepId,
-          workerId: "worker-1",
+          workerId: claimedStep!.claimedBy!,
           now: 177,
         }),
       ).toMatchObject({
@@ -565,6 +537,7 @@ describe("durable runtime sqlite store", () => {
     try {
       const run = store.createRun({
         operationKind: "test.runtime",
+        rootOperationReason: "test-root",
         status: "retry_scheduled",
         recoveryState: "retry_scheduled",
         now: 100,
@@ -577,14 +550,6 @@ describe("durable runtime sqlite store", () => {
         now: 110,
       });
 
-      expect(
-        store.claimNextRunnableRun({
-          operationKind: "test.runtime",
-          workerId: "worker-1",
-          claimTtlMs: 1_000,
-          now: 120,
-        }),
-      ).toBeUndefined();
       expect(
         store.claimNextRunnableStep({
           operationKind: "test.runtime",
@@ -599,7 +564,7 @@ describe("durable runtime sqlite store", () => {
     }
   });
 
-  it("reclaims expired run and step leases without accepting stale owner writes", () => {
+  it("reclaims expired step leases without accepting stale owner writes", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-store-"));
     const store = openDurableRuntimeSqliteStore({
       path: path.join(dir, "openclaw.sqlite"),
@@ -607,6 +572,7 @@ describe("durable runtime sqlite store", () => {
     try {
       const run = store.createRun({
         operationKind: "test.runtime",
+        rootOperationReason: "test-root",
         status: "queued",
         recoveryState: "runnable",
         now: 100,
@@ -619,60 +585,15 @@ describe("durable runtime sqlite store", () => {
         now: 110,
       });
 
-      expect(
-        store.claimNextRunnableRun({
-          operationKind: "test.runtime",
-          workerId: "worker-1",
-          claimTtlMs: 10,
-          now: 120,
-        }),
-      ).toMatchObject({
-        runtimeRunId: run.runtimeRunId,
-        claimedBy: "worker-1",
-        claimExpiresAt: 130,
+      const firstClaim = store.claimNextRunnableStep({
+        operationKind: "test.runtime",
+        workerId: "worker-1",
+        claimTtlMs: 10,
+        now: 140,
       });
-      expect(
-        store.claimNextRunnableRun({
-          operationKind: "test.runtime",
-          workerId: "worker-2",
-          claimTtlMs: 10,
-          now: 125,
-        }),
-      ).toBeUndefined();
-      expect(
-        store.claimNextRunnableRun({
-          operationKind: "test.runtime",
-          workerId: "worker-2",
-          claimTtlMs: 10,
-          now: 131,
-        }),
-      ).toMatchObject({
-        runtimeRunId: run.runtimeRunId,
-        claimedBy: "worker-2",
-        claimExpiresAt: 141,
-      });
-      expect(
-        store.releaseRunClaim({
-          runtimeRunId: run.runtimeRunId,
-          workerId: "worker-1",
-          now: 132,
-        }),
-      ).toBeUndefined();
-      expect(store.getRun(run.runtimeRunId)).toMatchObject({
-        claimedBy: "worker-2",
-        recoveryState: "claimed",
-      });
-
-      expect(
-        store.claimNextRunnableStep({
-          operationKind: "test.runtime",
-          workerId: "worker-1",
-          claimTtlMs: 10,
-          now: 140,
-        }),
-      ).toMatchObject({
+      expect(firstClaim).toMatchObject({
         stepId: step.stepId,
-        claimedBy: "worker-1",
+        claimedBy: expect.stringMatching(/^claim_/),
         claimExpiresAt: 150,
       });
       expect(
@@ -683,23 +604,23 @@ describe("durable runtime sqlite store", () => {
           now: 145,
         }),
       ).toBeUndefined();
-      expect(
-        store.claimNextRunnableStep({
-          operationKind: "test.runtime",
-          workerId: "worker-2",
-          claimTtlMs: 10,
-          now: 151,
-        }),
-      ).toMatchObject({
+      const secondClaim = store.claimNextRunnableStep({
+        operationKind: "test.runtime",
+        workerId: "worker-2",
+        claimTtlMs: 10,
+        now: 151,
+      });
+      expect(secondClaim).toMatchObject({
         stepId: step.stepId,
-        claimedBy: "worker-2",
+        claimedBy: expect.stringMatching(/^claim_/),
         claimExpiresAt: 161,
       });
+      expect(secondClaim?.claimedBy).not.toBe(firstClaim?.claimedBy);
       expect(
         store.releaseStepClaim({
           runtimeRunId: run.runtimeRunId,
           stepId: step.stepId,
-          workerId: "worker-1",
+          workerId: firstClaim!.claimedBy!,
           now: 152,
         }),
       ).toBeUndefined();
@@ -707,7 +628,7 @@ describe("durable runtime sqlite store", () => {
         store.updateStep({
           runtimeRunId: run.runtimeRunId,
           stepId: step.stepId,
-          expectedClaimedBy: "worker-1",
+          expectedClaimedBy: firstClaim!.claimedBy!,
           status: "succeeded",
           recoveryState: "terminal",
           now: 155,
@@ -716,7 +637,7 @@ describe("durable runtime sqlite store", () => {
       const completedStep = store.updateStep({
         runtimeRunId: run.runtimeRunId,
         stepId: step.stepId,
-        expectedClaimedBy: "worker-2",
+        expectedClaimedBy: secondClaim!.claimedBy!,
         status: "succeeded",
         recoveryState: "terminal",
         claimedBy: null,
@@ -743,6 +664,7 @@ describe("durable runtime sqlite store", () => {
     try {
       const active = store.createRun({
         operationKind: "test.runtime",
+        rootOperationReason: "test-root",
         status: "running",
         recoveryState: "running",
       });
@@ -755,6 +677,7 @@ describe("durable runtime sqlite store", () => {
 
       const terminal = store.createRun({
         operationKind: "test.runtime",
+        rootOperationReason: "test-root",
         status: "succeeded",
         recoveryState: "terminal",
         completedAt: 200,
@@ -822,10 +745,10 @@ describe("durable runtime sqlite store", () => {
           `SELECT name
              FROM sqlite_master
             WHERE type = 'table'
-              AND name LIKE 'durable_runtime_%'
+              AND name IN (${DURABLE_TABLES.map(() => "?").join(", ")})
             ORDER BY name`,
         )
-        .all() as Array<{ name: string }>;
+        .all(...DURABLE_TABLES) as Array<{ name: string }>;
       expect(durableTablesBefore).toEqual([]);
     } finally {
       existingDb.close();
@@ -841,11 +764,11 @@ describe("durable runtime sqlite store", () => {
           `SELECT name
              FROM sqlite_master
             WHERE type = 'table'
-              AND name LIKE 'durable_runtime_%'
+              AND name IN (${DURABLE_TABLES.map(() => "?").join(", ")})
             ORDER BY name`,
         )
-        .all() as Array<{ name: string }>;
-      expect(durableTablesAfter.map((row) => row.name)).toEqual([...DURABLE_TABLES].sort());
+        .all(...DURABLE_TABLES) as Array<{ name: string }>;
+      expect(durableTablesAfter.map((row) => row.name)).toEqual([...DURABLE_TABLES].toSorted());
       expect(
         upgradedDb
           .prepare(
@@ -866,6 +789,249 @@ describe("durable runtime sqlite store", () => {
       });
     } finally {
       upgradedDb.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fences wake dispatch so only the active lease can complete it", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-wake-claim-"));
+    const dbPath = path.join(dir, "openclaw.sqlite");
+    const firstStore = openDurableRuntimeSqliteStore({ path: dbPath });
+    const secondStore = openDurableRuntimeSqliteStore({ path: dbPath });
+    try {
+      const wake = firstStore.createWakeObligation({
+        sourceOwner: "session_store",
+        sourceRef: "agent:test:main",
+        ownerKind: "agent_session",
+        ownerRef: "agent:test:main",
+        targetKind: "agent_session",
+        targetRef: "agent:test:main",
+        reason: "operator_requested",
+        dedupeKey: "session:agent:test:main:dispatch",
+        now: 100,
+      });
+      const claim = firstStore.claimNextWakeObligation({
+        workerId: "worker-a",
+        claimTtlMs: 100,
+        retryBaseMs: 10,
+        retryMaxMs: 100,
+        now: 100,
+      });
+      expect(claim).toBeDefined();
+      expect(
+        secondStore.claimNextWakeObligation({
+          workerId: "worker-b",
+          claimTtlMs: 100,
+          retryBaseMs: 10,
+          retryMaxMs: 100,
+          now: 101,
+        }),
+      ).toBeUndefined();
+      expect(
+        secondStore.completeWakeObligationClaim({
+          wakeId: wake.wakeId,
+          deliveryAttemptId: claim!.deliveryAttempt.deliveryAttemptId,
+          claimToken: "stale-token",
+          attemptStatus: "delivered",
+          wakeStatus: "delivered",
+          now: 110,
+        }),
+      ).toBeUndefined();
+      expect(
+        firstStore.renewWakeObligationClaim({
+          wakeId: wake.wakeId,
+          deliveryAttemptId: claim!.deliveryAttempt.deliveryAttemptId,
+          claimToken: claim!.claimToken,
+          claimTtlMs: 100,
+          now: 150,
+        }),
+      ).toBe(true);
+      expect(
+        firstStore.completeWakeObligationClaim({
+          wakeId: wake.wakeId,
+          deliveryAttemptId: claim!.deliveryAttempt.deliveryAttemptId,
+          claimToken: claim!.claimToken,
+          attemptStatus: "delivered",
+          wakeStatus: "delivered",
+          evidence: { accepted: true },
+          now: 225,
+        }),
+      ).toMatchObject({ status: "delivered", deliveredAt: 225 });
+      expect(firstStore.getWakeObligation(wake.wakeId)).toMatchObject({
+        status: "delivered",
+        attemptCount: 1,
+      });
+      const attempts = firstStore.listDeliveryAttemptEvidence({ wakeId: wake.wakeId });
+      expect(attempts).toEqual([expect.objectContaining({ status: "delivered" })]);
+      expect(attempts[0]?.deliveryClaimedBy).toBeUndefined();
+    } finally {
+      secondStore.close();
+      firstStore.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects stale wake and uncertainty control revisions", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-control-revision-"));
+    const store = openDurableRuntimeSqliteStore({ path: path.join(dir, "openclaw.sqlite") });
+    try {
+      const wake = store.createWakeObligation({
+        sourceOwner: "task_runs",
+        sourceRef: "task-1",
+        targetKind: "agent_session",
+        targetRef: "agent:test:main",
+        reason: "child_terminal",
+        dedupeKey: "task-terminal:task-1",
+        metadata: { sourceRevision: "revision-2" },
+        now: 100,
+      });
+      const control = {
+        wakeId: wake.wakeId,
+        actorKind: "operator" as const,
+        actorRef: "test",
+        now: 110,
+      };
+      expect(
+        store.acknowledgeWakeObligation({
+          ...control,
+          expectedSourceRevision: "revision-1",
+        }),
+      ).toBeUndefined();
+      expect(store.getWakeObligation(wake.wakeId)?.status).toBe("pending");
+      expect(
+        store.acknowledgeWakeObligation({
+          ...control,
+          expectedSourceRevision: "revision-2",
+        }),
+      ).toMatchObject({ status: "acked" });
+
+      const fact = store.recordUncertaintyFact({
+        sourceOwner: "task_runs",
+        sourceRef: "task-1",
+        kind: "requires_owner_decision",
+        now: 120,
+      });
+      expect(
+        store.resolveUncertaintyFact({
+          factId: fact.factId,
+          status: "resolved",
+          resolutionKind: "owner_inspected",
+          expectedUpdatedAt: 119,
+          now: 130,
+        }),
+      ).toBeUndefined();
+      expect(
+        store.resolveUncertaintyFact({
+          factId: fact.factId,
+          status: "resolved",
+          resolutionKind: "owner_inspected",
+          expectedUpdatedAt: 120,
+          now: 130,
+        }),
+      ).toMatchObject({ status: "resolved", updatedAt: 130 });
+    } finally {
+      store.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("projects unresolved obligations from canonical upstream owners", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-owners-"));
+    const dbPath = path.join(dir, "openclaw.sqlite");
+    const store = openDurableRuntimeSqliteStore({ path: dbPath });
+    try {
+      const run = store.createRun({
+        operationKind: "test.runtime",
+        rootOperationReason: "test-root",
+        status: "queued",
+        recoveryState: "runnable",
+        now: 100,
+      });
+      const step = store.createStep({
+        runtimeRunId: run.runtimeRunId,
+        stepType: "tool",
+        status: "queued",
+        recoveryState: "runnable",
+        now: 105,
+      });
+      expect(
+        store.claimNextRunnableStep({
+          workerId: "attempt-1",
+          claimTtlMs: 10,
+          now: 110,
+        }),
+      ).toMatchObject({ runtimeRunId: run.runtimeRunId, stepId: step.stepId });
+
+      const { DatabaseSync } = requireNodeSqlite();
+      const db = new DatabaseSync(dbPath);
+      try {
+        db.prepare(
+          `INSERT INTO subagent_runs (
+             run_id, child_session_key, requester_session_key, requester_display_key,
+             task, cleanup, created_at, pending_final_delivery,
+             pending_final_delivery_created_at, pending_final_delivery_attempt_count,
+             pending_final_delivery_last_error
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          "subagent-1",
+          "agent:test:subagent:1",
+          "agent:test:main",
+          "agent:test:main",
+          "test task",
+          "keep",
+          100,
+          1,
+          130,
+          2,
+          "requester unavailable",
+        );
+        db.prepare(
+          `INSERT INTO delivery_queue_entries (
+             queue_name, id, status, session_key, channel, target, retry_count,
+             last_error, recovery_state, entry_json, enqueued_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          "outbound",
+          "delivery-1",
+          "failed",
+          "agent:test:main",
+          "discord",
+          "channel:1",
+          3,
+          "send failed",
+          "needs_retry",
+          "{}",
+          140,
+          150,
+        );
+      } finally {
+        db.close();
+      }
+
+      expect(store.listUnresolvedObligations({ now: 200 })).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            sourceOwner: "subagent_runs",
+            sourceRef: "subagent-1",
+            kind: "pending_subagent_delivery",
+            subjectRef: "agent:test:main",
+          }),
+          expect.objectContaining({
+            sourceOwner: "delivery_queue_entries",
+            sourceRef: "outbound:delivery-1",
+            kind: "pending_delivery_queue",
+            status: "failed",
+          }),
+          expect.objectContaining({
+            sourceOwner: "state_leases",
+            sourceRef: `durable_execution_step:${run.runtimeRunId}:${step.stepId}`,
+            kind: "expired_state_lease",
+            subjectRef: expect.stringMatching(/^claim_/),
+          }),
+        ]),
+      );
+    } finally {
+      store.close();
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });

@@ -15,7 +15,7 @@ describe("durable coordination projection", () => {
       operationVersion: "1",
       status: "waiting_child",
       recoveryState: "waiting_child",
-      sourceType: "agent_turn",
+      sourceOwner: "session_store",
       sourceRef: "agent:bo:discord:channel:bo-main",
       workUnitId: "workboard:default:card-parent",
       reportRouteId: "discord:bo-main",
@@ -138,7 +138,7 @@ describe("durable coordination projection", () => {
       operationVersion: "1",
       status: "lost",
       recoveryState: "lost",
-      sourceType: "agent",
+      sourceOwner: "agent",
       sourceRef: "agent:bo:direct",
       metadata: {
         sessionKey: "agent:bo:direct",
@@ -220,7 +220,7 @@ describe("durable coordination projection", () => {
       operationVersion: "1",
       status: "unknown_after_side_effect",
       recoveryState: "unknown_after_side_effect",
-      sourceType: "agent",
+      sourceOwner: "agent",
       sourceRef: "agent:bo:main",
       metadata: {
         sessionKey: "agent:bo:main",

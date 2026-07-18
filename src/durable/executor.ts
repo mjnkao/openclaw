@@ -132,6 +132,54 @@ function updateOwnedStep(params: {
   });
 }
 
+function recordExecutionUncertainty(params: {
+  store: DurableRuntimeStore;
+  run: DurableRuntimeRun;
+  step: DurableRuntimeStep;
+  kind: "unknown_after_side_effect" | "requires_owner_decision";
+  reason: "side_effect_uncertain" | "no_handler";
+  detail?: string;
+  now: number;
+}): void {
+  const sourceOwner = params.run.sourceOwner ?? "durable_execution_records";
+  const sourceRef = params.run.sourceRef ?? params.run.runtimeRunId;
+  const dedupeKey = `${params.reason}:${params.run.runtimeRunId}:${params.step.stepId}:${params.step.attempt}`;
+  const fact = params.store.recordUncertaintyFact({
+    sourceOwner,
+    sourceRef,
+    kind: params.kind,
+    sourceRunId: params.run.runtimeRunId,
+    stepId: params.step.stepId,
+    dedupeKey,
+    facts: {
+      reason: params.reason,
+      detail: params.detail,
+      attempt: params.step.attempt,
+    },
+    now: params.now,
+  });
+  params.store.createWakeObligation({
+    sourceOwner,
+    sourceRef,
+    parentRunId: params.run.parentRuntimeRunId,
+    targetKind: "run",
+    targetRef: params.run.runtimeRunId,
+    ownerKind: "run",
+    ownerRef: params.run.runtimeRunId,
+    targetResolutionStatus: "resolved",
+    targetResolutionReason: "durable execution record owns the blocked step",
+    reason: params.reason,
+    factsRef: `uncertainty_facts:${fact.factId}`,
+    sourceRunId: params.run.runtimeRunId,
+    dedupeKey: `wake:${dedupeKey}`,
+    metadata: {
+      stepId: params.step.stepId,
+      detail: params.detail,
+    },
+    now: params.now,
+  });
+}
+
 function markNoHandler(params: {
   store: DurableRuntimeStore;
   run: DurableRuntimeRun;
@@ -170,6 +218,15 @@ function markNoHandler(params: {
       workerId: params.workerId,
     },
   });
+  recordExecutionUncertainty({
+    store: params.store,
+    run: params.run,
+    step: params.step,
+    kind: "requires_owner_decision",
+    reason: "no_handler",
+    detail: `No handler is registered for step type ${params.step.stepType}`,
+    now: params.now,
+  });
   return {
     claimed: true,
     runtimeRunId: params.run.runtimeRunId,
@@ -185,6 +242,7 @@ function markHandlerException(params: {
   workerId: string;
   now: number;
   err: unknown;
+  sideEffectPolicy: DurableRuntimeStepSideEffectPolicy;
 }): DurableExecutorRunOnceResult {
   if (!isStepClaimOwned(params)) {
     return markClaimLost(params);
@@ -198,6 +256,59 @@ function markHandlerException(params: {
     metadata: { message: String(params.err) },
     now: params.now,
   });
+  const sideEffectUncertain =
+    (params.sideEffectPolicy === "non_idempotent" || params.sideEffectPolicy === "unknown") &&
+    !params.step.idempotencyKey;
+  if (sideEffectUncertain) {
+    const updatedStep = updateOwnedStep({
+      store: params.store,
+      step: params.step,
+      workerId: params.workerId,
+      input: {
+        status: "waiting",
+        recoveryState: "unknown_after_side_effect",
+        errorRef: errorRef.refId,
+        ...clearStepClaimFields(params.workerId),
+        now: params.now,
+      },
+    });
+    if (!updatedStep) {
+      return markClaimLost(params);
+    }
+    params.store.updateRun({
+      runtimeRunId: params.run.runtimeRunId,
+      status: "waiting",
+      recoveryState: "unknown_after_side_effect",
+      heartbeatAt: null,
+      now: params.now,
+    });
+    params.store.appendEvent({
+      runtimeRunId: params.run.runtimeRunId,
+      eventType: "runtime.step.handler_exception_unknown_side_effect",
+      eventTime: params.now,
+      stepId: params.step.stepId,
+      payload: {
+        errorRef: errorRef.refId,
+        sideEffectPolicy: params.sideEffectPolicy,
+        workerId: params.workerId,
+      },
+    });
+    recordExecutionUncertainty({
+      store: params.store,
+      run: params.run,
+      step: params.step,
+      kind: "unknown_after_side_effect",
+      reason: "side_effect_uncertain",
+      detail: String(params.err),
+      now: params.now,
+    });
+    return {
+      claimed: true,
+      runtimeRunId: params.run.runtimeRunId,
+      stepId: params.step.stepId,
+      outcome: "handler_exception",
+    };
+  }
   const updatedStep = updateOwnedStep({
     store: params.store,
     step: params.step,
@@ -374,6 +485,15 @@ function applyStepResult(params: {
           sideEffectPolicy,
           workerId,
         },
+      });
+      recordExecutionUncertainty({
+        store,
+        run,
+        step,
+        kind: "unknown_after_side_effect",
+        reason: "side_effect_uncertain",
+        detail: `Retry blocked for ${sideEffectPolicy} step without an idempotency key`,
+        now,
       });
       return {
         claimed: true,
@@ -589,6 +709,15 @@ function applyStepResult(params: {
     stepId: step.stepId,
     payload: { reason: result.reason, workerId },
   });
+  recordExecutionUncertainty({
+    store,
+    run,
+    step,
+    kind: "unknown_after_side_effect",
+    reason: "side_effect_uncertain",
+    detail: result.reason,
+    now,
+  });
   return {
     claimed: true,
     runtimeRunId: run.runtimeRunId,
@@ -601,23 +730,25 @@ export async function runDurableExecutorOnce(
   options: DurableExecutorRunOnceOptions,
 ): Promise<DurableExecutorRunOnceResult> {
   const now = options.now ?? (() => Date.now());
+  const claimTtlMs = options.claimTtlMs ?? DEFAULT_CLAIM_TTL_MS;
   const claimTime = now();
   const step = options.store.claimNextRunnableStep({
     operationKind: options.operationKind,
     stepType: options.stepType,
     workerId: options.workerId,
-    claimTtlMs: options.claimTtlMs ?? DEFAULT_CLAIM_TTL_MS,
+    claimTtlMs,
     now: claimTime,
   });
   if (!step) {
     return { claimed: false, reason: "no_runnable_step" };
   }
+  const claimToken = step.claimedBy!;
   const run = options.store.getRun(step.runtimeRunId);
   if (!run || terminalRunStatus(run)) {
     options.store.releaseStepClaim({
       runtimeRunId: step.runtimeRunId,
       stepId: step.stepId,
-      workerId: options.workerId,
+      workerId: claimToken,
       now: now(),
     });
     return { claimed: false, reason: "no_runnable_step" };
@@ -628,7 +759,7 @@ export async function runDurableExecutorOnce(
   const runningStep = updateOwnedStep({
     store: options.store,
     step,
-    workerId: options.workerId,
+    workerId: claimToken,
     input: {
       status: "running",
       recoveryState: "running",
@@ -642,7 +773,7 @@ export async function runDurableExecutorOnce(
       store: options.store,
       run,
       step,
-      workerId: options.workerId,
+      workerId: claimToken,
       now: startTime,
     });
   }
@@ -661,6 +792,7 @@ export async function runDurableExecutorOnce(
     payload: {
       stepType: step.stepType,
       workerId: options.workerId,
+      claimToken,
     },
   });
   if (!handler) {
@@ -668,11 +800,58 @@ export async function runDurableExecutorOnce(
       store: options.store,
       run,
       step,
-      workerId: options.workerId,
+      workerId: claimToken,
       now: now(),
     });
   }
 
+  let claimLost = false;
+  const heartbeat = (payload?: Record<string, unknown>): boolean => {
+    const heartbeatAt = now();
+    const heartbeatStep = options.store.renewStepClaim({
+      runtimeRunId: step.runtimeRunId,
+      stepId: step.stepId,
+      workerId: claimToken,
+      claimTtlMs,
+      now: heartbeatAt,
+    });
+    if (!heartbeatStep) {
+      if (!claimLost) {
+        claimLost = true;
+        options.store.appendEvent({
+          runtimeRunId: run.runtimeRunId,
+          eventType: "runtime.step.claim_lost",
+          eventTime: heartbeatAt,
+          stepId: step.stepId,
+          payload: {
+            phase: "heartbeat",
+            stepType: step.stepType,
+            workerId: options.workerId,
+            claimToken,
+          },
+        });
+      }
+      return false;
+    }
+    options.store.updateRun({
+      runtimeRunId: run.runtimeRunId,
+      heartbeatAt,
+      now: heartbeatAt,
+    });
+    options.store.appendEvent({
+      runtimeRunId: run.runtimeRunId,
+      eventType: "runtime.step.heartbeat",
+      eventTime: heartbeatAt,
+      stepId: step.stepId,
+      payload: { ...payload, workerId: options.workerId, claimToken },
+    });
+    return true;
+  };
+  const heartbeatTimer = setInterval(
+    () => heartbeat({ automatic: true }),
+    Math.max(1_000, Math.floor(claimTtlMs / 3)),
+  );
+  heartbeatTimer.unref?.();
   try {
     const result = await handler({
       store: options.store,
@@ -681,49 +860,14 @@ export async function runDurableExecutorOnce(
       workerId: options.workerId,
       now,
       heartbeat: (payload?: Record<string, unknown>) => {
-        const heartbeatAt = now();
-        const heartbeatStep = updateOwnedStep({
-          store: options.store,
-          step,
-          workerId: options.workerId,
-          input: {
-            heartbeatAt,
-            now: heartbeatAt,
-          },
-        });
-        if (!heartbeatStep) {
-          options.store.appendEvent({
-            runtimeRunId: run.runtimeRunId,
-            eventType: "runtime.step.claim_lost",
-            eventTime: heartbeatAt,
-            stepId: step.stepId,
-            payload: {
-              phase: "heartbeat",
-              stepType: step.stepType,
-              workerId: options.workerId,
-            },
-          });
-          return;
-        }
-        options.store.updateRun({
-          runtimeRunId: run.runtimeRunId,
-          heartbeatAt,
-          now: heartbeatAt,
-        });
-        options.store.appendEvent({
-          runtimeRunId: run.runtimeRunId,
-          eventType: "runtime.step.heartbeat",
-          eventTime: heartbeatAt,
-          stepId: step.stepId,
-          payload: { ...payload, workerId: options.workerId },
-        });
+        heartbeat(payload);
       },
     });
     return applyStepResult({
       store: options.store,
       run,
       step,
-      workerId: options.workerId,
+      workerId: claimToken,
       now: now(),
       result,
       sideEffectPolicy: registration?.sideEffectPolicy ?? "unknown",
@@ -733,9 +877,12 @@ export async function runDurableExecutorOnce(
       store: options.store,
       run,
       step,
-      workerId: options.workerId,
+      workerId: claimToken,
       now: now(),
       err,
+      sideEffectPolicy: registration?.sideEffectPolicy ?? "unknown",
     });
+  } finally {
+    clearInterval(heartbeatTimer);
   }
 }

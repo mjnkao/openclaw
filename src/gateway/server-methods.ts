@@ -503,7 +503,19 @@ export const coreGatewayHandlers: GatewayRequestHandlers = {
     loadHandlers: loadTasksHandlers,
   }),
   ...createLazyCoreHandlers({
-    methods: ["durable.coordination.get"],
+    methods: [
+      "durable.health.get",
+      "durable.coordination.get",
+      "durable.obligations.list",
+      "durable.wakes.list",
+      "durable.wakes.inspect",
+      "durable.wakes.acknowledge",
+      "durable.wakes.resume",
+      "durable.wakes.supersede",
+      "durable.uncertainty.list",
+      "durable.uncertainty.resolve",
+      "durable.delivery-attempts.list",
+    ],
     loadHandlers: loadDurableHandlers,
   }),
   ...createLazyCoreHandlers({

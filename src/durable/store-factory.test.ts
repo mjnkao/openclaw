@@ -13,6 +13,7 @@ describe("durable runtime store factory", () => {
     try {
       const run = store.createRun({
         operationKind: "factory.runtime",
+        rootOperationReason: "store_factory_test_fixture",
         idempotencyKey: "request-1",
         status: "queued",
         recoveryState: "runnable",
@@ -38,7 +39,7 @@ describe("durable runtime store factory", () => {
       expect(claimed).toMatchObject({
         runtimeRunId: run.runtimeRunId,
         stepId: step.stepId,
-        claimedBy: "factory-worker",
+        claimedBy: expect.stringMatching(/^claim_/),
         recoveryState: "claimed",
       });
       expect(store.getTimeline(run.runtimeRunId)).toHaveLength(1);

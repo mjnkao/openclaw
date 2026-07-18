@@ -90,7 +90,7 @@ describe("gateway context refs", () => {
         expect(runs[0]).toMatchObject({
           operationKind: DURABLE_CHAT_SEND_OPERATION_KIND,
           idempotencyKey: "run-1",
-          sourceType: "chat.send",
+          sourceOwner: "session_store",
           sourceRef: "agent:main:main",
           workUnitId: "workboard:default:card-1",
           reportRouteId: "agent:main:main",
@@ -100,7 +100,7 @@ describe("gateway context refs", () => {
             contextRefs: [{ type: "work_unit", id: "workboard:default:card-1" }],
             intakeEnvelope: expect.objectContaining({
               schema: DURABLE_INTAKE_ENVELOPE_SCHEMA,
-              sourceType: "chat.send",
+              sourceOwner: "session_store",
               sessionKey: "agent:main:main",
               attachmentCount: 0,
               replay: expect.objectContaining({
