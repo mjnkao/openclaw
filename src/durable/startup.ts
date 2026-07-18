@@ -2,6 +2,7 @@ import { createSubsystemLogger } from "../logging/subsystem.js";
 // Gateway startup integration for the durable runtime control plane.
 import { isDurableRuntimesEnabled, isDurableWorkerEnabled } from "./config.js";
 import {
+  reconcileDurableAgentTurnContinuationsOnGatewayStartup,
   reconcileDurableAgentTurnsOnGatewayStartup,
   reconcileDurableChatSendsOnGatewayStartup,
   reconcileDurableSubagentRunsOnGatewayStartup,
@@ -31,6 +32,13 @@ export async function maybeRecordDurableGatewayStartup(params: {
           now: params.startupStartedAt,
         })
       : { scanned: 0, markedLost: 0 };
+    const continuationRecovery = recoveryEnabled
+      ? reconcileDurableAgentTurnContinuationsOnGatewayStartup({
+          store,
+          processInstanceId: params.processInstanceId,
+          now: params.startupStartedAt,
+        })
+      : { scanned: 0, queuedRuns: 0 };
     const chatSendRecovery = recoveryEnabled
       ? reconcileDurableChatSendsOnGatewayStartup({
           store,
@@ -74,6 +82,7 @@ export async function maybeRecordDurableGatewayStartup(params: {
       runs: stats.runs,
       events: stats.events,
       reconciledLostAgentTurns: recovery.markedLost,
+      reconciledSupersededContinuations: continuationRecovery.queuedRuns ?? 0,
       reconciledLostChatSends: chatSendRecovery.markedLost,
       reconciledLostSubagentRuns: subagentRecovery.markedLost,
     });

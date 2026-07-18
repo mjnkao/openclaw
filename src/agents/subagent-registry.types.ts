@@ -84,19 +84,17 @@ export type SubagentCompletionDeliveryState = {
     | "waiting_for_requester_turn";
 };
 
-type SubagentKillReconciliationState = {
-  /** Actual cancellation time; a yielded run may have an older execution end. */
-  killedAt: number;
-  /** Requester aborts must not re-inject a delayed completion after queues are cleared. */
-  suppressTaskDelivery?: boolean;
-  /** Durable ownership boundary even after the newer registry row is released. */
-  supersededAt?: number;
+export type SubagentProgressNoticeState = {
+  lastNoticedAt?: number;
+  lastAttemptedAt?: number;
+  noticeCount?: number;
+  lastIdempotencyKey?: string;
+  lastReason?: "wait_timeout";
+  lastError?: string | null;
 };
 
 export type SubagentRunRecord = {
   runId: string;
-  /** Detached task owner; steer/restart changes runId but continues the same task. */
-  taskRunId?: string;
   childSessionKey: string;
   controllerSessionKey?: string;
   requesterSessionKey: string;
@@ -111,8 +109,6 @@ export type SubagentRunRecord = {
   workspaceDir?: string;
   runTimeoutSeconds?: number;
   spawnMode?: SpawnSubagentMode;
-  /** Monotonic ownership generation within one child session. */
-  generation?: number;
   createdAt: number;
   startedAt?: number;
   sessionStartedAt?: number;
@@ -123,10 +119,6 @@ export type SubagentRunRecord = {
   cleanupCompletedAt?: number;
   cleanupHandled?: boolean;
   suppressAnnounceReason?: "steer-restart" | "killed";
-  /** Present only while a current-version killed run awaits bounded reconciliation. */
-  killReconciliation?: SubagentKillReconciliationState;
-  /** Durable requester-stop policy until silent completion cleanup finishes. */
-  suppressCompletionDelivery?: boolean;
   expectsCompletionMessage?: boolean;
   endedReason?: SubagentLifecycleEndedReason;
   pauseReason?: "sessions_yield";
@@ -137,10 +129,10 @@ export type SubagentRunRecord = {
   endedHookEmittedAt?: number;
   /** Set after cleanupBrowserSessionsForLifecycleEnd has been dispatched once. */
   browserCleanupDispatchedAt?: number;
-  /** Set immediately before irreversible sessions.delete cleanup is dispatched. */
-  deleteCleanupDispatchedAt?: number;
   /** Durable outbox marker for parent/external completion delivery. */
   delivery?: SubagentCompletionDeliveryState;
+  /** Durable progress/waiting notice marker for active child runs. */
+  progressNotice?: SubagentProgressNoticeState;
   attachmentsDir?: string;
   attachmentsRootDir?: string;
   retainAttachmentsOnKeep?: boolean;

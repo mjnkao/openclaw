@@ -1,5 +1,6 @@
 import { createSubsystemLogger } from "../logging/subsystem.js";
 // Recovery reconciliation for durable runtime runs.
+import { reconcileSupersededAgentTurnContinuations } from "./agent-turn-continuations.js";
 import { isDurableWorkerEnabled } from "./config.js";
 import { reconcileDurableFanIn, type DurableFanInPolicy } from "./fan-in.js";
 import {
@@ -430,6 +431,19 @@ export function reconcileDurableAgentTurnsOnGatewayStartup(params: {
   return { scanned: openRuns.length, markedLost };
 }
 
+export function reconcileDurableAgentTurnContinuationsOnGatewayStartup(params: {
+  store: DurableRuntimeStore;
+  processInstanceId: string;
+  now: number;
+}): DurableRecoveryResult {
+  const result = reconcileSupersededAgentTurnContinuations({
+    store: params.store,
+    processInstanceId: params.processInstanceId,
+    now: params.now,
+  });
+  return { scanned: result.scanned, markedLost: 0, queuedRuns: result.closed };
+}
+
 export function reconcileDurableChatSendsOnGatewayStartup(params: {
   store: DurableRuntimeStore;
   processInstanceId: string;
@@ -849,6 +863,11 @@ export function startDurableRecoveryWorker(params: {
         now: Date.now(),
         staleAfterMs,
       });
+      const continuationResult = reconcileSupersededAgentTurnContinuations({
+        store,
+        processInstanceId: params.processInstanceId,
+        now: Date.now(),
+      });
       const chatSendResult = reconcileStaleDurableChatSends({
         store,
         processInstanceId: params.processInstanceId,
@@ -875,6 +894,7 @@ export function startDurableRecoveryWorker(params: {
         result.markedLost > 0 ||
         chatSendResult.markedLost > 0 ||
         subagentRunResult.markedLost > 0 ||
+        continuationResult.closed > 0 ||
         (timerResult.firedTimers ?? 0) > 0 ||
         (signalResult.consumedSignals ?? 0) > 0
       ) {
@@ -885,6 +905,8 @@ export function startDurableRecoveryWorker(params: {
           markedLostChatSends: chatSendResult.markedLost,
           staleSubagentRunsScanned: subagentRunResult.scanned,
           markedLostSubagentRuns: subagentRunResult.markedLost,
+          supersededContinuationsScanned: continuationResult.scanned,
+          supersededContinuationsClosed: continuationResult.closed,
           firedTimers: timerResult.firedTimers ?? 0,
           consumedSignals: signalResult.consumedSignals ?? 0,
           queuedRuns: (timerResult.queuedRuns ?? 0) + (signalResult.queuedRuns ?? 0),

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { closeSupersededAgentTurnContinuations } from "./agent-turn-continuations.js";
 import { isDurableRuntimesEnabled } from "./config.js";
 import { reconcileDurableFanIn, type DurableFanInPolicy } from "./fan-in.js";
 import {
@@ -105,6 +106,20 @@ function isTerminalRunStatus(status: DurableRuntimeRunStatus): boolean {
   return (
     status === "succeeded" || status === "failed" || status === "cancelled" || status === "lost"
   );
+}
+
+function isTerminalLinkStatus(status: DurableRuntimeLinkStatus): boolean {
+  return (
+    status === "succeeded" || status === "failed" || status === "cancelled" || status === "lost"
+  );
+}
+
+function isParentFanInComplete(params: {
+  store: DurableRuntimeStore;
+  parentRuntimeRunId: string;
+}): boolean {
+  const childLinks = params.store.listChildLinks(params.parentRuntimeRunId);
+  return childLinks.length > 0 && childLinks.every((link) => isTerminalLinkStatus(link.status));
 }
 
 function findRunByIdempotencyKey(params: {
@@ -386,6 +401,119 @@ export function recordDurableSubagentTerminal(params: {
   });
 }
 
+export function recordDurableSubagentProgress(params: {
+  runId: string;
+  childSessionKey?: string;
+  status?: "running" | "waiting";
+  reason?: string;
+  detail?: string;
+  elapsedMs?: number;
+  env?: NodeJS.ProcessEnv;
+}): void {
+  const env = params.env ?? process.env;
+  if (!isDurableRuntimesEnabled(env)) {
+    return;
+  }
+  safeCall(() => {
+    const now = Date.now();
+    const store = openDurableRuntimeStore({ env });
+    try {
+      const child = store.createRun({
+        operationKind: DURABLE_SUBAGENT_RUN_OPERATION_KIND,
+        operationVersion: "1",
+        status: "running",
+        recoveryState: "running",
+        idempotencyKey: params.runId,
+        requestHash: params.childSessionKey
+          ? sha256(`${params.runId}:${params.childSessionKey}`)
+          : undefined,
+        sourceType: "subagent",
+        sourceRef: params.childSessionKey,
+        metadata: {
+          childSessionKey: params.childSessionKey,
+        },
+        now,
+      });
+      const existingMetadata =
+        child.metadata && typeof child.metadata === "object" && !Array.isArray(child.metadata)
+          ? child.metadata
+          : {};
+      const progress = {
+        status: params.status ?? "running",
+        reason: params.reason,
+        detail: boundedText(params.detail, 240),
+        elapsedMs: params.elapsedMs,
+        observedAt: now,
+      };
+      const metadata = {
+        ...existingMetadata,
+        childSessionKey: params.childSessionKey,
+        lastProgress: progress,
+      };
+      store.updateRun({
+        runtimeRunId: child.runtimeRunId,
+        status: "running",
+        recoveryState: "running",
+        metadata,
+        now,
+      });
+      store.createStep({
+        runtimeRunId: child.runtimeRunId,
+        stepId: "subagent_run",
+        stepType: "agent",
+        status: "running",
+        recoveryState: "running",
+        idempotencyKey: params.runId,
+        metadata,
+        now,
+      });
+      store.appendEvent({
+        runtimeRunId: child.runtimeRunId,
+        eventType: "subagent.run.progress",
+        eventTime: now,
+        stepId: "subagent_run",
+        agentInvocationId: params.runId,
+        idempotencyKey: `${params.runId}:progress:${now}`,
+        correlationId: params.childSessionKey,
+        payload: progress,
+      });
+      for (const link of store.listParentLinks(child.runtimeRunId)) {
+        const linkMetadata =
+          link.metadata && typeof link.metadata === "object" && !Array.isArray(link.metadata)
+            ? link.metadata
+            : {};
+        const payload = {
+          childRuntimeRunId: child.runtimeRunId,
+          childSessionKey: params.childSessionKey,
+          ...progress,
+        };
+        store.updateLink({
+          parentRuntimeRunId: link.parentRuntimeRunId,
+          parentStepId: link.parentStepId,
+          childRuntimeRunId: link.childRuntimeRunId,
+          status: "running",
+          metadata: {
+            ...linkMetadata,
+            lastProgress: progress,
+          },
+          now,
+        });
+        store.appendEvent({
+          runtimeRunId: link.parentRuntimeRunId,
+          eventType: "subagent.child.progress",
+          eventTime: now,
+          stepId: link.parentStepId,
+          agentInvocationId: params.runId,
+          correlationId: params.childSessionKey,
+          payload,
+        });
+      }
+    } finally {
+      store.close();
+    }
+  });
+}
+
 export function recordDurableSubagentAnnounceDelivery(params: {
   runId: string;
   childSessionKey?: string;
@@ -455,7 +583,8 @@ export function recordDurableSubagentAnnounceDelivery(params: {
           params.delivered &&
           params.path === "direct" &&
           directRun?.status === "succeeded" &&
-          directRun.recoveryState === "terminal"
+          directRun.recoveryState === "terminal" &&
+          isParentFanInComplete({ store, parentRuntimeRunId: parent.runtimeRunId })
         ) {
           store.updateRun({
             runtimeRunId: parent.runtimeRunId,
@@ -483,6 +612,20 @@ export function recordDurableSubagentAnnounceDelivery(params: {
             correlationId: params.childSessionKey,
             payload,
           });
+          const parentSessionKey =
+            typeof parent.metadata?.sessionKey === "string" && parent.metadata.sessionKey.trim()
+              ? parent.metadata.sessionKey.trim()
+              : parent.sourceRef;
+          if (parentSessionKey) {
+            closeSupersededAgentTurnContinuations({
+              store,
+              sessionKey: parentSessionKey,
+              parentRuntimeRunId: parent.runtimeRunId,
+              excludeRuntimeRunId: directRun.runtimeRunId,
+              reason: "parent_terminal",
+              now,
+            });
+          }
           continue;
         }
         store.updateRun({

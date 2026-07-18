@@ -1,22 +1,23 @@
 import { describe, expect, it } from "vitest";
 import {
-  buildDurableCoordinationMetadataProjection,
   buildDurableCoordinationProjection,
+  buildDurableTaskFlowStateProjection,
+  buildDurableWorkboardMetadataProjection,
   mergeDurableProjectionIntoJsonObject,
 } from "./coordination-projection.js";
 import type { DurableRuntimeLink, DurableRuntimeRun, DurableRuntimeStep } from "./types.js";
 
 describe("durable coordination projection", () => {
-  it("summarizes waiting child runs for runtime consumers", () => {
+  it("summarizes waiting child runs for taskflow and workboard consumers", () => {
     const run: DurableRuntimeRun = {
-      runtimeRunId: "rt_parent",
+      runtimeRunId: "wfr_parent",
       operationKind: "openclaw.agent.turn",
       operationVersion: "1",
       status: "waiting_child",
       recoveryState: "waiting_child",
       sourceType: "agent_turn",
       sourceRef: "agent:bo:discord:channel:bo-main",
-      workUnitId: "wu:test:card-parent",
+      workUnitId: "workboard:default:card-parent",
       reportRouteId: "discord:bo-main",
       heartbeatAt: 120,
       metadata: {
@@ -43,7 +44,7 @@ describe("durable coordination projection", () => {
       {
         parentRuntimeRunId: run.runtimeRunId,
         parentStepId: "subagents",
-        childRuntimeRunId: "rt_child_1",
+        childRuntimeRunId: "wfr_child_1",
         linkType: "subagent",
         status: "succeeded",
         createdAt: 120,
@@ -52,7 +53,7 @@ describe("durable coordination projection", () => {
       {
         parentRuntimeRunId: run.runtimeRunId,
         parentStepId: "subagents",
-        childRuntimeRunId: "rt_child_2",
+        childRuntimeRunId: "wfr_child_2",
         linkType: "subagent",
         status: "failed",
         createdAt: 121,
@@ -61,7 +62,7 @@ describe("durable coordination projection", () => {
       {
         parentRuntimeRunId: run.runtimeRunId,
         parentStepId: "subagents",
-        childRuntimeRunId: "rt_child_3",
+        childRuntimeRunId: "wfr_child_3",
         linkType: "subagent",
         status: "running",
         createdAt: 122,
@@ -72,15 +73,15 @@ describe("durable coordination projection", () => {
     const projection = buildDurableCoordinationProjection({ run, steps, childLinks });
 
     expect(projection).toMatchObject({
-      runtimeRunId: "rt_parent",
-      workUnitId: "wu:test:card-parent",
+      runtimeRunId: "wfr_parent",
+      workUnitId: "workboard:default:card-parent",
       reportRouteId: "discord:bo-main",
       status: "waiting_child",
       recoveryState: "waiting_child",
       currentStepId: "subagents",
       waitingReason: "child",
       external: {
-        workUnitId: "wu:test:card-parent",
+        workUnitId: "workboard:default:card-parent",
         reportRouteId: "discord:bo-main",
         taskId: "task_parent",
         taskFlowId: "flow_parent",
@@ -96,37 +97,43 @@ describe("durable coordination projection", () => {
         open: 1,
       },
       controls: {
-        canCancel: false,
-        canRetry: false,
-        canResume: false,
-        canSignal: false,
+        canCancel: true,
+        canResume: true,
         canOpenTimeline: true,
       },
     });
 
-    expect(buildDurableCoordinationMetadataProjection(projection)).toMatchObject({
-      runtimeRunId: "rt_parent",
-      workUnitId: "wu:test:card-parent",
+    expect(buildDurableTaskFlowStateProjection(projection)).toMatchObject({
+      runtimeRunId: "wfr_parent",
+      workUnitId: "workboard:default:card-parent",
       reportRouteId: "discord:bo-main",
       waitingReason: "child",
       children: { open: 1, failed: 1 },
     });
+    expect(buildDurableWorkboardMetadataProjection(projection)).toMatchObject({
+      runtimeRunId: "wfr_parent",
+      workUnitId: "workboard:default:card-parent",
+      reportRouteId: "discord:bo-main",
+      taskId: "task_parent",
+      taskFlowId: "flow_parent",
+      timelineCommand: "openclaw durable timeline wfr_parent",
+    });
     expect(
       mergeDurableProjectionIntoJsonObject(
         { existing: true },
-        buildDurableCoordinationMetadataProjection(projection),
+        buildDurableTaskFlowStateProjection(projection),
       ),
     ).toMatchObject({
       existing: true,
       durable: {
-        runtimeRunId: "rt_parent",
+        runtimeRunId: "wfr_parent",
       },
     });
   });
 
-  it("exposes recovery diagnostics for lost runs without requiring a product surface", () => {
+  it("exposes recovery diagnostics for lost runs without requiring a Workboard card", () => {
     const run: DurableRuntimeRun = {
-      runtimeRunId: "rt_lost",
+      runtimeRunId: "wfr_lost",
       operationKind: "openclaw.agent.turn",
       operationVersion: "1",
       status: "lost",
@@ -164,17 +171,14 @@ describe("durable coordination projection", () => {
     const projection = buildDurableCoordinationProjection({ run });
 
     expect(projection).toMatchObject({
-      runtimeRunId: "rt_lost",
+      runtimeRunId: "wfr_lost",
       status: "lost",
       recoveryState: "lost",
       external: {
         sessionKey: "agent:bo:direct",
       },
       controls: {
-        canCancel: false,
-        canRetry: false,
-        canResume: false,
-        canSignal: false,
+        canRetry: true,
         canOpenTimeline: true,
       },
       recovery: {
@@ -195,10 +199,62 @@ describe("durable coordination projection", () => {
         },
       },
     });
-    expect(buildDurableCoordinationMetadataProjection(projection)).toMatchObject({
+    expect(buildDurableTaskFlowStateProjection(projection)).toMatchObject({
       recovery: {
         state: "lost",
         nextAction: "inspect_timeline_then_retry_or_resume",
+      },
+    });
+    expect(buildDurableWorkboardMetadataProjection(projection)).toMatchObject({
+      recovery: {
+        state: "lost",
+        nextAction: "inspect_timeline_then_retry_or_resume",
+      },
+    });
+  });
+
+  it("treats unknown-after-side-effect runs as resumable reconciliation work", () => {
+    const run: DurableRuntimeRun = {
+      runtimeRunId: "wfr_unknown",
+      operationKind: "openclaw.agent.turn",
+      operationVersion: "1",
+      status: "unknown_after_side_effect",
+      recoveryState: "unknown_after_side_effect",
+      sourceType: "agent",
+      sourceRef: "agent:bo:main",
+      metadata: {
+        sessionKey: "agent:bo:main",
+        recoveryDiagnostic: {
+          state: "unknown_after_side_effect",
+          severity: "warning",
+          reportable: true,
+          retryable: false,
+          reason: "planned_gateway_restart",
+          message: "Runtime run was interrupted by an approved gateway restart.",
+          nextAction: "inspect_timeline_then_resume_or_reconcile",
+          safeRecoveryActions: ["inspect_timeline", "resume_parent", "reconcile_side_effects"],
+        },
+      },
+      createdAt: 100,
+      updatedAt: 200,
+    };
+
+    const projection = buildDurableCoordinationProjection({ run });
+
+    expect(projection).toMatchObject({
+      status: "unknown_after_side_effect",
+      recoveryState: "unknown_after_side_effect",
+      waitingReason: "unknown",
+      controls: {
+        canRetry: true,
+        canResume: true,
+        canOpenTimeline: true,
+      },
+      recovery: {
+        state: "unknown_after_side_effect",
+        severity: "warning",
+        retryable: false,
+        nextAction: "inspect_timeline_then_resume_or_reconcile",
       },
     });
   });

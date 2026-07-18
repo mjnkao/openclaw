@@ -17,6 +17,11 @@ import { applyMergePatch } from "../../config/merge-patch.js";
 import { normalizeConfigPatchReplacePaths } from "../../config/patch-replace-paths.js";
 import { extractDeliveryInfo } from "../../config/sessions.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import {
+  buildDefaultDurableRestartContinuationMessage,
+  isDurableGatewayRestartContinuationUseful,
+  recordDurableGatewayRestartInterruption,
+} from "../../durable/restart-interruption.js";
 import { GatewayClientRequestError } from "../../gateway/client.js";
 import {
   buildRestartSuccessContinuation,
@@ -470,7 +475,13 @@ export function createGatewayTool(opts?: {
         const rawReason = normalizeOptionalString(params.reason);
         const reason = rawReason ? truncateUtf16Safe(rawReason, 200) : undefined;
         const note = normalizeOptionalString(params.note);
-        const continuationMessage = normalizeOptionalString(params.continuationMessage);
+        const explicitContinuationMessage = normalizeOptionalString(params.continuationMessage);
+        const continuationMessage = isDurableGatewayRestartContinuationUseful({
+          sessionKey,
+          continuationMessage: explicitContinuationMessage,
+        })
+          ? buildDefaultDurableRestartContinuationMessage()
+          : explicitContinuationMessage;
         // Extract channel + threadId for routing after restart.
         // Uses generic :thread: parsing plus plugin-owned session grammars.
         const { deliveryContext, threadId } = extractDeliveryInfo(sessionKey);
@@ -504,6 +515,10 @@ export function createGatewayTool(opts?: {
           sessionKey,
           emitHooks: {
             beforeEmit: async () => {
+              recordDurableGatewayRestartInterruption({
+                reason,
+                sessionKey,
+              });
               await writeRestartSentinel(payload);
               sentinelWritten = true;
             },
