@@ -138,9 +138,11 @@ type DurableOwnerAdapter = {
 The implemented initial adapters cover `subagent_runs`, `task_runs`, and
 `session_store`; the task adapter reads `task_delivery_state` through the
 existing task owner API. The session adapter resolves the current canonical
-session row and hands a bounded internal notice to the existing system-event and
-heartbeat front door. Its evidence proves target-session handoff only, never
-user or external-channel delivery. `flow_runs`, `delivery_queue_entries`,
+session row and hands a bounded internal notice to the existing persisted
+session-delivery queue before the system-event and heartbeat front door. The
+queue entry uses a stable idempotency key and is generation-fenced by default.
+Its evidence distinguishes queue acceptance, attached-session consumption, and
+external delivery; none implies another. `flow_runs`, `delivery_queue_entries`,
 restart/boot, and ACP owners remain explicit extension points. Until those
 adapters exist, their rows remain available to bounded inspection projections
 but cannot be dispatched by the wake worker. Adapter outputs must be bounded,
@@ -151,16 +153,16 @@ An owner front door is the narrow API that is solely allowed to mutate or
 deliver for that lifecycle. It is not a new service and it is not direct table
 access from durable core. The initial concrete front doors are:
 
-| Canonical owner                       | Front door                                                      | Durable integration                                               |
-| ------------------------------------- | --------------------------------------------------------------- | ----------------------------------------------------------------- |
-| `subagent_runs`                       | subagent registry progress/completion delivery APIs             | Implemented                                                       |
-| `task_runs` and `task_delivery_state` | task registry and `requestTaskAttentionDelivery`                | Implemented                                                       |
-| `session_store`                       | `requestSessionAttentionDelivery`, system events, and heartbeat | Implemented                                                       |
-| `flow_runs`                           | flow continue/cancel/wait owner APIs                            | Planned adapter                                                   |
-| `delivery_queue_entries`              | queue claim/reconcile/ack/fail APIs                             | Planned adapter                                                   |
-| restart/boot owners                   | restart handoff, sentinel, and startup reconciliation APIs      | Generic startup classification implemented; owner adapter planned |
-| ACP owners                            | ACP session/control/replay APIs with current binding revision   | Planned adapter                                                   |
-| `state_leases`                        | lease claim/renew/release APIs                                  | Reused as authority; no duplicate lifecycle                       |
+| Canonical owner                       | Front door                                                     | Durable integration                                               |
+| ------------------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------- |
+| `subagent_runs`                       | subagent registry progress/completion delivery APIs            | Implemented                                                       |
+| `task_runs` and `task_delivery_state` | task registry and `requestTaskAttentionDelivery`               | Implemented                                                       |
+| `session_store`                       | persisted session-delivery queue, system events, and heartbeat | Partial: in-memory handoff must be replaced before release        |
+| `flow_runs`                           | flow continue/cancel/wait owner APIs                           | Planned adapter                                                   |
+| `delivery_queue_entries`              | queue claim/reconcile/ack/fail APIs                            | Planned adapter                                                   |
+| restart/boot owners                   | restart handoff, sentinel, and startup reconciliation APIs     | Generic startup classification implemented; owner adapter planned |
+| ACP owners                            | ACP session/control/replay APIs with current binding revision  | Planned adapter                                                   |
+| `state_leases`                        | lease claim/renew/release APIs                                 | Reused as authority; no duplicate lifecycle                       |
 
 "All OpenClaw owners/front doors" means inventorying and integrating every
 canonical lifecycle that can leave unresolved work or attention. It does not
@@ -238,9 +240,9 @@ An obligation includes:
 
 Legal status transitions:
 
-- `pending -> delivered | acked | failed | suspended | superseded`
-- `delivered -> acked | failed | suspended | superseded`
-- `failed -> delivered | acked | suspended | superseded`
+- `pending -> handoff_accepted | acked | failed | suspended | superseded`
+- `handoff_accepted -> acked | failed | suspended | superseded`
+- `failed -> handoff_accepted | acked | suspended | superseded`
 - `suspended -> pending | acked | superseded`
 
 Only `acked` and `superseded` are terminal and immutable. `failed` remains
@@ -249,7 +251,10 @@ stopped after a deadline, retry cap, unresolved target, or decision requirement;
 only an authorized owner decision or a newly reconciled canonical fact may move
 it back to `pending`. Repeated source observation returns the existing obligation
 by dedupe key. A missing, ambiguous, unauthorized, or inspect-only target remains
-inspectable and must not be normalized to delivered or acked.
+inspectable and must not be normalized to `handoff_accepted` or `acked`.
+`handoff_accepted` names only the exact internal owner/queue boundary retained in
+attempt evidence. It is not attached-session consumption, end-user delivery, or
+external transport success.
 
 Required producers include:
 
@@ -295,13 +300,13 @@ The Gateway recovery loop owns a general obligation dispatcher. Each pass:
    active;
 5. resolves and dispatches through the source owner adapter;
 6. records one `DeliveryAttemptEvidence` with the exact proof boundary;
-7. marks the obligation delivered, failed, suspended, acknowledged, or
+7. marks the obligation handoff-accepted, failed, suspended, acknowledged, or
    superseded according to evidence and owner policy;
 8. emits a diagnostic when obligation age exceeds the no-silence SLA.
 
 Retries use bounded exponential backoff with jitter. Retry count, elapsed age,
 target resolution, last evidence, and next safe action are inspectable. A stalled
-obligation cannot remain silently pending forever: it becomes delivered,
+obligation cannot remain silently pending forever: it becomes handoff-accepted,
 acknowledged, suspended, superseded, or overdue and visible to its owner and
 operator surfaces.
 
@@ -315,11 +320,12 @@ Delivery evidence records what one attempt proves. It does not replace
 `delivery_queue_entries` and does not turn internal handoff into external
 delivery.
 
-Evidence boundaries include:
+Evidence boundaries include and must be named separately:
 
 - obligation selected for attempt;
-- internal queue accepted;
-- target session handoff accepted;
+- persisted internal queue accepted;
+- target session generation validated;
+- attached session consumed the notice;
 - external transport accepted when the channel provides direct proof;
 - failed before dispatch;
 - outcome unknown after dispatch;
@@ -444,24 +450,15 @@ observe source -> notify owner -> inspect facts -> authorize decision
 
 The full owner-decision vocabulary may include `acknowledge`, `supersede`,
 `retry`, `resume`, `continue_partial`, `abandon`, `wait`, `ask_human`, and
-`mark_reconciled`. The initial public slice exposes only wake acknowledge,
-supersede, resume, and uncertainty resolution. Decisions carry caller identity,
-source revision, idempotency key, reason, and bounded evidence. The initial
-slice retains append-style wake control evidence and uncertainty resolution
-evidence on those resources. Shared audit-store integration is a release gate
-before adding broad administrative decisions. A dedicated decision table is not
-justified until those existing evidence paths prove insufficient.
+`mark_reconciled`. The initial public slice is inspection-only. Store-internal
+decision primitives do not create a supported Gateway or CLI mutation contract.
 
-Gateway mutation methods are additive and owner-oriented:
-
-- `durable.wakes.acknowledge`
-- `durable.wakes.supersede`
-- `durable.wakes.resume`
-- `durable.uncertainty.resolve`
-
-Read-only operator access does not imply mutation authority. Retry and resume
-never directly rewrite a source lifecycle row; they call the owning API through
-the adapter after authorization and revision validation.
+Any later owner-control PR must carry caller identity, authorization source,
+source revision, idempotency key, reason, bounded evidence, and shared audit
+integration. Retry and resume must call the owning API through an adapter after
+authorization and revision validation; they never rewrite a source lifecycle
+row directly. A dedicated decision table is not justified until existing owner
+and audit evidence paths prove insufficient.
 
 ## Atomicity, Replay, And Crash Matrix
 

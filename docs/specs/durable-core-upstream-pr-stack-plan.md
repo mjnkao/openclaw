@@ -26,6 +26,10 @@ series including the architecture gate. Submit the context compaction and hard
 overflow correction as one independent PR because it fixes existing agent-turn
 correctness without requiring durable-core schema or runtime enablement.
 
+The five high-rated beta 3 PRs remain proof archives, not merge candidates. See
+[Durable Core Beta 3 PR Stack Audit](/specs/durable-core-beta3-pr-stack-audit)
+for the reviewed invariants that the replacement series must preserve.
+
 ## Audited Revisions
 
 | Item               | Revision or state                    | Finding                                                                        |
@@ -161,14 +165,16 @@ Scope:
 - `wake_obligations`, `uncertainty_facts`, and
   `delivery_attempt_evidence` contracts;
 - source-owner/ref and source-revision requirements;
-- task, subagent, and session owner adapters;
+- task and subagent source adapters plus the session dispatch contract;
 - lease-backed dispatcher, bounded retries, suspension, and owner validation;
 - reconciliation fallback for owner APIs that cannot share one transaction;
 - no broad public control API.
 
 Required proof: exactly one source-backed obligation, crash-after-owner-commit
-reconciliation, target-resolution states, attempt evidence boundaries, retry
-caps, and no false external-delivery or acknowledgement claim.
+reconciliation, target-resolution states, persist-before-side-effect, stale
+claim fencing, slow-hook claim renewal, atomic attempt/wake finalization,
+close/reopen split-state repair, retry caps, and no false external-delivery or
+acknowledgement claim.
 
 ### PR5/6: Agent, session, task, subagent, and restart front doors
 
@@ -176,32 +182,41 @@ Scope:
 
 - durable agent-turn intake and terminal classification;
 - fail-closed Gateway CLI behavior while durable authority owns a turn;
-- session attention handoff through the canonical system-event/heartbeat path;
+- session attention handoff through the existing persisted session-delivery
+  queue, followed by the canonical system-event/heartbeat path;
+- generation-fenced delivery by default, with any cross-generation policy made
+  explicit and owner-controlled;
+- distinct evidence for queue acceptance, attached-session consumption, and
+  external user delivery;
 - task and subagent source-fact production without mirrored lifecycles;
 - restart handoff correlation and visible parent/report-route attention;
 - no prompt-only correctness dependency.
 
 Required proof: live process restart during a tool call, parent/subagent timeout
 and orphan cases, gateway restart during deferred work, duplicate observation,
-and a normal post-fault turn. Each case must end in safe progress, a visible
-obligation, or explicit uncertainty rather than silence.
+crash after queue acceptance, restart recovery, session reset/generation change,
+attached-session consumption, and a normal post-fault turn. Each case must end
+in safe progress, a visible obligation, or explicit uncertainty rather than
+silence. Queue acceptance must not be labeled as external or user delivery.
 
-### PR6/6: Read-only operations surface and bounded owner controls
+### PR6/6: Read-only operations surface
 
 Scope:
 
 - protocol schemas and authorized Gateway reads;
 - `openclaw durable` health, timeline, obligation, attempt, uncertainty, and
   explanation commands;
-- only the owner controls accepted by PR1, with caller identity, source revision,
-  idempotency, reason, and retained evidence;
+- no public wake or uncertainty mutation in the initial upstream surface;
 - normal OpenClaw configuration/doctor integration instead of permanent growth
   of environment-only product controls;
 - redacted current-head live proof and operator documentation.
 
 Required proof: disabled reads are side-effect free, authorization is enforced,
-invalid protocol input fails before opening state, output is bounded, and every
-control delegates to a current owner adapter rather than rewriting owner rows.
+invalid protocol input fails before opening state, output is bounded, generated
+clients and packaged SDK consumers remain compatible, and no write method is
+advertised. Owner mutations require a later, separately approved PR with caller
+identity, source revision, idempotency, reason, audit evidence, and owner-adapter
+delegation.
 
 ## Independent Correctness PR
 
@@ -243,9 +258,16 @@ upstream-ready series. Before extracting PR2/6:
 3. reduce environment-only product controls into the normal config/doctor
    surface, retaining environment variables only where project convention
    requires them;
-4. complete planned adapters for flow, delivery queue, restart/boot, and ACP or
+4. remove the single-backend `OPENCLAW_DURABLE_RUNTIME_STORE` selector;
+5. replace the current in-memory system-event handoff with persisted,
+   generation-fenced session delivery and attached-consumption proof;
+6. remove initial public wake/uncertainty writes and rename the hyphenated
+   `durable.delivery-attempts.list` method to an approved camelCase RPC shape;
+7. port the beta 3 close/reopen split-state, atomic-abort, slow-hook renewal, and
+   session restart/reset fixtures;
+8. complete planned adapters for flow, delivery queue, restart/boot, and ACP or
    explicitly move them to later scope without claiming full owner coverage;
-5. convert the live fault run into redacted, reproducible current-head proof.
+9. convert the live fault run into redacted, reproducible current-head proof.
 
 Until those gates pass, the correct statement is: the OpenClaw E integration is
 a strong live-tested reference, not a complete upstream-ready durable-core

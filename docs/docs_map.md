@@ -8809,6 +8809,22 @@ Do not edit it by hand; run `pnpm docs:map:gen`.
   - H2: Invariants
   - H2: Related
 
+## specs/durable-core-beta3-pr-stack-audit.md
+
+- Route: /specs/durable-core-beta3-pr-stack-audit
+- Headings:
+  - H1: Durable Core Beta 3 PR Stack Audit
+  - H2: Executive Decision
+  - H2: Base and Topology
+  - H2: PR1: Beta 3 RFC
+  - H2: PR2: Runtime Foundation
+  - H2: PR3: Wake Replay
+  - H2: PR4: Inspection-First Surface
+  - H2: PR5: Persisted Session Handoff
+  - H2: Official 7.1 Preservation Matrix
+  - H2: PR Disposition
+  - H2: Effect on Stack Size
+
 ## specs/durable-core-missing-fact-owner-map.md
 
 - Route: /specs/durable-core-missing-fact-owner-map
@@ -8900,7 +8916,7 @@ Do not edit it by hand; run `pnpm docs:map:gen`.
   - H3: PR3/6: Execution authority, leases, and recovery classification
   - H3: PR4/6: Attention outbox and canonical owner adapters
   - H3: PR5/6: Agent, session, task, subagent, and restart front doors
-  - H3: PR6/6: Read-only operations surface and bounded owner controls
+  - H3: PR6/6: Read-only operations surface
   - H2: Independent Correctness PR
   - H2: Submission Rules
   - H2: Current Release Blockers

@@ -43,7 +43,7 @@ commit. Validation after a rebase must run on the exact reviewed head.
 | Restart recovery       | Recovery uses restart, owner, and lease evidence before classifying work; no blind replay                                                               |
 | Compaction             | Transcript compaction preserves unresolved operational facts and does not ack/supersede work                                                            |
 | CLI/Gateway inspection | Bounded obligation/attempt/uncertainty/lease reads are side-effect free and authorized                                                                  |
-| Owner controls         | Ack, supersede, resume, and uncertainty resolution are explicit, authorized, revision-guarded, evidence-retaining, and idempotent                       |
+| Owner controls         | The initial public surface has no mutations; any later control is explicit, authorized, revision-guarded, evidence-retaining, and idempotent            |
 | Crash matrix           | Faults after owner/correlation/wake/lease/attempt/dispatch/decision/ACK boundaries converge without silent loss or unsafe replay                        |
 | Privacy/retention      | Raw input is opt-in; bounded refs and explanatory terminal evidence survive compaction/retention                                                        |
 | Model independence     | Minimal deterministic fixtures prove the contracts without relying on prompt, profile, skill, model family, or context size                             |
@@ -153,8 +153,17 @@ all parent-wake names are absent.
 - Durable recovery reads those owners and records correlations; it does not
   duplicate their lifecycle.
 - A session-owned interrupted run resolves the current canonical session before
-  handoff, queues only a bounded uncertainty notice, and records that user
-  delivery is not proven.
+  handoff, persists one generation-fenced queue entry, queues only a bounded
+  uncertainty notice, and records that attached-session and user delivery are
+  not proven by queue acceptance.
+- Crash after persisted queue acceptance and before system-event admission
+  retains exactly one recoverable queue entry and does not terminally acknowledge
+  the obligation.
+- A session reset or `/new` generation mismatch suspends or retargets the old
+  notice according to explicit owner policy; it never silently injects old work
+  into the new generation.
+- Attached-session consumption is proven separately from queue recovery and from
+  external delivery.
 - Gateway timeout or connection loss under durable authority fails closed; the
   CLI does not start an embedded fallback turn that could repeat side effects.
 
@@ -182,9 +191,9 @@ For each reason:
 
 Legal transitions:
 
-- `pending -> delivered | acked | failed | suspended | superseded`
-- `delivered -> acked | failed | suspended | superseded`
-- `failed -> delivered | acked | suspended | superseded`
+- `pending -> handoff_accepted | acked | failed | suspended | superseded`
+- `handoff_accepted -> acked | failed | suspended | superseded`
+- `failed -> handoff_accepted | acked | suspended | superseded`
 - `suspended -> pending | acked | superseded`
 
 Only `acked` and `superseded` are terminal. Illegal transitions and terminal
@@ -349,22 +358,18 @@ Required operator-read methods:
 - `durable.wakes.list`
 - `durable.wakes.inspect`
 - `durable.uncertainty.list`
-- `durable.delivery-attempts.list`
+- `durable.deliveryAttempts.list`
 - existing coordination/execution inspection as retained
 
-Required owner/controller mutation methods may be added only with explicit auth
-proof. Tests cover method scope, protocol validation, disabled no-mutation,
-invalid-param no-mutation, bounded projections, and no worker side effects.
+The initial Gateway and CLI surface exposes no wake or uncertainty mutation.
+Tests cover method scope, protocol validation, disabled no-mutation,
+invalid-param no-mutation, bounded projections, no worker side effects, and an
+explicit scan proving no write method is advertised.
 
-Required additive mutations are:
-
-- `durable.wakes.acknowledge`
-- `durable.wakes.supersede`
-- `durable.wakes.resume`
-- `durable.uncertainty.resolve`
-
-Mutation tests prove caller identity, authorization source, source revision,
-idempotency key, owner validation, audit reference, and stale/terminal guards.
+Owner/controller mutations may be added only in a later PR with tests for caller
+identity, authorization source, source revision, idempotency key, owner
+validation, audit reference, stale/terminal guards, and delegation through the
+canonical owner API.
 
 Protocol schema/type/validator exports and method descriptors must be complete;
 dead schemas without handlers do not satisfy the contract.

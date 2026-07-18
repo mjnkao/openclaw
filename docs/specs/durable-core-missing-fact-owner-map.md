@@ -53,16 +53,16 @@ Every owner integration must also answer:
 
 ## Owner Adapter Inventory
 
-| Status      | Adapter source owner     | Attention facts                                                        | Dispatch boundary                                           | Decision boundary                                            |
-| ----------- | ------------------------ | ---------------------------------------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------ |
-| Implemented | `subagent_runs`          | Terminal, overdue/interrupted, pending/failed/suspended final delivery | Requester/controller session or stored report route         | Owner-validated retry/resume/abandon/ack; never mirror child |
-| Implemented | `task_runs`              | Overdue active work, terminal/lost work, actionable delivery failure   | Task requester/owner route through task notification owner  | Task lifecycle remains in task APIs                          |
-| Implemented | `session_store`          | Interrupted session-owned execution requiring owner attention          | Current canonical session system-event/heartbeat front door | Handoff only; no semantic replay or user-delivery claim      |
-| Reused      | `task_delivery_state`    | Requester origin and last notification revision                        | Read and mutated only through the task owner API            | No standalone durable adapter or lifecycle                   |
-| Planned     | `flow_runs`              | Blocked/overdue fan-in, unresolved wait, or owner-required decision    | Flow owner/controller route                                 | Flow continue/cancel/wait through flow APIs                  |
-| Planned     | `delivery_queue_entries` | Retry exhausted or outcome unknown after dispatch                      | Existing queue/channel transport owner                      | Queue reconcile/supersede; never infer external success      |
-| Planned     | restart and boot owners  | Interrupted work requiring classification or owner attention           | Affected work owner/report route                            | Reconcile/mark uncertainty; never semantic replay            |
-| Planned     | ACP owners               | Missing/stale ACP target binding or interrupted ACP-owned operation    | Authorized current ACP route                                | ACP owner control with current binding revision              |
+| Status      | Adapter source owner     | Attention facts                                                        | Dispatch boundary                                            | Decision boundary                                            |
+| ----------- | ------------------------ | ---------------------------------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| Implemented | `subagent_runs`          | Terminal, overdue/interrupted, pending/failed/suspended final delivery | Requester/controller session or stored report route          | Owner-validated retry/resume/abandon/ack; never mirror child |
+| Implemented | `task_runs`              | Overdue active work, terminal/lost work, actionable delivery failure   | Task requester/owner route through task notification owner   | Task lifecycle remains in task APIs                          |
+| Partial     | `session_store`          | Interrupted session-owned execution requiring owner attention          | Persisted generation-fenced session queue, then system event | In-memory handoff must be replaced; no user-delivery claim   |
+| Reused      | `task_delivery_state`    | Requester origin and last notification revision                        | Read and mutated only through the task owner API             | No standalone durable adapter or lifecycle                   |
+| Planned     | `flow_runs`              | Blocked/overdue fan-in, unresolved wait, or owner-required decision    | Flow owner/controller route                                  | Flow continue/cancel/wait through flow APIs                  |
+| Planned     | `delivery_queue_entries` | Retry exhausted or outcome unknown after dispatch                      | Existing queue/channel transport owner                       | Queue reconcile/supersede; never infer external success      |
+| Planned     | restart and boot owners  | Interrupted work requiring classification or owner attention           | Affected work owner/report route                             | Reconcile/mark uncertainty; never semantic replay            |
+| Planned     | ACP owners               | Missing/stale ACP target binding or interrupted ACP-owned operation    | Authorized current ACP route                                 | ACP owner control with current binding revision              |
 
 Adapters return generic bounded facts and evidence; model, provider, channel,
 profile, skill, and project names do not enter the core adapter contract.

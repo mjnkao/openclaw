@@ -233,15 +233,15 @@ The durable CLI and Gateway should be additive and source-oriented:
 - `durable uncertainty list`
 - `durable delivery-attempts list <wake-id>`
 - `durable leases list` or inclusion in obligation inspection
-- initial owner actions: acknowledge, supersede, resume, and uncertainty
-  resolution; add retry/abandon/general decisions only with a canonical owner
-  adapter and shared audit proof
+- no initial public owner mutations; add acknowledge, supersede, resume,
+  uncertainty resolution, retry, or abandon only with a canonical owner adapter
+  and shared audit proof
 
 Read methods require operator-read authority and must never claim, migrate,
-enqueue, acknowledge, or replay. Initial mutation methods require
-`operator.write`, server-derived actor identity, revision guards, and retained
-decision evidence. Broader owner/controller/admin actions require canonical
-owner authorization and shared audit integration.
+enqueue, acknowledge, or replay. A later mutation PR requires `operator.write`,
+server-derived actor identity, revision guards, retained decision evidence, and
+delegation through the canonical owner API. Broader owner/controller/admin
+actions require canonical owner authorization and shared audit integration.
 
 ## Required Runtime Flow
 
