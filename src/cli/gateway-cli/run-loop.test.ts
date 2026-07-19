@@ -186,6 +186,7 @@ vi.mock("../../infra/agent-events.js", () => ({
 
 vi.mock("../../config/runtime-snapshot.js", () => ({
   clearRuntimeConfigSnapshot: () => clearRuntimeConfigSnapshot(),
+  getRuntimeConfigSnapshot: () => undefined,
 }));
 
 vi.mock("../../tasks/task-registry.maintenance.js", () => ({
