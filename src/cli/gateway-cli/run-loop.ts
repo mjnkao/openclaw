@@ -2,6 +2,7 @@
 import { randomUUID } from "node:crypto";
 import net from "node:net";
 import { clearRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
+import { resolveDurableRuntimeMode } from "../../durable/config.js";
 import {
   captureGatewayRestartTraceHandoff,
   createGatewayRestartTraceHandoffEnv,
@@ -136,6 +137,7 @@ export async function runGatewayLoop(params: {
   const eagerLifecycleRuntime = await loadGatewayLifecycleRuntimeModule();
   let lock = await acquireGatewayLock({ port: params.lockPort });
   let server: Awaited<ReturnType<typeof startGatewayServer>> | null = null;
+  let stopDurableRecoveryWorker: (() => void) | null = null;
   let shuttingDown = false;
   let restartResolver: (() => void) | null = null;
   // The HTTP server can report ready before params.start returns its close handle.
@@ -665,6 +667,8 @@ export async function runGatewayLoop(params: {
 
         armCloseForceExitTimerForIndefiniteRestart();
         const closeDrainTimeoutMs = resolveRestartCloseDrainTimeoutMs();
+        stopDurableRecoveryWorker?.();
+        stopDurableRecoveryWorker = null;
         await server?.close({
           reason: isRestart ? "gateway restarting" : "gateway stopping",
           restartExpectedMs: isRestart ? 1500 : null,
@@ -925,9 +929,36 @@ export async function runGatewayLoop(params: {
       try {
         await params.beginBoot?.(startupStartedAt);
         server = await params.start({ startupStartedAt });
+        const durableStartup =
+          resolveDurableRuntimeMode() === "off" ? null : await import("../../durable/startup.js");
+        if (durableStartup) {
+          await durableStartup.maybeRecordDurableGatewayStartup({
+            processInstanceId,
+            startupStartedAt,
+            port: params.lockPort,
+          });
+          stopDurableRecoveryWorker?.();
+          stopDurableRecoveryWorker = await durableStartup.startDurableGatewayRecoveryWorker({
+            processInstanceId,
+          });
+        }
         startupFailedWithoutServerHandle = false;
         isFirstStart = false;
       } catch (err) {
+        stopDurableRecoveryWorker?.();
+        stopDurableRecoveryWorker = null;
+        if (server) {
+          const failedServer = server;
+          server = null;
+          try {
+            await failedServer.close({
+              reason: "gateway startup failed",
+              restartExpectedMs: null,
+            });
+          } catch (closeError) {
+            gatewayLog.error(`failed to close gateway after startup error: ${String(closeError)}`);
+          }
+        }
         params.completeBoot?.({
           outcome: "startup_failed",
           reason: formatErrorMessage(err).slice(0, 500),
@@ -939,7 +970,6 @@ export async function runGatewayLoop(params: {
         if (isFirstStart) {
           throw err;
         }
-        server = null;
         startupFailedWithoutServerHandle = true;
         startupFailedBeforeServerHandle = true;
         if (!pendingStartupRequest) {
@@ -966,6 +996,8 @@ export async function runGatewayLoop(params: {
       });
     }
   } finally {
+    stopDurableRecoveryWorker?.();
+    stopDurableRecoveryWorker = null;
     await releaseLockIfHeld();
     cleanupSignals();
   }
