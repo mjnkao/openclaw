@@ -86,6 +86,13 @@ import {
 import { hasProviderOwnedSession } from "../../config/sessions/entry-freshness.js";
 import { resolveMaintenanceConfigFromInput } from "../../config/sessions/store-maintenance.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import {
+  classifyDurableAgentTurnTerminal,
+  durableAgentTurnErrorPayload,
+  resolveDurableAgentTurnResultState,
+  startDurableAgentTurnLifecycle,
+  type DurableAgentTurnLifecycle,
+} from "../../durable/agent-turn.js";
 import { isAbortError } from "../../infra/abort-signal.js";
 import {
   assertAgentRunLifecycleGenerationCurrent,
@@ -157,6 +164,10 @@ import {
   parseMessageWithAttachments,
   resolveChatAttachmentMaxBytes,
 } from "../chat-attachments.js";
+import {
+  appendContextRefsToExtraSystemPrompt,
+  normalizeGatewayContextRefs,
+} from "../context-refs.js";
 import { resolveAssistantAvatarUrl } from "../control-ui-shared.js";
 import { ADMIN_SCOPE } from "../method-scopes.js";
 import {
@@ -977,6 +988,7 @@ function dispatchAgentRunFromGateway(params: {
   respond: GatewayRequestHandlerOptions["respond"];
   context: GatewayRequestHandlerOptions["context"];
   taskTrackingMode: Exclude<GatewayAgentTaskTrackingMode, "plugin_subagent">;
+  durableLifecycle?: DurableAgentTurnLifecycle;
 }) {
   const shouldTrackTask = params.taskTrackingMode === "cli";
   let taskTracked = false;
@@ -1009,15 +1021,43 @@ function dispatchAgentRunFromGateway(params: {
       );
     }
   }
-  void agentCommandFromIngress(params.ingressOpts, defaultRuntime, params.context.deps)
+  void agentCommandFromIngress(
+    params.ingressOpts,
+    defaultRuntime,
+    params.context.deps,
+    params.durableLifecycle,
+  )
     .then((result) => {
-      const aborted = result?.meta?.aborted === true;
+      const resultState = resolveDurableAgentTurnResultState({ result });
+      const aborted = resultState.aborted;
       const timeoutAttribution = readAgentRunTimeoutAttribution(result?.meta);
-      if (taskTracked) {
+      const yieldState = {
+        ...(resultState.yielded ? { yielded: true as const } : {}),
+        ...(resultState.livenessState ? { livenessState: resultState.livenessState } : {}),
+        ...(resultState.openclawProgressKind
+          ? { openclawProgressKind: resultState.openclawProgressKind }
+          : {}),
+      };
+      const durableTerminal = classifyDurableAgentTurnTerminal({
+        aborted,
+        failed: resultState.failed,
+        livenessState: yieldState.livenessState,
+      });
+      if (taskTracked && yieldState.yielded !== true) {
         tryFinalizeTrackedAgentTask({
           runId: params.runId,
-          status: aborted ? "timed_out" : "succeeded",
-          terminalSummary: aborted ? "aborted" : "completed",
+          status:
+            durableTerminal.status === "succeeded"
+              ? "succeeded"
+              : durableTerminal.status === "cancelled"
+                ? "timed_out"
+                : "failed",
+          terminalSummary:
+            durableTerminal.status === "succeeded"
+              ? "completed"
+              : durableTerminal.status === "cancelled"
+                ? "aborted"
+                : (yieldState.livenessState ?? "failed"),
           log: params.context.logGateway,
         });
       }
@@ -1032,6 +1072,7 @@ function dispatchAgentRunFromGateway(params: {
         ...(aborted && timeoutAttribution.providerStarted !== undefined
           ? { providerStarted: timeoutAttribution.providerStarted }
           : {}),
+        ...yieldState,
         result,
       };
       setGatewayDedupeEntries({
@@ -1083,6 +1124,7 @@ function dispatchAgentRunFromGateway(params: {
       });
     })
     .finally(() => {
+      params.durableLifecycle?.close();
       clearAgentRunContext(params.runId, params.ingressOpts.lifecycleGeneration);
       params.cleanupAbortController();
     });
@@ -1175,7 +1217,14 @@ export const agentHandlers: GatewayRequestHandlers = {
       inputProvenance?: InputProvenance;
       workspaceDir?: string;
       voiceWakeTrigger?: string;
+      contextRefs?: unknown;
     };
+    const contextRefsResult = normalizeGatewayContextRefs(request.contextRefs);
+    if (!contextRefsResult.ok) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, contextRefsResult.error));
+      return;
+    }
+    const contextRefs = contextRefsResult.refs;
     if (request.cwd && !path.isAbsolute(request.cwd)) {
       respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "cwd must be absolute"));
       return;
@@ -3171,6 +3220,16 @@ export const agentHandlers: GatewayRequestHandlers = {
         }
       }
 
+      const durableLifecycle = startDurableAgentTurnLifecycle({
+        runId,
+        message,
+        agentId: resolvedSessionKey === "global" ? activeSessionAgentId : agentId,
+        sessionKey: resolvedSessionKey,
+        channel: resolvedChannel,
+        transport: "gateway",
+        deliver,
+        contextRefs,
+      });
       const accepted = {
         runId,
         sessionKey: resolvedSessionKey,
@@ -3178,6 +3237,16 @@ export const agentHandlers: GatewayRequestHandlers = {
         status: "accepted" as const,
         acceptedAt: Date.now(),
       };
+      try {
+        durableLifecycle.markRunning({
+          acceptedAt: accepted.acceptedAt,
+          taskTrackingMode,
+          controlUiVisible: !suppressVisibleSessionEffects,
+        });
+      } catch (error) {
+        durableLifecycle.close();
+        throw error;
+      }
       const acceptedDedupePayload = {
         ...accepted,
         controlUiVisible: !suppressVisibleSessionEffects,
@@ -3229,6 +3298,16 @@ export const agentHandlers: GatewayRequestHandlers = {
               undefined,
               { runId },
             );
+            durableLifecycle.markTerminal({
+              status: "cancelled",
+              eventType: "agent.turn.cancelled",
+              payload: {
+                summary: "aborted",
+                stopReason,
+                timeoutPhase: "queue",
+                providerStarted: false,
+              },
+            });
             return;
           }
 
@@ -3332,7 +3411,10 @@ export const agentHandlers: GatewayRequestHandlers = {
               lane: request.lane,
               modelRun: request.modelRun === true,
               promptMode: request.promptMode,
-              extraSystemPrompt: request.extraSystemPrompt,
+              extraSystemPrompt: appendContextRefsToExtraSystemPrompt({
+                extraSystemPrompt: request.extraSystemPrompt,
+                refs: contextRefs,
+              }),
               bootstrapContextMode: request.bootstrapContextMode,
               bootstrapContextRunKind: request.bootstrapContextRunKind,
               acpTurnSource: request.acpTurnSource,
@@ -3388,6 +3470,7 @@ export const agentHandlers: GatewayRequestHandlers = {
             respond,
             context,
             taskTrackingMode: dispatchTaskTrackingMode,
+            durableLifecycle,
           });
           dispatched = true;
         } catch (err) {
@@ -3411,8 +3494,14 @@ export const agentHandlers: GatewayRequestHandlers = {
             runId,
             error: formatForLog(err),
           });
+          durableLifecycle.markTerminal({
+            status: "failed",
+            eventType: "agent.turn.failed",
+            payload: durableAgentTurnErrorPayload(err),
+          });
         } finally {
           if (!dispatched) {
+            durableLifecycle.close();
             cleanupAdmittedRun({ force: true });
           }
         }

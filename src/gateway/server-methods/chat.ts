@@ -169,6 +169,12 @@ import {
 } from "../chat-queued-turns.js";
 import { stripEnvelopeFromMessage } from "../chat-sanitize.js";
 import { augmentChatHistoryWithCliSessionImports } from "../cli-session-history.js";
+import {
+  appendContextRefsToMsgContext,
+  normalizeGatewayContextRefs,
+  recordDurableChatSendFrontdoorIntake,
+  recordDurableChatSendTerminal,
+} from "../context-refs.js";
 import { isSuppressedControlReplyText } from "../control-reply-text.js";
 import {
   isDashboardSessionTitleCandidate,
@@ -3733,10 +3739,17 @@ export const chatHandlers: GatewayRequestHandlers = {
       timeoutMs?: number;
       systemInputProvenance?: InputProvenance;
       systemProvenanceReceipt?: string;
+      contextRefs?: unknown;
       suppressCommandInterpretation?: boolean;
       expectedSessionRoutingContract?: string;
       idempotencyKey: string;
     };
+    const contextRefsResult = normalizeGatewayContextRefs(p.contextRefs);
+    if (!contextRefsResult.ok) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, contextRefsResult.error));
+      return;
+    }
+    const contextRefs = contextRefsResult.refs;
     const suppressCommandInterpretation = p.suppressCommandInterpretation === true;
     const explicitOriginResult = normalizeExplicitChatSendOrigin({
       originatingChannel: p.originatingChannel,
@@ -4011,6 +4024,7 @@ export const chatHandlers: GatewayRequestHandlers = {
       model: resolvedSessionModel.model,
       hasAttachments: normalizedAttachments.length > 0,
       hasExplicitOrigin: explicitOriginResult.value !== undefined,
+      hasContextRefs: contextRefs.length > 0,
       hasConnectedClient: client?.connect !== undefined,
     };
     const originatingRoute = resolveChatSendOriginatingRoute({
@@ -4386,6 +4400,16 @@ export const chatHandlers: GatewayRequestHandlers = {
         status: "started" as const,
         ...(serverTiming ? { serverTiming } : {}),
       };
+      recordDurableChatSendFrontdoorIntake({
+        runId: clientRunId,
+        sessionKey,
+        agentId: selectedAgent.agentId ?? agentId,
+        message: rawMessage,
+        attachmentCount: normalizedAttachments.length,
+        contextRefs,
+        log: context.logGateway,
+        now,
+      });
       emitDiagnosticsTimelineEvent(
         {
           type: "mark",
@@ -4457,6 +4481,7 @@ export const chatHandlers: GatewayRequestHandlers = {
         idempotencyKey: `${clientRunId}:user`,
         ...(hasGatewayAdminScope(client) ? { senderIsOwner: true } : {}),
         ...(systemInputProvenance ? { provenance: systemInputProvenance } : {}),
+        ...(contextRefs.length > 0 ? { contextRefs } : {}),
       };
       const userTurnInputPromise: Promise<UserTurnInput> = userTurnMediaPromise.then((media) => ({
         ...baseUserTurnInput,
@@ -4543,6 +4568,7 @@ export const chatHandlers: GatewayRequestHandlers = {
           : {}),
         GatewayClientScopes: client?.connect?.scopes ?? [],
       };
+      appendContextRefsToMsgContext(ctx, contextRefs);
       const isInternalTextSlashCommandTurn =
         ctx.Provider === INTERNAL_MESSAGE_CHANNEL && ctx.CommandSource === "text";
       if (mediaPathOffloadPaths.length > 0) {
@@ -5727,6 +5753,16 @@ export const chatHandlers: GatewayRequestHandlers = {
                     ...(returnedAgentError ? { error: returnedAgentError } : {}),
                   },
                 });
+                recordDurableChatSendTerminal({
+                  runId: clientRunId,
+                  sessionKey,
+                  agentId,
+                  status: shouldBroadcastAgentError ? "failed" : "succeeded",
+                  summary: shouldBroadcastAgentError
+                    ? (returnedAgentErrorMessage ?? "agent returned an error payload")
+                    : "completed",
+                  log: context.logGateway,
+                });
               }
             },
             {
@@ -5814,6 +5850,14 @@ export const chatHandlers: GatewayRequestHandlers = {
               error,
             },
           });
+          recordDurableChatSendTerminal({
+            runId: clientRunId,
+            sessionKey,
+            agentId,
+            status: activeRunAbort.controller.signal.aborted ? "cancelled" : "failed",
+            summary: errorMessage,
+            log: context.logGateway,
+          });
           broadcastChatError({
             context,
             runId: clientRunId,
@@ -5893,6 +5937,14 @@ export const chatHandlers: GatewayRequestHandlers = {
           payload,
           error,
         },
+      });
+      recordDurableChatSendTerminal({
+        runId: clientRunId,
+        sessionKey,
+        agentId,
+        status: "failed",
+        summary: String(err),
+        log: context.logGateway,
       });
       respond(false, payload, error, {
         runId: clientRunId,

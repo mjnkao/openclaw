@@ -381,6 +381,7 @@ export function scheduleSubagentOrphanRecovery(params?: { delayMs?: number; maxR
     ({ scheduleOrphanRecovery }) => {
       scheduleOrphanRecovery({
         getActiveRuns: () => subagentRuns,
+        persistActiveRuns: persistSubagentRunsOrThrow,
         delayMs: params?.delayMs,
         maxRetries: params?.maxRetries,
       });
@@ -1610,7 +1611,6 @@ export type SubagentCompletionDeliveryRequestResult =
   | { status: "accepted" | "already_running" | "delivered"; runId: string }
   | { status: "not_ready" | "not_required" | "suspended" | "missing"; runId: string };
 
-/** Owner-controlled delivery entry point used by durable attention reconciliation. */
 export function requestSubagentCompletionDelivery(
   runId: string,
 ): SubagentCompletionDeliveryRequestResult {
@@ -1638,6 +1638,11 @@ export function requestSubagentCompletionDelivery(
     persistSubagentRuns();
   }
   return { status: started ? "accepted" : "already_running", runId: normalizedRunId };
+}
+
+export async function requestSubagentProgressDelivery(runId: string) {
+  restoreSubagentRunsOnce();
+  return await subagentRunManager.requestSubagentProgressDelivery(runId);
 }
 
 export function resetSubagentRegistryForTests(opts?: { persist?: boolean }) {

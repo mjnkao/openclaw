@@ -1581,6 +1581,38 @@ describe("agentCliCommand", () => {
     });
   });
 
+  it("fails closed instead of using embedded fallback after a gateway close under durable authority", async () => {
+    await withTempStore(async () => {
+      const previousRuntime = process.env.OPENCLAW_DURABLE_RUNTIME;
+      const previousWorker = process.env.OPENCLAW_DURABLE_WORKER;
+      process.env.OPENCLAW_DURABLE_RUNTIME = "1";
+      process.env.OPENCLAW_DURABLE_WORKER = "1";
+      try {
+        callGateway.mockRejectedValue(createGatewayClosedError());
+
+        await expect(agentCliCommand({ message: "hi", to: "+1555" }, runtime)).rejects.toThrow(
+          "Gateway agent outcome is uncertain while durable authority is enabled",
+        );
+
+        expect(agentCommand).not.toHaveBeenCalled();
+        expect(
+          mockMessages(runtime.error).some((message) => message.includes("EMBEDDED FALLBACK")),
+        ).toBe(false);
+      } finally {
+        if (previousRuntime === undefined) {
+          delete process.env.OPENCLAW_DURABLE_RUNTIME;
+        } else {
+          process.env.OPENCLAW_DURABLE_RUNTIME = previousRuntime;
+        }
+        if (previousWorker === undefined) {
+          delete process.env.OPENCLAW_DURABLE_WORKER;
+        } else {
+          process.env.OPENCLAW_DURABLE_WORKER = previousWorker;
+        }
+      }
+    });
+  });
+
   it("retries transient normal gateway closes before embedded fallback", async () => {
     vi.useFakeTimers();
     try {
@@ -1703,6 +1735,38 @@ describe("agentCliCommand", () => {
         ),
       ).toBe(true);
       expect(runtime.log).toHaveBeenCalledWith("local");
+    });
+  });
+
+  it("fails closed instead of starting a fresh timeout session under durable authority", async () => {
+    await withTempStore(async () => {
+      const previousRuntime = process.env.OPENCLAW_DURABLE_RUNTIME;
+      const previousWorker = process.env.OPENCLAW_DURABLE_WORKER;
+      process.env.OPENCLAW_DURABLE_RUNTIME = "1";
+      process.env.OPENCLAW_DURABLE_WORKER = "1";
+      try {
+        callGateway.mockRejectedValue(createGatewayTimeoutError());
+
+        await expect(agentCliCommand({ message: "hi", to: "+1555" }, runtime)).rejects.toThrow(
+          "Gateway agent outcome is uncertain while durable authority is enabled",
+        );
+
+        expect(agentCommand).not.toHaveBeenCalled();
+        expect(
+          mockMessages(runtime.error).some((message) => message.includes("EMBEDDED FALLBACK")),
+        ).toBe(false);
+      } finally {
+        if (previousRuntime === undefined) {
+          delete process.env.OPENCLAW_DURABLE_RUNTIME;
+        } else {
+          process.env.OPENCLAW_DURABLE_RUNTIME = previousRuntime;
+        }
+        if (previousWorker === undefined) {
+          delete process.env.OPENCLAW_DURABLE_WORKER;
+        } else {
+          process.env.OPENCLAW_DURABLE_WORKER = previousWorker;
+        }
+      }
     });
   });
 

@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   applyAgentAutoCompactionGuard,
   applyAgentCompactionSettingsFromConfig,
+  applyManualCompactionCheckpointSettings,
   DEFAULT_AGENT_COMPACTION_RESERVE_TOKENS_FLOOR,
   isSilentOverflowProneModel,
   resolveEffectiveCompactionMode,
@@ -345,6 +346,45 @@ describe("applyAgentCompactionSettingsFromConfig", () => {
     const result = applyAgentCompactionSettingsFromConfig({ settingsManager });
 
     expect(result.compaction.reserveTokens).toBe(DEFAULT_AGENT_COMPACTION_RESERVE_TOKENS_FLOOR);
+  });
+});
+
+describe("applyManualCompactionCheckpointSettings", () => {
+  it("makes an unconfigured manual compaction a hard checkpoint", () => {
+    const settingsManager = SettingsManager.inMemory();
+    const applyOverrides = vi.spyOn(settingsManager, "applyOverrides");
+
+    expect(applyManualCompactionCheckpointSettings({ settingsManager, trigger: "manual" })).toBe(
+      true,
+    );
+    expect(applyOverrides).toHaveBeenCalledWith({
+      compaction: { keepRecentTokens: 1 },
+    });
+    expect(settingsManager.getCompactionKeepRecentTokens()).toBe(1);
+  });
+
+  it("preserves an explicitly configured retained tail", () => {
+    const settingsManager = SettingsManager.inMemory();
+    const applyOverrides = vi.spyOn(settingsManager, "applyOverrides");
+
+    expect(
+      applyManualCompactionCheckpointSettings({
+        settingsManager,
+        cfg: { agents: { defaults: { compaction: { keepRecentTokens: 12_000 } } } },
+        trigger: "manual",
+      }),
+    ).toBe(false);
+    expect(applyOverrides).not.toHaveBeenCalled();
+  });
+
+  it("does not change automatic budget or overflow compaction", () => {
+    const settingsManager = SettingsManager.inMemory();
+    const applyOverrides = vi.spyOn(settingsManager, "applyOverrides");
+
+    expect(applyManualCompactionCheckpointSettings({ settingsManager, trigger: "overflow" })).toBe(
+      false,
+    );
+    expect(applyOverrides).not.toHaveBeenCalled();
   });
 });
 

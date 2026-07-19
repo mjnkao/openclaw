@@ -6,6 +6,10 @@
 import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import { isSilentReplyText, SILENT_REPLY_TOKEN } from "../auto-reply/tokens.js";
 import type { cleanupBrowserSessionsForLifecycleEnd } from "../browser-lifecycle-cleanup.js";
+import {
+  recordDurableSubagentAnnounceDelivery,
+  recordDurableSubagentTerminal,
+} from "../durable/subagent.js";
 import type { callGateway as defaultCallGateway } from "../gateway/call.js";
 import { formatErrorMessage, readErrorName } from "../infra/errors.js";
 import { defaultRuntime } from "../runtime.js";
@@ -1312,6 +1316,14 @@ export function createSubagentRegistryLifecycleController(params: {
             return;
           }
           recordAnnounceDeliveryResult(entry, delivery);
+          recordDurableSubagentAnnounceDelivery({
+            runId: pendingPayload.childRunId,
+            childSessionKey: pendingPayload.childSessionKey,
+            delivered: delivery.delivered,
+            path: delivery.path,
+            error: delivery.delivered ? undefined : formatAnnounceDeliveryError(delivery),
+            reason: delivery.reason,
+          });
           if (delivery.delivered) {
             const deliveryState = ensureDeliveryState(entry);
             if (deliveryState.lastError !== undefined) {
@@ -1696,6 +1708,12 @@ export function createSubagentRegistryLifecycleController(params: {
     if (!isTerminalCallbackCurrent(completeParams.runId, entry, terminalGeneration)) {
       return;
     }
+    recordDurableSubagentTerminal({
+      runId: completeParams.runId,
+      childSessionKey: entry.childSessionKey,
+      status: entry.outcome?.status,
+      error: entry.outcome?.status === "error" ? entry.outcome.error : undefined,
+    });
     const retireSupersededSession = async (currentEntry: SubagentRunRecord) => {
       if (completionReason !== SUBAGENT_ENDED_REASON_KILLED) {
         await params.retireSupersededRun(completeParams.runId, currentEntry);

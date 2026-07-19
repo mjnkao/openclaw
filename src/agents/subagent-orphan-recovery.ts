@@ -19,6 +19,8 @@ import {
   updateSessionStore,
   type SessionEntry,
 } from "../config/sessions.js";
+import { isDurableAuthorityEnabled } from "../durable/config.js";
+import { recordDurableSubagentInterrupted } from "../durable/subagent.js";
 import { callGateway } from "../gateway/call.js";
 import { readSessionMessagesAsync } from "../gateway/session-transcript-readers.js";
 import { formatErrorMessage } from "../infra/errors.js";
@@ -187,16 +189,19 @@ async function resumeOrphanedSession(params: {
  */
 export async function recoverOrphanedSubagentSessions(params: {
   getActiveRuns: () => Map<string, SubagentRunRecord>;
+  persistActiveRuns?: () => void;
   /** Persisted across retries so already-resumed sessions are not resumed again. */
   resumedSessionKeys?: Set<string>;
 }): Promise<{
   recovered: number;
+  deferred: number;
   failed: number;
   skipped: number;
   failedRuns: Array<{ runId: string; childSessionKey: string; error?: string }>;
 }> {
   const result = {
     recovered: 0,
+    deferred: 0,
     failed: 0,
     skipped: 0,
     failedRuns: [] as Array<{ runId: string; childSessionKey: string; error?: string }>,
@@ -254,6 +259,28 @@ export async function recoverOrphanedSubagentSessions(params: {
 
         // Check if this session was aborted by the restart
         if (!entry.abortedLastRun) {
+          result.skipped++;
+          continue;
+        }
+
+        if (isDurableAuthorityEnabled()) {
+          runRecord.execution = {
+            ...runRecord.execution,
+            status: "interrupted",
+            interruptedAt: now,
+            interruptionReason: "gateway-restart",
+            endedAt: undefined,
+            outcome: undefined,
+          };
+          params.persistActiveRuns?.();
+          recordDurableSubagentInterrupted({
+            runId,
+            childSessionKey,
+            requesterSessionKey: runRecord.requesterSessionKey,
+            reason: "gateway-restart",
+            interruptedAt: now,
+          });
+          result.deferred++;
           result.skipped++;
           continue;
         }
@@ -393,9 +420,9 @@ export async function recoverOrphanedSubagentSessions(params: {
     }
   }
 
-  if (result.recovered > 0 || result.failed > 0) {
+  if (result.recovered > 0 || result.deferred > 0 || result.failed > 0) {
     log.info(
-      `orphan recovery complete: recovered=${result.recovered} failed=${result.failed} skipped=${result.skipped}`,
+      `orphan recovery complete: recovered=${result.recovered} deferred=${result.deferred} failed=${result.failed} skipped=${result.skipped}`,
     );
   }
 
@@ -426,6 +453,7 @@ function buildRecoveryFailureMessage(params: { attempts: number; error?: string 
  */
 export function scheduleOrphanRecovery(params: {
   getActiveRuns: () => Map<string, SubagentRunRecord>;
+  persistActiveRuns?: () => void;
   delayMs?: number;
   maxRetries?: number;
 }): void {
