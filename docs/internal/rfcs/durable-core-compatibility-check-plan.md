@@ -289,6 +289,6 @@ decisions about whether durable core is a shared subsystem at all.
 
 ## Related
 
-- [Durable Core Residual-Gap Architecture Proposal](/specs/durable-core-proposal-architecture)
+- [Durable Core Residual-Gap Architecture Proposal](/internal/rfcs/durable-core-architecture)
 - [Security and trust model](/gateway/security)
 - [Operator scopes](/gateway/operator-scopes)

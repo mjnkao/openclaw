@@ -17,6 +17,11 @@ ownership or stack order. It does not claim that runtime behavior, external
 delivery, replay, worker recovery, schema migration, or CLI/Gateway behavior is
 implemented by this document.
 
+Until maintainers sponsor the direction, this candidate intentionally remains
+under `docs/internal/`, outside public docs sync, generated route maps,
+navigation, and localization glossaries. Moving it into the publish tree is a
+separate maintainer approval step.
+
 ## Candidate General Durable Runtime RFC
 
 Durable core would be an owner-first, opt-in cross-owner contract layer beneath
@@ -445,6 +450,6 @@ lease expiry, permission changes, provider outages, or uncertain side effects.
 
 ## Related
 
-- [Durable Core Residual-Gap Compatibility Check Plan](/specs/durable-core-proposal-test-plan)
+- [Durable Core Residual-Gap Compatibility Check Plan](/internal/rfcs/durable-core-compatibility-check-plan)
 - [Security and trust model](/gateway/security)
 - [Operator scopes](/gateway/operator-scopes)
