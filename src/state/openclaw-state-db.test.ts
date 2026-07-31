@@ -18,6 +18,8 @@ import { loadTaskRegistryStateFromSqlite } from "../tasks/task-registry.store.sq
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import type { DB as OpenClawStateKyselyDatabase } from "./openclaw-state-db.generated.js";
 import {
+  acquireOpenClawStateDatabaseLease,
+  closeOpenClawStateDatabaseForPath,
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
@@ -888,6 +890,71 @@ describe("openclaw state database", () => {
     expect(second.db.isOpen).toBe(true);
     expect(openOpenClawStateDatabase({ path: firstPath })).toBe(first);
     expect(readSqliteNumberPragma(first.db, "user_version")).toBe(1);
+  });
+
+  it("defers a global close while a database lease is active", () => {
+    const databasePath = path.join(createTempStateDir(), "state", "leased.sqlite");
+    const lease = acquireOpenClawStateDatabaseLease({ path: databasePath });
+
+    closeOpenClawStateDatabaseForTest();
+
+    expect(lease.database.db.isOpen).toBe(true);
+    expect(openOpenClawStateDatabase({ path: databasePath })).toBe(lease.database);
+
+    lease.release();
+
+    expect(lease.database.db.isOpen).toBe(false);
+  });
+
+  it("defers a path close until the final lease is released", () => {
+    const databasePath = path.join(createTempStateDir(), "state", "leased.sqlite");
+    const firstLease = acquireOpenClawStateDatabaseLease({ path: databasePath });
+    const secondLease = acquireOpenClawStateDatabaseLease({ path: databasePath });
+
+    closeOpenClawStateDatabaseForPath({ path: databasePath });
+    firstLease.release();
+
+    expect(firstLease.database.db.isOpen).toBe(true);
+
+    secondLease.release();
+
+    expect(firstLease.database.db.isOpen).toBe(false);
+  });
+
+  it("opens a new database generation after a deferred close completes", () => {
+    const databasePath = path.join(createTempStateDir(), "state", "leased.sqlite");
+    const lease = acquireOpenClawStateDatabaseLease({ path: databasePath });
+    const firstGeneration = lease.database;
+
+    closeOpenClawStateDatabaseForPath({ path: databasePath });
+    lease.release();
+    const secondGeneration = openOpenClawStateDatabase({ path: databasePath });
+
+    expect(firstGeneration.db.isOpen).toBe(false);
+    expect(secondGeneration).not.toBe(firstGeneration);
+    expect(secondGeneration.db.isOpen).toBe(true);
+  });
+
+  it("does not let a stale lease release close a newer database generation", () => {
+    const databasePath = path.join(createTempStateDir(), "state", "leased.sqlite");
+    const staleLease = acquireOpenClawStateDatabaseLease({ path: databasePath });
+
+    closeOpenClawStateDatabaseForPath({ path: databasePath });
+    staleLease.database.db.close();
+
+    const currentLease = acquireOpenClawStateDatabaseLease({ path: databasePath });
+    const currentGeneration = currentLease.database;
+    closeOpenClawStateDatabaseForPath({ path: databasePath });
+
+    staleLease.release();
+    staleLease.release();
+
+    expect(currentGeneration.db.isOpen).toBe(true);
+    expect(openOpenClawStateDatabase({ path: databasePath })).toBe(currentGeneration);
+
+    currentLease.release();
+
+    expect(currentGeneration.db.isOpen).toBe(false);
   });
 
   it("keys explicit relative paths by resolved database pathname", () => {

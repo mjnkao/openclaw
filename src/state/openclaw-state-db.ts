@@ -50,12 +50,19 @@ export type OpenClawStateDatabaseOptions = {
   path?: string;
 };
 
+export type OpenClawStateDatabaseLease = {
+  database: OpenClawStateDatabase;
+  release: () => void;
+};
+
 export type OpenClawStateDatabaseSchemaMigration = {
   kind: "agent-databases-composite-primary-key";
   path: string;
 };
 
 const cachedDatabases = new Map<string, OpenClawStateDatabase>();
+const cachedDatabaseLeaseCounts = new Map<OpenClawStateDatabase, number>();
+const cachedDatabasesPendingClose = new Set<OpenClawStateDatabase>();
 
 type OpenClawStateMetadataDatabase = Pick<OpenClawStateKyselyDatabase, "schema_meta">;
 
@@ -988,9 +995,7 @@ export function openOpenClawStateDatabase(
   }
   if (cached) {
     // A closed handle can leave Kysely and WAL helpers cached; clear both before reopening.
-    cached.walMaintenance.close();
-    clearNodeSqliteKyselyCacheForDatabase(cached.db);
-    cachedDatabases.delete(pathname);
+    closeOpenClawStateDatabaseHandle(pathname, cached);
   }
 
   ensureOpenClawStatePermissions(pathname, env);
@@ -1017,7 +1022,49 @@ export function openOpenClawStateDatabase(
   ensureOpenClawStatePermissions(pathname, env);
   const database = { db, path: pathname, walMaintenance };
   cachedDatabases.set(pathname, database);
+  cachedDatabaseLeaseCounts.set(database, 0);
   return database;
+}
+
+function closeOpenClawStateDatabaseHandle(pathname: string, database: OpenClawStateDatabase): void {
+  database.walMaintenance.close();
+  clearNodeSqliteKyselyCacheForDatabase(database.db);
+  if (database.db.isOpen) {
+    database.db.close();
+  }
+  if (cachedDatabases.get(pathname) === database) {
+    cachedDatabases.delete(pathname);
+  }
+  cachedDatabaseLeaseCounts.delete(database);
+  cachedDatabasesPendingClose.delete(database);
+}
+
+export function acquireOpenClawStateDatabaseLease(
+  options: OpenClawStateDatabaseOptions,
+): OpenClawStateDatabaseLease {
+  const database = openOpenClawStateDatabase(options);
+  const pathname = database.path;
+  cachedDatabaseLeaseCounts.set(database, (cachedDatabaseLeaseCounts.get(database) ?? 0) + 1);
+  let released = false;
+
+  return {
+    database,
+    release: () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      const currentLeaseCount = cachedDatabaseLeaseCounts.get(database);
+      if (currentLeaseCount === undefined || currentLeaseCount === 0) {
+        return;
+      }
+      const leaseCount = currentLeaseCount - 1;
+      cachedDatabaseLeaseCounts.set(database, leaseCount);
+      if (leaseCount === 0 && cachedDatabasesPendingClose.has(database)) {
+        closeOpenClawStateDatabaseHandle(pathname, database);
+      }
+    },
+  };
 }
 
 /** Run a synchronous immediate transaction against the shared state database. */
@@ -1025,27 +1072,49 @@ export function runOpenClawStateWriteTransaction<T>(
   operation: (database: OpenClawStateDatabase) => T,
   options: OpenClawStateDatabaseOptions = {},
 ): T {
-  const database = openOpenClawStateDatabase(options);
-  const result = runSqliteImmediateTransactionSync(database.db, () => operation(database));
+  const lease = acquireOpenClawStateDatabaseLease(options);
   try {
-    ensureOpenClawStatePermissions(database.path, options.env ?? process.env);
-  } catch {
-    // The write already committed; permission hardening is best-effort here so
-    // callers never retry an operation that is durable in SQLite.
+    const result = runSqliteImmediateTransactionSync(lease.database.db, () =>
+      operation(lease.database),
+    );
+    try {
+      ensureOpenClawStatePermissions(lease.database.path, options.env ?? process.env);
+    } catch {
+      // The write already committed; permission hardening is best-effort here so
+      // callers never retry an operation that is durable in SQLite.
+    }
+    return result;
+  } finally {
+    lease.release();
   }
-  return result;
 }
 
 /** Close all cached shared state database handles. */
 export function closeOpenClawStateDatabase(): void {
-  for (const database of cachedDatabases.values()) {
-    database.walMaintenance.close();
-    clearNodeSqliteKyselyCacheForDatabase(database.db);
-    if (database.db.isOpen) {
-      database.db.close();
+  for (const [pathname, database] of cachedDatabases) {
+    if ((cachedDatabaseLeaseCounts.get(database) ?? 0) > 0) {
+      cachedDatabasesPendingClose.add(database);
+      continue;
     }
+    closeOpenClawStateDatabaseHandle(pathname, database);
   }
-  cachedDatabases.clear();
+}
+
+/** Close one cached shared state database handle resolved from the provided options. */
+export function closeOpenClawStateDatabaseForPath(
+  options: OpenClawStateDatabaseOptions = {},
+): void {
+  const pathname = resolveDatabasePath(options);
+  const database = cachedDatabases.get(pathname);
+  if (!database) {
+    return;
+  }
+  const leaseCount = cachedDatabaseLeaseCounts.get(database) ?? 0;
+  if (leaseCount > 0) {
+    cachedDatabasesPendingClose.add(database);
+    return;
+  }
+  closeOpenClawStateDatabaseHandle(pathname, database);
 }
 
 /** Test whether any cached shared state database handle is still open. */
