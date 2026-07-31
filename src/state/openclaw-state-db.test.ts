@@ -28,7 +28,7 @@ import {
   acquireOpenClawStateDatabaseLease,
   assertOpenClawStateDatabaseForMaintenance,
   clearOpenClawStateDatabaseOpenFailure,
-  closeOpenClawStateDatabaseForPath,
+  closeOpenClawStateDatabaseForPathForTest,
   closeOpenClawStateDatabaseForTest,
   detectOpenClawStateDatabaseSchemaMigrations,
   OPENCLAW_SQLITE_BUSY_TIMEOUT_MS,
@@ -4239,7 +4239,7 @@ INSERT INTO macos_port_guardian_records VALUES (4242, 18789, '/usr/bin/ssh', 're
     const firstLease = acquireOpenClawStateDatabaseLease({ path: databasePath });
     const secondLease = acquireOpenClawStateDatabaseLease({ path: databasePath });
 
-    closeOpenClawStateDatabaseForPath({ path: databasePath });
+    closeOpenClawStateDatabaseForPathForTest({ path: databasePath });
     firstLease.release();
 
     expect(firstLease.database.db.isOpen).toBe(true);
@@ -4254,7 +4254,7 @@ INSERT INTO macos_port_guardian_records VALUES (4242, 18789, '/usr/bin/ssh', 're
     const lease = acquireOpenClawStateDatabaseLease({ path: databasePath });
     const firstGeneration = lease.database;
 
-    closeOpenClawStateDatabaseForPath({ path: databasePath });
+    closeOpenClawStateDatabaseForPathForTest({ path: databasePath });
     lease.release();
     const secondGeneration = openOpenClawStateDatabase({ path: databasePath });
 
@@ -4267,12 +4267,12 @@ INSERT INTO macos_port_guardian_records VALUES (4242, 18789, '/usr/bin/ssh', 're
     const databasePath = path.join(createTempStateDir(), "state", "leased.sqlite");
     const staleLease = acquireOpenClawStateDatabaseLease({ path: databasePath });
 
-    closeOpenClawStateDatabaseForPath({ path: databasePath });
+    closeOpenClawStateDatabaseForPathForTest({ path: databasePath });
     staleLease.database.db.close();
 
     const currentLease = acquireOpenClawStateDatabaseLease({ path: databasePath });
     const currentGeneration = currentLease.database;
-    closeOpenClawStateDatabaseForPath({ path: databasePath });
+    closeOpenClawStateDatabaseForPathForTest({ path: databasePath });
 
     staleLease.release();
     staleLease.release();

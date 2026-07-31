@@ -46,6 +46,7 @@ import type {
   DurableRuntimeRefKind,
   DurableRuntimeRun,
   DurableRuntimeRunStatus,
+  DurableRuntimeReadStore,
   DurableRuntimeSignal,
   DurableRuntimeStep,
   DurableRuntimeStepClaim,
@@ -73,7 +74,6 @@ import type {
   SupersedeWakeObligationInput,
   SuspendWakeObligationInput,
   WakeObligationControlInput,
-  UpdateWakeObligationInput,
   UpdateWakeObligationProjectionInput,
   UpdateDurableRuntimeStepInput,
   UpdateDurableRuntimeTimerInput,
@@ -268,7 +268,7 @@ function stableJsonStringify(value: unknown): string {
     if (isRecordValue(entry)) {
       return Object.fromEntries(
         Object.entries(entry)
-          .toSorted(([left], [right]) => left.localeCompare(right))
+          .toSorted(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
           .map(([key, nested]) => [key, sortValue(nested)]),
       );
     }
@@ -296,6 +296,15 @@ function wakeProjectionMetadata(input: CreateWakeObligationInput): Record<string
     ...sanitizeWakeProjectionMetadata(input.metadata),
     ...(sourceRevision ? { sourceRevision } : {}),
   };
+}
+
+function wakeDeliveryMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
+  const {
+    diagnostics: _diagnostics,
+    evidence: _evidence,
+    ...deliveryMetadata
+  } = sanitizeWakeProjectionMetadata(metadata);
+  return deliveryMetadata;
 }
 
 function wakeProjectionHash(
@@ -551,6 +560,90 @@ function parseMetadata(value: string | null): Record<string, unknown> {
   return parseStoredJsonRecord(value, "Durable metadata") ?? {};
 }
 
+const DELIVERY_ATTEMPT_INTERNAL_METADATA_KEY = "__durableInternal";
+const DELIVERY_ATTEMPT_INTERNAL_METADATA_VERSION = 1;
+const LEGACY_CLAIMED_WAKE_SOURCE_REVISION_KEY = "claimedWakeSourceRevision";
+const LEGACY_CLAIMED_WAKE_OCCURRENCE_KEY = "claimedWakeOccurrenceKey";
+
+function wakeDeliveryRevision(row: WakeObligationRow): string {
+  const metadata = parseMetadata(row.metadata_json);
+  const reconciliation = isRecordValue(metadata.wakeReconciliation)
+    ? metadata.wakeReconciliation
+    : {};
+  const projection = {
+    sourceOwner: row.source_owner,
+    sourceRef: row.source_ref,
+    parentRunId: row.parent_run_id,
+    parentSessionKey: row.parent_session_key,
+    targetKind: row.target_kind,
+    targetRef: row.target_ref,
+    ownerKind: row.owner_kind,
+    ownerRef: row.owner_ref,
+    reportRouteRef: row.report_route_ref,
+    targetResolutionStatus: row.target_resolution_status,
+    targetResolutionReason: row.target_resolution_reason,
+    reason: row.reason,
+    factsRef: row.facts_ref,
+    sourceRunId: row.source_run_id,
+    sourceRevision: metadataText(metadata.sourceRevision) ?? null,
+    metadata: wakeDeliveryMetadata(metadata),
+    policy:
+      row.coalescing_mode === "none"
+        ? { mode: "none" }
+        : { mode: "while_unresolved", recurrence: row.recurrence_policy },
+    latestOccurrenceKey: metadataText(reconciliation.latestOccurrenceKey) ?? null,
+  };
+  const hash = createHash("sha256").update(stableJsonStringify(projection)).digest("hex");
+  return `v1:${hash}`;
+}
+
+function attemptMatchesClaimedWakeRevision(
+  attempt: DeliveryAttemptEvidenceRow,
+  wake: WakeObligationRow,
+): boolean {
+  return deliveryAttemptClaimedWakeRevision(attempt) === wakeDeliveryRevision(wake);
+}
+
+function deliveryAttemptClaimMetadata(
+  attempt: DeliveryAttemptEvidenceRow,
+): Record<string, unknown> | undefined {
+  const internal = parseMetadata(attempt.metadata_json)[DELIVERY_ATTEMPT_INTERNAL_METADATA_KEY];
+  return isRecordValue(internal) && internal.version === DELIVERY_ATTEMPT_INTERNAL_METADATA_VERSION
+    ? internal
+    : undefined;
+}
+
+function deliveryAttemptClaimedOptionalText(
+  attempt: DeliveryAttemptEvidenceRow,
+  key: "claimedFactsRef" | "claimedSourceRunId",
+): string | null | undefined {
+  const internal = deliveryAttemptClaimMetadata(attempt);
+  if (!internal || !Object.hasOwn(internal, key)) {
+    return undefined;
+  }
+  const value = internal[key];
+  return value === null ? null : metadataText(value);
+}
+
+function deliveryAttemptClaimedWakeRevision(
+  attempt: DeliveryAttemptEvidenceRow,
+): string | undefined {
+  return metadataText(deliveryAttemptClaimMetadata(attempt)?.claimedWakeDeliveryRevision);
+}
+
+function deliveryAttemptPublicMetadata(
+  metadataJson: string | null,
+): Record<string, unknown> | undefined {
+  const metadata = parseMetadata(metadataJson);
+  const {
+    [DELIVERY_ATTEMPT_INTERNAL_METADATA_KEY]: _internal,
+    [LEGACY_CLAIMED_WAKE_SOURCE_REVISION_KEY]: _legacySourceRevision,
+    [LEGACY_CLAIMED_WAKE_OCCURRENCE_KEY]: _legacyOccurrenceKey,
+    ...publicMetadata
+  } = metadata;
+  return Object.keys(publicMetadata).length > 0 ? publicMetadata : undefined;
+}
+
 function mergeMetadataJson(
   currentMetadataJson: string | null,
   patch: Record<string, unknown> | undefined,
@@ -578,6 +671,9 @@ function buildWakeControlDecision(
     ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
     ...(input.expectedSourceRevision
       ? { expectedSourceRevision: input.expectedSourceRevision }
+      : {}),
+    ...(input.expectedDeliveryRevision
+      ? { expectedDeliveryRevision: input.expectedDeliveryRevision }
       : {}),
     ...(input.evidence ? { evidence: input.evidence } : {}),
     ...(input.metadata ? { metadata: input.metadata } : {}),
@@ -617,16 +713,22 @@ function hasWakeControlEvidence(metadataJson: string | null): boolean {
   );
 }
 
-function matchesExpectedWakeSourceRevision(
+function matchesExpectedWakeRevision(
   current: WakeObligationRow,
-  expectedSourceRevision: string | undefined,
+  input: WakeObligationControlInput,
 ): boolean {
-  const expected = optionalText(expectedSourceRevision);
-  if (!expected) {
-    return true;
+  const expectedSourceRevision = optionalText(input.expectedSourceRevision);
+  if (
+    expectedSourceRevision &&
+    metadataText(parseMetadata(current.metadata_json).sourceRevision) !== expectedSourceRevision
+  ) {
+    return false;
   }
-  const metadata = parseMetadata(current.metadata_json);
-  return metadataText(metadata.sourceRevision) === expected;
+  const expectedDeliveryRevision = optionalText(input.expectedDeliveryRevision);
+  if (expectedDeliveryRevision) {
+    return wakeDeliveryRevision(current) === expectedDeliveryRevision;
+  }
+  return input.actorKind === "operator" || input.actorKind === "admin";
 }
 
 function isMatchingControlNoop(
@@ -805,6 +907,7 @@ function rowToWakeObligation(row: WakeObligationRow): WakeObligation {
     ...(row.facts_ref ? { factsRef: row.facts_ref } : {}),
     ...(row.source_run_id ? { sourceRunId: row.source_run_id } : {}),
     ...(sourceRevision ? { sourceRevision } : {}),
+    deliveryRevision: wakeDeliveryRevision(row),
     attemptCount: row.attempt_count,
     ...(row.last_attempt_at == null ? {} : { lastAttemptAt: row.last_attempt_at }),
     ...(row.next_attempt_at == null ? {} : { nextAttemptAt: row.next_attempt_at }),
@@ -843,6 +946,7 @@ function rowToUncertaintyFact(row: UncertaintyFactRow): UncertaintyFact {
 }
 
 function rowToDeliveryAttemptEvidence(row: DeliveryAttemptEvidenceRow): DeliveryAttemptEvidence {
+  const metadata = deliveryAttemptPublicMetadata(row.metadata_json);
   return {
     deliveryAttemptId: row.delivery_attempt_id,
     sourceOwner: row.source_owner,
@@ -870,7 +974,7 @@ function rowToDeliveryAttemptEvidence(row: DeliveryAttemptEvidenceRow): Delivery
       : { deliveryClaimExpiresAt: row.delivery_claim_expires_at }),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    ...(row.metadata_json ? { metadata: parseMetadata(row.metadata_json) } : {}),
+    ...(metadata ? { metadata } : {}),
   };
 }
 
@@ -915,17 +1019,6 @@ function count(db: DatabaseSync, query: SyncQuery<CountRow>): number {
 
 function normalizeQueryLimit(limit: number | undefined, fallback: number): number {
   return Math.max(1, Math.min(5000, Math.trunc(limit ?? fallback)));
-}
-
-const NO_SILENCE_DIAGNOSTIC_PATHS = {
-  overdue: "$.diagnostics.noSilenceSla.overdue",
-  slaMs: "$.diagnostics.noSilenceSla.slaMs",
-} as const;
-
-function noSilenceDiagnosticNumber(
-  jsonPath: (typeof NO_SILENCE_DIAGNOSTIC_PATHS)[keyof typeof NO_SILENCE_DIAGNOSTIC_PATHS],
-) {
-  return sql<number>`json_extract(metadata_json, ${jsonPath})`; // kysely-allow-raw: closed path union
 }
 
 function isTerminalRunStatus(status: DurableRuntimeRunStatus): boolean {
@@ -1040,11 +1133,24 @@ function isSameSqlValue(
   return left === right;
 }
 
-export function openDurableRuntimeSqliteStore(storeOptions?: {
+type OpenDurableRuntimeSqliteStoreOptions = {
   path?: string;
   env?: NodeJS.ProcessEnv;
   readOnly?: boolean;
-}): DurableRuntimeStore {
+};
+
+export function openDurableRuntimeSqliteStore(
+  storeOptions: OpenDurableRuntimeSqliteStoreOptions & { readOnly: true },
+): DurableRuntimeReadStore;
+export function openDurableRuntimeSqliteStore(
+  storeOptions?: OpenDurableRuntimeSqliteStoreOptions & { readOnly?: false },
+): DurableRuntimeStore;
+export function openDurableRuntimeSqliteStore(
+  storeOptions: OpenDurableRuntimeSqliteStoreOptions,
+): DurableRuntimeReadStore | DurableRuntimeStore;
+export function openDurableRuntimeSqliteStore(
+  storeOptions?: OpenDurableRuntimeSqliteStoreOptions,
+): DurableRuntimeStore {
   const env = storeOptions?.env ?? process.env;
   const pathname = path.resolve(storeOptions?.path ?? resolveOpenClawStateSqlitePath(env));
   const readOnly = storeOptions?.readOnly === true;
@@ -1070,6 +1176,82 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
     }
   })();
   let closed = false;
+
+  const finalizeUnknownDeliveryAttempt = (input: {
+    wake: WakeObligationRow;
+    attempt: DeliveryAttemptEvidenceRow;
+    now: number;
+    error: string;
+    evidence?: Record<string, unknown>;
+  }): boolean => {
+    const changed = executeQuery(
+      db,
+      durableDb
+        .updateTable("delivery_attempt_evidence")
+        .set({
+          status: "unknown",
+          evidence_json: serializeJson(input.evidence),
+          error_message: input.error,
+          unknown_at: input.now,
+          delivery_claimed_by: null,
+          delivery_claim_expires_at: null,
+          updated_at: input.now,
+        })
+        .where("delivery_attempt_id", "=", input.attempt.delivery_attempt_id)
+        .where("status", "=", "attempted"),
+    );
+    if (changed === 0) {
+      return false;
+    }
+    executeQuery(
+      db,
+      durableDb
+        .deleteFrom("state_leases")
+        .where("scope", "=", WAKE_OBLIGATION_LEASE_SCOPE)
+        .where("lease_key", "=", input.wake.wake_id),
+    );
+    const claimedFactsRef = deliveryAttemptClaimedOptionalText(input.attempt, "claimedFactsRef");
+    const claimedSourceRunId = deliveryAttemptClaimedOptionalText(
+      input.attempt,
+      "claimedSourceRunId",
+    );
+    const claimedWakeDeliveryRevision = deliveryAttemptClaimedWakeRevision(input.attempt);
+    executeQuery(
+      db,
+      durableDb
+        .insertInto("uncertainty_facts")
+        .values({
+          fact_id: `uncertainty_${randomUUID()}`,
+          source_owner: input.wake.source_owner,
+          source_ref: input.wake.source_ref,
+          kind: "delivery_unknown",
+          source_run_id:
+            claimedSourceRunId === undefined ? input.wake.source_run_id : claimedSourceRunId,
+          step_id: null,
+          event_id: null,
+          ref_id: input.attempt.delivery_attempt_id,
+          facts_ref: claimedFactsRef === undefined ? input.wake.facts_ref : claimedFactsRef,
+          dedupe_key: `wake-dispatch-unknown:${input.attempt.delivery_attempt_id}`,
+          facts_json: serializeJson({
+            wakeId: input.wake.wake_id,
+            deliveryAttemptId: input.attempt.delivery_attempt_id,
+            ...(claimedWakeDeliveryRevision ? { claimedWakeDeliveryRevision } : {}),
+            ...(claimedFactsRef !== undefined ? { claimedFactsRef } : {}),
+            ...(claimedSourceRunId !== undefined ? { claimedSourceRunId } : {}),
+            ...(input.evidence ? { evidence: input.evidence } : {}),
+          }),
+          status: "open",
+          resolution_kind: null,
+          resolution_ref: null,
+          resolved_at: null,
+          created_at: input.now,
+          updated_at: input.now,
+          metadata_json: null,
+        })
+        .onConflict((conflict) => conflict.doNothing()),
+    );
+    return true;
+  };
 
   const prepareWakeCandidate = (
     input: CreateWakeObligationInput,
@@ -1537,19 +1719,49 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
     });
   };
 
-  const updateWakeObligationRecord = (
-    input: Omit<UpdateWakeObligationInput, "status"> & {
-      status?: WakeObligationStatus;
-      finalizeActiveClaim?: {
-        attemptStatus: Extract<DeliveryAttemptEvidenceStatus, "handoff_accepted" | "superseded">;
-        error?: string;
-      };
-    },
-  ): WakeObligation | undefined => {
+  const updateWakeObligationRecord = (input: {
+    wakeId: string;
+    status?: WakeObligationStatus;
+    attemptCount?: number;
+    lastAttemptAt?: number | null;
+    nextAttemptAt?: number | null;
+    ackedAt?: number | null;
+    failedReason?: string | null;
+    metadata?: Record<string, unknown>;
+    factsRef?: string;
+    now?: number;
+    finalizeActiveClaim?: {
+      attemptStatus: Extract<
+        DeliveryAttemptEvidenceStatus,
+        "handoff_accepted" | "superseded" | "unknown"
+      >;
+      error?: string;
+    };
+  }): WakeObligation | undefined => {
     const now = input.now ?? Date.now();
     return runSqliteImmediateTransactionSync(db, () => {
-      const finalizeActiveClaim = () => {
+      const finalizeActiveClaim = (current: WakeObligationRow) => {
         if (!input.finalizeActiveClaim) {
+          return;
+        }
+        if (input.finalizeActiveClaim.attemptStatus === "unknown") {
+          const activeAttempts = queryRows<DeliveryAttemptEvidenceRow>(
+            db,
+            durableDb
+              .selectFrom("delivery_attempt_evidence")
+              .selectAll()
+              .where("wake_id", "=", input.wakeId)
+              .where("status", "=", "attempted")
+              .where("delivery_claimed_by", "is not", null),
+          );
+          for (const attempt of activeAttempts) {
+            finalizeUnknownDeliveryAttempt({
+              wake: current,
+              attempt,
+              now,
+              error: input.finalizeActiveClaim.error ?? "wake dispatch outcome is unknown",
+            });
+          }
           return;
         }
         executeQuery(
@@ -1616,7 +1828,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         if (!isNoOp) {
           return undefined;
         }
-        finalizeActiveClaim();
+        finalizeActiveClaim(current);
         return rowToWakeObligation(current);
       }
       if (!isAllowedWakeStatusTransition(current.status, nextStatus)) {
@@ -1639,7 +1851,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
           })
           .where("wake_id", "=", input.wakeId),
       );
-      finalizeActiveClaim();
+      finalizeActiveClaim(current);
       const row = queryFirst<WakeObligationRow>(
         db,
         durableDb.selectFrom("wake_obligations").selectAll().where("wake_id", "=", input.wakeId),
@@ -1676,6 +1888,10 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       status: "suspended",
       failedReason: input.failedReason,
       metadata: sanitizeWakeProjectionMetadata(input.metadata),
+      finalizeActiveClaim: {
+        attemptStatus: "unknown",
+        error: "wake suspended while dispatch outcome was unresolved",
+      },
       now: input.now,
     });
   };
@@ -1756,14 +1972,18 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
     return rows.map(rowToWakeObligation);
   };
 
-  const listOwnerWakeObligationsForReconciliationRecords = (input: {
-    sourceOwner: string;
+  const listUnresolvedWakeObligationsPageRecords = (input: {
+    sourceOwner?: string;
+    createdAtOrBefore?: number;
     afterWakeId?: string;
     limit: number;
   }): WakeObligation[] => {
     const sourceOwner = optionalText(input.sourceOwner);
-    if (!sourceOwner) {
-      throw new Error("Owner wake reconciliation requires a sourceOwner");
+    if (
+      input.createdAtOrBefore !== undefined &&
+      (!Number.isSafeInteger(input.createdAtOrBefore) || input.createdAtOrBefore < 0)
+    ) {
+      throw new Error("Unresolved wake createdAtOrBefore must be a non-negative safe integer");
     }
     const afterWakeId = optionalText(input.afterWakeId);
     const rows = queryRows<WakeObligationRow>(
@@ -1771,34 +1991,12 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       durableDb
         .selectFrom("wake_obligations")
         .selectAll()
-        .where("source_owner", "=", sourceOwner)
-        .where("status", "in", ["pending", "handoff_accepted", "failed", "suspended"])
-        .$if(Boolean(afterWakeId), (qb) => qb.where("wake_id", ">", afterWakeId!))
-        .orderBy("wake_id", "asc")
-        .limit(normalizeQueryLimit(input.limit, 500)),
-    );
-    return rows.map(rowToWakeObligation);
-  };
-
-  const listWakeObligationsNeedingNoSilenceDiagnosticRecords = (input: {
-    overdueBefore: number;
-    slaMs: number;
-    limit?: number;
-  }): WakeObligation[] => {
-    const rows = queryRows<WakeObligationRow>(
-      db,
-      durableDb
-        .selectFrom("wake_obligations")
-        .selectAll()
-        .where("status", "not in", ["acked", "superseded"])
-        .where("created_at", "<=", input.overdueBefore)
-        .where((eb) =>
-          eb.or([
-            eb(noSilenceDiagnosticNumber(NO_SILENCE_DIAGNOSTIC_PATHS.overdue), "is not", 1),
-            eb(noSilenceDiagnosticNumber(NO_SILENCE_DIAGNOSTIC_PATHS.slaMs), "is not", input.slaMs),
-          ]),
+        .where(unresolvedWakeStatusSql())
+        .$if(Boolean(sourceOwner), (qb) => qb.where("source_owner", "=", sourceOwner!))
+        .$if(input.createdAtOrBefore !== undefined, (qb) =>
+          qb.where("created_at", "<=", input.createdAtOrBefore!),
         )
-        .orderBy("created_at", "asc")
+        .$if(Boolean(afterWakeId), (qb) => qb.where("wake_id", ">", afterWakeId!))
         .orderBy("wake_id", "asc")
         .limit(normalizeQueryLimit(input.limit, 500)),
     );
@@ -1843,7 +2041,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       if (!current) {
         return undefined;
       }
-      if (!matchesExpectedWakeSourceRevision(current, input.expectedSourceRevision)) {
+      if (!matchesExpectedWakeRevision(current, input)) {
         return undefined;
       }
       if (current.status === "acked") {
@@ -1881,7 +2079,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       if (!current) {
         return undefined;
       }
-      if (!matchesExpectedWakeSourceRevision(current, input.expectedSourceRevision)) {
+      if (!matchesExpectedWakeRevision(current, input)) {
         return undefined;
       }
       if (current.status === "superseded") {
@@ -1929,7 +2127,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       if (!current) {
         return undefined;
       }
-      if (!matchesExpectedWakeSourceRevision(current, input.expectedSourceRevision)) {
+      if (!matchesExpectedWakeRevision(current, input)) {
         return undefined;
       }
       if (current.status !== "suspended") {
@@ -1961,7 +2159,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       if (!current) {
         return undefined;
       }
-      if (!matchesExpectedWakeSourceRevision(current, input.expectedSourceRevision)) {
+      if (!matchesExpectedWakeRevision(current, input)) {
         return undefined;
       }
       if (isTerminalWakeStatus(current.status)) {
@@ -2093,20 +2291,12 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         candidate: WakeObligationRow,
         ambiguousAttempt: DeliveryAttemptEvidenceRow,
       ) => {
-        executeQuery(
-          db,
-          durableDb
-            .updateTable("delivery_attempt_evidence")
-            .set({
-              status: "unknown",
-              error_message: "wake dispatch claim expired before durable completion evidence",
-              unknown_at: now,
-              delivery_claimed_by: null,
-              delivery_claim_expires_at: null,
-              updated_at: now,
-            })
-            .where("delivery_attempt_id", "=", ambiguousAttempt.delivery_attempt_id),
-        );
+        finalizeUnknownDeliveryAttempt({
+          wake: candidate,
+          attempt: ambiguousAttempt,
+          now,
+          error: "wake dispatch claim expired before durable completion evidence",
+        });
         executeQuery(
           db,
           durableDb
@@ -2117,42 +2307,6 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
               updated_at: now,
             })
             .where("wake_id", "=", candidate.wake_id),
-        );
-        executeQuery(
-          db,
-          durableDb
-            .deleteFrom("state_leases")
-            .where("scope", "=", WAKE_OBLIGATION_LEASE_SCOPE)
-            .where("lease_key", "=", candidate.wake_id),
-        );
-        executeQuery(
-          db,
-          durableDb
-            .insertInto("uncertainty_facts")
-            .values({
-              fact_id: `uncertainty_${randomUUID()}`,
-              source_owner: candidate.source_owner,
-              source_ref: candidate.source_ref,
-              kind: "delivery_unknown",
-              source_run_id: candidate.source_run_id,
-              step_id: null,
-              event_id: null,
-              ref_id: ambiguousAttempt.delivery_attempt_id,
-              facts_ref: candidate.facts_ref,
-              dedupe_key: `wake-dispatch-unknown:${ambiguousAttempt.delivery_attempt_id}`,
-              facts_json: serializeJson({
-                wakeId: candidate.wake_id,
-                deliveryAttemptId: ambiguousAttempt.delivery_attempt_id,
-              }),
-              status: "open",
-              resolution_kind: null,
-              resolution_ref: null,
-              resolved_at: null,
-              created_at: now,
-              updated_at: now,
-              metadata_json: null,
-            })
-            .onConflict((conflict) => conflict.doNothing()),
         );
       };
 
@@ -2279,7 +2433,14 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
             delivery_claim_expires_at: claimExpiresAt,
             created_at: now,
             updated_at: now,
-            metadata_json: null,
+            metadata_json: serializeJson({
+              [DELIVERY_ATTEMPT_INTERNAL_METADATA_KEY]: {
+                version: DELIVERY_ATTEMPT_INTERNAL_METADATA_VERSION,
+                claimedWakeDeliveryRevision: wakeDeliveryRevision(candidate),
+                claimedFactsRef: candidate.facts_ref,
+                claimedSourceRunId: candidate.source_run_id,
+              },
+            }),
           }),
         );
         executeQuery(
@@ -2353,35 +2514,52 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
           .selectAll()
           .where("delivery_attempt_id", "=", input.deliveryAttemptId)
           .where("wake_id", "=", input.wakeId)
+          .where("status", "=", "attempted")
           .where("delivery_claimed_by", "=", input.claimToken),
       );
       const wake = queryFirst<WakeObligationRow>(
         db,
         durableDb.selectFrom("wake_obligations").selectAll().where("wake_id", "=", input.wakeId),
       );
-      if (!current || !wake || isTerminalWakeStatus(wake.status)) {
+      if (
+        !current ||
+        current.delivery_claim_expires_at === null ||
+        current.delivery_claim_expires_at <= now ||
+        !wake ||
+        isTerminalWakeStatus(wake.status) ||
+        !attemptMatchesClaimedWakeRevision(current, wake)
+      ) {
         return undefined;
       }
       if (!isAllowedWakeStatusTransition(wake.status, input.wakeStatus)) {
         return undefined;
       }
-      executeQuery(
-        db,
-        durableDb
-          .updateTable("delivery_attempt_evidence")
-          .set({
-            status: input.attemptStatus,
-            evidence_json: serializeJson(input.evidence),
-            error_message: optionalText(input.error),
-            handoff_accepted_at: input.attemptStatus === "handoff_accepted" ? now : null,
-            failed_at: input.attemptStatus === "failed" ? now : null,
-            unknown_at: input.attemptStatus === "unknown" ? now : null,
-            delivery_claimed_by: null,
-            delivery_claim_expires_at: null,
-            updated_at: now,
-          })
-          .where("delivery_attempt_id", "=", input.deliveryAttemptId),
-      );
+      if (input.attemptStatus === "unknown") {
+        finalizeUnknownDeliveryAttempt({
+          wake,
+          attempt: current,
+          now,
+          error: optionalText(input.error) ?? "wake dispatch outcome is unknown",
+          evidence: input.evidence,
+        });
+      } else {
+        executeQuery(
+          db,
+          durableDb
+            .updateTable("delivery_attempt_evidence")
+            .set({
+              status: input.attemptStatus,
+              evidence_json: serializeJson(input.evidence),
+              error_message: optionalText(input.error),
+              handoff_accepted_at: input.attemptStatus === "handoff_accepted" ? now : null,
+              failed_at: input.attemptStatus === "failed" ? now : null,
+              delivery_claimed_by: null,
+              delivery_claim_expires_at: null,
+              updated_at: now,
+            })
+            .where("delivery_attempt_id", "=", input.deliveryAttemptId),
+        );
+      }
       executeQuery(
         db,
         durableDb
@@ -2397,40 +2575,14 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
           })
           .where("wake_id", "=", input.wakeId),
       );
-      executeQuery(
-        db,
-        durableDb
-          .deleteFrom("state_leases")
-          .where("scope", "=", WAKE_OBLIGATION_LEASE_SCOPE)
-          .where("lease_key", "=", input.wakeId)
-          .where("owner", "=", input.claimToken),
-      );
-      if (input.attemptStatus === "unknown") {
+      if (input.attemptStatus !== "unknown") {
         executeQuery(
           db,
           durableDb
-            .insertInto("uncertainty_facts")
-            .values({
-              fact_id: `uncertainty_${randomUUID()}`,
-              source_owner: wake.source_owner,
-              source_ref: wake.source_ref,
-              kind: "delivery_unknown",
-              source_run_id: wake.source_run_id,
-              step_id: null,
-              event_id: null,
-              ref_id: input.deliveryAttemptId,
-              facts_ref: wake.facts_ref,
-              dedupe_key: `wake-dispatch-unknown:${input.deliveryAttemptId}`,
-              facts_json: serializeJson(input.evidence),
-              status: "open",
-              resolution_kind: null,
-              resolution_ref: null,
-              resolved_at: null,
-              created_at: now,
-              updated_at: now,
-              metadata_json: null,
-            })
-            .onConflict((conflict) => conflict.doNothing()),
+            .deleteFrom("state_leases")
+            .where("scope", "=", WAKE_OBLIGATION_LEASE_SCOPE)
+            .where("lease_key", "=", input.wakeId)
+            .where("owner", "=", input.claimToken),
         );
       }
       const row = queryFirst<DeliveryAttemptEvidenceRow>(
@@ -2458,17 +2610,19 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
           .where("lease_key", "=", input.wakeId)
           .where("owner", "=", input.claimToken),
       );
-      const attempt = queryFirst<{
-        delivery_claim_expires_at: number | bigint | null;
-      }>(
+      const attempt = queryFirst<DeliveryAttemptEvidenceRow>(
         db,
         durableDb
           .selectFrom("delivery_attempt_evidence")
-          .select("delivery_claim_expires_at")
+          .selectAll()
           .where("delivery_attempt_id", "=", input.deliveryAttemptId)
           .where("wake_id", "=", input.wakeId)
           .where("status", "=", "attempted")
           .where("delivery_claimed_by", "=", input.claimToken),
+      );
+      const wake = queryFirst<WakeObligationRow>(
+        db,
+        durableDb.selectFrom("wake_obligations").selectAll().where("wake_id", "=", input.wakeId),
       );
       if (
         !lease ||
@@ -2476,7 +2630,9 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         Number(lease.expires_at) <= now ||
         !attempt ||
         attempt.delivery_claim_expires_at === null ||
-        Number(attempt.delivery_claim_expires_at) <= now
+        attempt.delivery_claim_expires_at <= now ||
+        !wake ||
+        !attemptMatchesClaimedWakeRevision(attempt, wake)
       ) {
         return false;
       }
@@ -3672,6 +3828,32 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       });
     },
 
+    fireDueTimer(input: { timerId: string; now?: number }): DurableRuntimeTimer | undefined {
+      const now = input.now ?? Date.now();
+      return runSqliteImmediateTransactionSync(db, () => {
+        const updated = executeQuery(
+          db,
+          durableDb
+            .updateTable("durable_timer_obligations")
+            .set({ status: "fired", fired_at: now })
+            .where("timer_id", "=", input.timerId)
+            .where("status", "=", "pending")
+            .where("due_at", "<=", now),
+        );
+        if (updated !== 1) {
+          return undefined;
+        }
+        const row = queryFirst<DurableRuntimeTimerRow>(
+          db,
+          durableDb
+            .selectFrom("durable_timer_obligations")
+            .selectAll()
+            .where("timer_id", "=", input.timerId),
+        );
+        return row ? rowToTimer(row) : undefined;
+      });
+    },
+
     listTimers(runtimeRunId?: string): DurableRuntimeTimer[] {
       const rows = queryRows<DurableRuntimeTimerRow>(
         db,
@@ -3800,6 +3982,34 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       });
     },
 
+    consumePendingSignal(input: {
+      signalId: string;
+      now?: number;
+    }): DurableRuntimeSignal | undefined {
+      const now = input.now ?? Date.now();
+      return runSqliteImmediateTransactionSync(db, () => {
+        const updated = executeQuery(
+          db,
+          durableDb
+            .updateTable("durable_signal_evidence")
+            .set({ consumed_at: now })
+            .where("signal_id", "=", input.signalId)
+            .where("consumed_at", "is", null),
+        );
+        if (updated !== 1) {
+          return undefined;
+        }
+        const row = queryFirst<DurableRuntimeSignalRow>(
+          db,
+          durableDb
+            .selectFrom("durable_signal_evidence")
+            .selectAll()
+            .where("signal_id", "=", input.signalId),
+        );
+        return row ? rowToSignal(row) : undefined;
+      });
+    },
+
     listPendingSignals(options?: { limit?: number }): DurableRuntimeSignal[] {
       const limit = Math.max(1, Math.min(5000, Math.trunc(options?.limit ?? 500)));
       const rows = queryRows<DurableRuntimeSignalRow>(
@@ -3897,20 +4107,13 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
       return listWakeObligationRecords(options);
     },
 
-    listOwnerWakeObligationsForReconciliation(input: {
-      sourceOwner: string;
+    listUnresolvedWakeObligationsPage(input: {
+      sourceOwner?: string;
+      createdAtOrBefore?: number;
       afterWakeId?: string;
       limit: number;
     }): WakeObligation[] {
-      return listOwnerWakeObligationsForReconciliationRecords(input);
-    },
-
-    listWakeObligationsNeedingNoSilenceDiagnostic(input: {
-      overdueBefore: number;
-      slaMs: number;
-      limit?: number;
-    }): WakeObligation[] {
-      return listWakeObligationsNeedingNoSilenceDiagnosticRecords(input);
+      return listUnresolvedWakeObligationsPageRecords(input);
     },
 
     recordUncertaintyFact(input: CreateUncertaintyFactInput): UncertaintyFact {
@@ -4096,7 +4299,7 @@ export function openDurableRuntimeSqliteStore(storeOptions?: {
         durableDb
           .selectFrom("wake_obligations")
           .selectAll()
-          .where("status", "in", ["pending", "handoff_accepted", "failed", "suspended"])
+          .where(unresolvedWakeStatusSql())
           .orderBy("updated_at", "desc")
           .orderBy("wake_id", "desc")
           .limit(limit),
