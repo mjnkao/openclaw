@@ -124,30 +124,47 @@ new shared record, prefer the existing owner.
 
 ### Candidate Residual Schema
 
-The candidate schema is deliberately limited to ten residual tables. Existing
+The candidate schema is deliberately limited to eleven residual tables. Existing
 owner tables remain canonical and are not mirrored.
 
-| Table                       | Residual fact                                                       |
-| --------------------------- | ------------------------------------------------------------------- |
-| `durable_execution_records` | Generic accepted execution evidence when no lifecycle owner exists  |
-| `durable_event_evidence`    | Ordered execution and recovery evidence                             |
-| `durable_execution_steps`   | Generic step, checkpoint, claim, and replay boundaries              |
-| `durable_payload_refs`      | Bounded input, output, error, checkpoint, and artifact references   |
-| `durable_run_correlations`  | Parent/child and cross-owner correlations                           |
-| `durable_timer_obligations` | Generic retry, deadline, and sleep obligations                      |
-| `durable_signal_evidence`   | Generic approval, input, and callback evidence                      |
-| `wake_obligations`          | Source-backed owner or report-route attention obligations           |
-| `delivery_attempt_evidence` | Per-attempt handoff and delivery proof with explicit proof boundary |
-| `uncertainty_facts`         | Ambiguous outcomes and facts requiring reconciliation or a decision |
+| Table                         | Residual fact                                                        |
+| ----------------------------- | -------------------------------------------------------------------- |
+| `durable_execution_records`   | Generic accepted execution evidence when no lifecycle owner exists   |
+| `durable_event_evidence`      | Ordered execution and recovery evidence                              |
+| `durable_execution_steps`     | Generic step, checkpoint, claim, and replay boundaries               |
+| `durable_payload_refs`        | Bounded input, output, error, checkpoint, and artifact references    |
+| `durable_run_correlations`    | Parent/child and cross-owner correlations                            |
+| `durable_timer_obligations`   | Generic retry, deadline, and sleep obligations                       |
+| `durable_signal_evidence`     | Generic approval, input, and callback evidence                       |
+| `wake_obligations`            | Source-backed owner or report-route attention obligations            |
+| `wake_obligation_occurrences` | Immutable occurrence identity and projection-hash evidence for wakes |
+| `delivery_attempt_evidence`   | Per-attempt handoff and delivery proof with explicit proof boundary  |
+| `uncertainty_facts`           | Ambiguous outcomes and facts requiring reconciliation or a decision  |
 
-No separate dedupe ledger, result mailbox, mode table, decision table, cleanup
+No generic dedupe ledger, result mailbox, mode table, decision table, cleanup
 table, or migration ledger is justified while unique keys, existing owner
 state, `state_leases`, audit evidence, and `schema_meta` can provide those
-contracts. The ten tables would live in the existing shared SQLite file and be
-installed only when durable runtime is explicitly enabled. Disabled startup and
-read paths must neither open or migrate durable storage nor eagerly load the
-recovery and owner-adapter module graph. A future durable schema version must be
-rejected by read-only preflight before any DDL, metadata update, or backfill.
+contracts. `wake_obligation_occurrences` is narrower: a coalesced wake can
+represent multiple immutable occurrence identities while its current projection
+and lifecycle continue to advance. Keeping only the latest occurrence key on
+that mutable wake would lose exact-retry evidence and could allow a delayed
+retry to restore an older projection. The occurrence table therefore retains
+only the canonical source scope, a bounded opaque key, its canonical wake
+reference, a projection hash, and observation time; it does not own a second
+wake lifecycle or store raw payloads. Source scoping prevents one owner from
+claiming or probing another owner's occurrence namespace.
+
+The eleven tables would live in the existing shared SQLite file and be installed
+only when durable runtime is explicitly enabled. Disabled startup and read
+paths must neither open or migrate durable storage nor eagerly load the recovery
+and owner-adapter module graph. Read-only preflight must reject a future shared
+state schema version, a partial durable table set, or an incompatible durable
+table, constraint, foreign-key, or required-index shape before any DDL, metadata
+update, or backfill. Writable initialization may install the complete absent
+schema and repair a missing canonical index transactionally; it must not guess
+how to migrate an incompatible table shape or create a separate schema authority.
+Every durable schema evolution must advance the canonical shared-state schema
+version; an unknown durable table under the current version is incompatible.
 
 A new column or table is justified only when a proven residual fact cannot be
 represented by these bounded records without taking lifecycle ownership away
@@ -296,6 +313,9 @@ The proposal does not promise:
 
 - Terminal run and step states are immutable except retention or compaction
   metadata.
+- Run and step status, recovery state, and completion time advance as one
+  coherent lifecycle tuple. Incoherent or externally corrupted rows are never
+  runnable or claimable.
 - Claimed records include an owner and expiry; stale owner writes are rejected.
 - Recovery mutations append events and do not silently rewrite history.
 - Disabled durable paths do not create databases, tables, or migrations and do
@@ -313,12 +333,25 @@ The proposal does not promise:
 - Reconciliation uses finite pages, absolute deadlines, bounded evidence, and
   inspectable continuation; truncation and timeout are not owner absence.
 - Occurrence dedupe identity and logical attention identity remain separate.
+- Wake occurrence identities are immutable. An exact retry with the same
+  normalized projection and policy is a no-op even after later coalescing or a
+  terminal transition; reuse with different content is an inspectable conflict.
+- Incomplete duplicate scans and conflicting evidence are non-mutating outcomes
+  rather than permission to choose a convenient winner.
+- Parent run and parent session targets are part of logical wake identity; a
+  later occurrence cannot retarget an existing wake by changing either field.
+- A logical wake's recurrence policy is immutable. A policy change requires a
+  distinct owner-authorized lifecycle instead of a delayed occurrence silently
+  changing post-terminal behavior.
 - Queue acceptance, owner consumption, transport acknowledgement, and user
   presentation remain distinct proof boundaries.
 - Public Gateway inspection is authorized before durable state access; Gateway
   and trusted local CLI inspection are side-effect-free, read-only, and
   projected through explicit field and result bounds.
 - Unknown metadata is preserved across supported read/modify/write paths.
+- Retention may redact old payloads only after retaining event identity,
+  ordering, idempotency keys, and canonical payload hashes. Compaction never
+  turns a prior exact replay into a new event.
 - Bounded previews are the default. Full input capture is opt-in, hashes are not
   anonymization, and metadata can be sensitive.
 
@@ -333,12 +366,19 @@ payload refs, delivery-attempt evidence, no-handler diagnostics, and
 acknowledgement state. It must not decide whether the owner should retry,
 resume, abandon, wait, ask the user, or create new work.
 
-Wake reconciliation distinguishes the canonical source revision, an occurrence
-dedupe key, and a logical attention identity. Exact retries of one occurrence
-are idempotent. For a declared coalesced attention policy, different occurrence
-keys for the same normalized source, reason, target, owner, and report route
-update at most one unresolved logical obligation. A changed owner, target,
-route, or reason is a different obligation.
+Wake reconciliation distinguishes the canonical source revision, an immutable
+occurrence key, its normalized projection hash, and a logical attention
+identity. Exact occurrence lookup precedes logical-identity enumeration. A retry
+whose key and projection hash match is a no-op and never rolls a newer wake
+projection back. Reusing a key with different normalized content or policy is an
+idempotency conflict and persists no candidate state.
+
+For a declared coalesced attention policy, different occurrence keys for the
+same normalized source, reason, target, owner, and report route update at most
+one unresolved logical obligation. Recurrence policy is declared explicitly
+when the logical wake is created and cannot be changed by a later occurrence;
+generic storage must never infer policy from a reason name. A changed parent run,
+parent session, owner, target, route, or reason is a different obligation.
 
 `pending`, `handoff_accepted`, `failed`, and `suspended` remain unresolved for
 that cardinality rule. Queue acceptance cannot authorize a second wake. After
@@ -346,7 +386,23 @@ that cardinality rule. Queue acceptance cannot authorize a second wake. After
 declared recurrence policy permits it and the canonical owner still requires
 attention. Reconciliation is atomic at the store boundary and keeps append-only
 attempt evidence; generic storage must not infer recurrence policy from reason
-names.
+names. Logical duplicate enumeration is bounded. A truncated scan, or more than
+one candidate carrying claim, attempt, or non-pending evidence, returns a
+non-mutating conflict for owner inspection. Safe pending duplicates with no such
+evidence may be repaired atomically by retaining one canonical wake, reparenting
+their occurrence evidence, and preserving the superseded wake history.
+
+Retry eligibility is persisted as an explicit next-attempt time and indexed with
+wake status. Dispatch selection filters backoff and active leases before taking
+a bounded candidate window, so an older delayed prefix cannot hide later
+runnable attention. An expired in-flight dispatch becomes suspended uncertainty
+before any new attempt; `suspended` remains visible as unresolved owner work.
+
+Inspection returns a bounded recent occurrence-key window plus count/truncation
+metadata. Exact lookup by occurrence key remains available without requiring an
+unbounded enumeration, but requires the canonical source owner and source ref.
+Occurrence keys are opaque source-scoped references, not payloads or
+authorization principals, and projection hashes are not anonymization.
 
 The candidate wake lifecycle uses `pending`, `handoff_accepted`, `acked`,
 `failed`, `suspended`, and `superseded`. The term `handoff_accepted` names only

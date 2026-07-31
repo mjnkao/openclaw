@@ -88,30 +88,31 @@ claim no runtime delivery behavior.
 
 ## Candidate Compatibility Matrix
 
-| Area                          | Candidate compatibility check                                                                                                                                  | Proof surface                     |
-| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
-| Disabled-path no mutation     | CLI and Gateway inspection reject before SQLite, WAL, SHM, migration, durable tables, worker startup, or eager recovery/owner-graph loading                    | Durable config and inspection     |
-| Runtime opt-in                | Durable recording and inspection are inert by default and enabled only by explicit durable runtime config                                                      | Runtime config                    |
-| Worker separate gate          | Runtime-enabled startup records only allowed facts; worker recovery requires separate worker opt-in                                                            | Worker recovery                   |
-| Future schema fail-closed     | Newer durable schema versions fail before DDL, ALTER, backfill, worker mutation, or projection mutation                                                        | Schema migration                  |
-| Terminal immutability         | Terminal runs and steps reject lifecycle rewrites; `acked` and `superseded` wakes reject further transitions except explicit retention metadata                | Storage mutation guards           |
-| Canonical owner binding       | One immutable startup-selected binding owns each role and scope; durable records never become an active-run owner or authorize fallback to a competing adapter | Owner composition                 |
-| Per-operation capability gate | Recovery actions run only when the selected binding proves every required live capability; optional capability loss does not disable healthy sibling work      | Recovery authorization            |
-| Live capability isolation     | Host objects, approval leases, callbacks, process handles, credentials, and cancellation controllers never enter durable metadata or inspection                | Capability and privacy            |
-| Authorization ordering        | Caller authorization and canonical session/route resolution complete before durable admission; admission completes before dispatch or accepted framing         | Intake and security               |
-| Bounded owner enumeration     | Owner APIs enforce page/item/byte/time bounds and opaque continuation; timeout or truncation remains unresolved and cannot become authoritative absence        | Owner adapters                    |
-| Identity propagation          | Chat, `agent.run`, user turns, embedded-agent yield, task completion, and status notices carry stable durable refs                                             | Runtime identity                  |
-| ACP/manual-spawn preservation | ACP manual-spawn child turn task suppression remains intact; plugin-subagent precedence and CLI fallback still work                                            | Agent and subagent compatibility  |
-| Pairing QR regression         | Webchat pairing QR display remains visible without persisting sensitive QR content                                                                             | Adjacent channel compatibility    |
-| Wake target resolution        | Owner, parent, peer, scheduled, Task Flow, external route, missing, unauthorized, and ambiguous targets resolve or fail closed with inspectable evidence       | Wake routing                      |
-| Wake queue contract           | Wake records keep source revision, occurrence dedupe, logical attention, recurrence policy, attempt evidence, and lifecycle state as distinct fields           | Wake storage                      |
-| Replay authority              | Automatic replay is denied unless operation registry, input material, idempotency, side-effect class, dedupe/CAS or reconciliation, and retention gates pass   | Replay safeguards                 |
-| CLI/Gateway inspection        | `operator.read` gates `durable.*` before state opens; gateway-wide reads use bounded/redacted allowlists. Agent/session refs do not grant access               | Gateway auth and projections      |
-| Owner decision boundary       | Initial public API remains read-only; any later decision validates caller authority and source revision, calls the owner API, and records audit evidence       | Owner adapters and audit          |
-| Worker no-handler behavior    | Empty registry and no-handler rows fail closed and do not mark unknown side effects as handled                                                                 | Worker recovery                   |
-| Claim/lease recovery          | Expired claimed run/step rows are inspectable and reclaim only when eligible, with SQLite row evidence                                                         | Lease recovery                    |
-| Internal session handoff      | Resolved session targets move through internal delivery handoff with durable evidence and no external transport claim                                          | Internal delivery                 |
-| External delivery             | Only claimed if the implementation includes external transport delivery and direct proof                                                                       | External transport implementation |
+| Area                           | Candidate compatibility check                                                                                                                                                                                  | Proof surface                     |
+| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
+| Disabled-path no mutation      | CLI and Gateway inspection reject before SQLite, WAL, SHM, migration, durable tables, worker startup, or eager recovery/owner-graph loading                                                                    | Durable config and inspection     |
+| Runtime opt-in                 | Durable recording and inspection are inert by default and enabled only by explicit durable runtime config                                                                                                      | Runtime config                    |
+| Worker separate gate           | Runtime-enabled startup records only allowed facts; worker recovery requires separate worker opt-in                                                                                                            | Worker recovery                   |
+| Schema compatibility preflight | Future shared-state versions and partial or incompatible durable tables, constraints, foreign keys, or indexes fail before mutation; only absent schema install and missing canonical-index repair are allowed | Schema initialization             |
+| Terminal immutability          | Terminal runs and steps reject lifecycle rewrites; `acked` and `superseded` wakes reject further transitions except explicit retention metadata                                                                | Storage mutation guards           |
+| Canonical owner binding        | One immutable startup-selected binding owns each role and scope; durable records never become an active-run owner or authorize fallback to a competing adapter                                                 | Owner composition                 |
+| Per-operation capability gate  | Recovery actions run only when the selected binding proves every required live capability; optional capability loss does not disable healthy sibling work                                                      | Recovery authorization            |
+| Live capability isolation      | Host objects, approval leases, callbacks, process handles, credentials, and cancellation controllers never enter durable metadata or inspection                                                                | Capability and privacy            |
+| Authorization ordering         | Caller authorization and canonical session/route resolution complete before durable admission; admission completes before dispatch or accepted framing                                                         | Intake and security               |
+| Bounded owner enumeration      | Owner APIs enforce page/item/byte/time bounds and opaque continuation; timeout or truncation remains unresolved and cannot become authoritative absence                                                        | Owner adapters                    |
+| Identity propagation           | Chat, `agent.run`, user turns, embedded-agent yield, task completion, and status notices carry stable durable refs                                                                                             | Runtime identity                  |
+| ACP/manual-spawn preservation  | ACP manual-spawn child turn task suppression remains intact; plugin-subagent precedence and CLI fallback still work                                                                                            | Agent and subagent compatibility  |
+| Pairing QR regression          | Webchat pairing QR display remains visible without persisting sensitive QR content                                                                                                                             | Adjacent channel compatibility    |
+| Wake target resolution         | Owner, parent, peer, scheduled, Task Flow, external route, missing, unauthorized, and ambiguous targets resolve or fail closed with inspectable evidence                                                       | Wake routing                      |
+| Wake queue contract            | Wake records keep source revision, immutable occurrence evidence, logical attention, typed coalescing/recurrence policy, attempt evidence, and lifecycle state as distinct fields                              | Wake storage                      |
+| Replay authority               | Automatic replay is denied unless operation registry, input material, idempotency, side-effect class, dedupe/CAS or reconciliation, and retention gates pass                                                   | Replay safeguards                 |
+| CLI/Gateway inspection         | `operator.read` gates `durable.*` before state opens; gateway-wide reads use bounded/redacted allowlists. Agent/session refs do not grant access                                                               | Gateway auth and projections      |
+| Owner decision boundary        | Initial public API remains read-only; any later decision validates caller authority and source revision, calls the owner API, and records audit evidence                                                       | Owner adapters and audit          |
+| Worker no-handler behavior     | Empty registry and no-handler rows fail closed and do not mark unknown side effects as handled                                                                                                                 | Worker recovery                   |
+| Claim/lease recovery           | Expired claimed run/step rows are inspectable and reclaim only when eligible, with SQLite row evidence                                                                                                         | Lease recovery                    |
+| Lifecycle tuple coherence      | Terminal status, terminal recovery, and completion time advance together; malformed nonterminal completed rows are neither open nor claimable                                                                  | Run and step storage              |
+| Internal session handoff       | Resolved session targets move through internal delivery handoff with durable evidence and no external transport claim                                                                                          | Internal delivery                 |
+| External delivery              | Only claimed if the implementation includes external transport delivery and direct proof                                                                                                                       | External transport implementation |
 
 ### Exact Schema Gate
 
@@ -123,12 +124,19 @@ tables:
 `durable_execution_steps`, `durable_payload_refs`,
 `durable_run_correlations`, `durable_timer_obligations`,
 `durable_signal_evidence`, `wake_obligations`,
+`wake_obligation_occurrences`,
 `delivery_attempt_evidence`, and `uncertainty_facts`.
 
 Tests should reject accidental lifecycle mirrors and extra ledgers, preserve
 pre-existing official 7.1 owner rows, prove rollback across the shared-state
-transaction boundary, and fail closed on future durable schema metadata before
-any mutation.
+transaction boundary, and fail closed on future shared-state versions or
+partial/incompatible durable table, constraint, foreign-key, and required-index
+shape before any mutation. Writable preflight may install the whole absent
+schema or repair a missing canonical index transactionally, but must reject an
+incompatible table shape. Read-only preflight must never repair it. An unknown
+durable table under the current shared-state version is also incompatible,
+because every supported durable schema evolution must advance that canonical
+version.
 
 ### Acceptance Front-Door Gate
 
@@ -174,15 +182,39 @@ fenced terminal settlement across success, failure, and cancellation races.
 - Assert exact retries of one occurrence are idempotent while different
   occurrence keys for one declared coalesced logical identity retain at most one
   unresolved wake and append attempt evidence.
+- Reuse the same opaque occurrence key under two distinct canonical source
+  scopes; assert each source resolves only its own mapping and cross-source
+  lookup does not enumerate the other source's wake.
+- Retry an older occurrence after a newer occurrence has advanced the canonical
+  projection and after the wake becomes terminal; assert exact lookup returns
+  the canonical wake without restoring the older projection.
+- Reuse one occurrence key with changed normalized content or policy; assert an
+  idempotency conflict and no candidate mutation. Submit a new occurrence with a
+  different recurrence policy for the same logical wake; assert a non-mutating
+  policy conflict.
 - Advance the source revision while a wake is pending, handoff-accepted, failed,
   and suspended; assert the active projection advances without creating a
   parallel obligation.
 - Change owner, target, report route, or reason; assert it becomes a distinct
   logical identity and obsolete unresolved routing is superseded.
+- Change parent run or parent session; assert the new occurrence cannot retarget
+  or coalesce into the prior logical wake.
 - After acknowledgement or supersession, assert a later occurrence creates a
   new wake only when the declared recurrence policy permits it.
 - Race two store connections across an occurrence boundary and assert atomic
   reconciliation preserves the one-unresolved-obligation rule.
+- Seed safe pending duplicates and assert atomic canonical repair reparents all
+  occurrence evidence while preserving superseded history. Add claim, attempt,
+  or non-pending evidence to multiple duplicates and assert reconciliation
+  refuses to choose a winner.
+- Exceed the logical duplicate scan bound and assert an inspectable truncated
+  conflict with no candidate write. Exceed the occurrence-key inspection window
+  and assert bounded keys plus count/truncation metadata while exact lookup for
+  an older key still succeeds.
+- Seed more than one dispatch page of older wakes in backoff or under active
+  leases followed by a runnable wake; assert eligibility filtering selects the
+  runnable wake without fixed-prefix starvation. Expire an ambiguous dispatch;
+  assert it becomes suspended uncertainty and remains in unresolved inspection.
 
 ### Canonical Owner And Bounded Recovery
 
@@ -235,8 +267,11 @@ fenced terminal settlement across success, failure, and cancellation races.
   omits them.
 - Enforce request, result, nested-collection, and serialization limits, plus any
   declared pagination bounds, before returning inspection data.
-- Compaction preserves enough run, step, event, ref, claim, and recovery data to
-  explain state while removing or truncating sensitive previews.
+- Compaction preserves run, step, event, ref, claim, and recovery identity while
+  removing or truncating sensitive previews. Redacting an event payload must
+  retain its sequence, event id, idempotency key, and canonical payload hash so
+  an exact replay remains idempotent, a changed replay still conflicts, and a
+  repeated compaction pass is a no-op.
 
 ## Claim And Live-Proof Policy
 
