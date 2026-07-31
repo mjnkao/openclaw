@@ -114,6 +114,10 @@ const rawSqliteAllowPathGroups = {
     "src/config/sessions/session-accessor.sqlite-entry-cache.ts",
   ],
   "device pairing cache connection-local validity counters": ["src/infra/device-pairing-store.ts"],
+  "durable runtime schema bootstrap, store lifecycle, leases, and transactional operations": [
+    "src/durable/schema.ts",
+    "src/durable/sqlite-store.ts",
+  ],
   "Kysely-backed stores that own a DatabaseSync boundary": [
     "src/acp/event-ledger.ts",
     "src/state/user-profiles.ts",

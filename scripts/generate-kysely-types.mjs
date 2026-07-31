@@ -16,6 +16,13 @@ const SCHEMAS = [
     schema: "src/state/openclaw-agent-schema.sql",
     outFile: "src/state/openclaw-agent-db.generated.d.ts",
   },
+  {
+    name: "durable-runtime",
+    schema: "src/durable/schema.sql",
+    outFile: "src/durable/schema-db.generated.d.ts",
+    schemaOutFile: "src/durable/schema.generated.ts",
+    schemaExport: "DURABLE_RUNTIME_SCHEMA_SQL",
+  },
 ];
 
 const verify = process.argv.includes("--verify") || process.argv.includes("--check");
