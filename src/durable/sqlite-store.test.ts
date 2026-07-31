@@ -3,12 +3,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
 import { resolveSqliteDatabaseFilePaths } from "../infra/sqlite-files.js";
 import {
   OPENCLAW_STATE_SCHEMA_VERSION,
-  closeOpenClawStateDatabaseForPath,
+  closeOpenClawStateDatabaseForPathForTest,
   openOpenClawStateDatabase,
 } from "../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
@@ -213,7 +213,7 @@ describe("durable runtime sqlite store", () => {
         state.db.prepare("SELECT 1 FROM schema_meta WHERE meta_key = ?").get("durable_runtime"),
       ).toBeUndefined();
     } finally {
-      closeOpenClawStateDatabaseForPath({ path: dbPath });
+      closeOpenClawStateDatabaseForPathForTest({ path: dbPath });
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -228,7 +228,7 @@ describe("durable runtime sqlite store", () => {
       expect(ownerDatabase.db.isOpen).toBe(true);
       expect(openOpenClawStateDatabase({ path: dbPath })).toBe(ownerDatabase);
     } finally {
-      closeOpenClawStateDatabaseForPath({ path: dbPath });
+      closeOpenClawStateDatabaseForPathForTest({ path: dbPath });
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -318,7 +318,7 @@ describe("durable runtime sqlite store", () => {
         .all(...DURABLE_TABLES);
       expect(runtimeTables).toEqual([]);
     } finally {
-      closeOpenClawStateDatabaseForPath({ path: dbPath });
+      closeOpenClawStateDatabaseForPathForTest({ path: dbPath });
     }
 
     const store = openDurableRuntimeSqliteStore({ path: dbPath });
@@ -699,6 +699,25 @@ describe("durable runtime sqlite store", () => {
         status: "fired",
         firedAt: 201,
       });
+      const atomicallyFiredTimer = store.createTimer({
+        runtimeRunId: parent.runtimeRunId,
+        stepId: step.stepId,
+        timerType: "sleep",
+        dueAt: 205,
+        now: 202,
+      });
+      expect(
+        store.fireDueTimer({ timerId: atomicallyFiredTimer.timerId, now: 204 }),
+      ).toBeUndefined();
+      expect(store.fireDueTimer({ timerId: atomicallyFiredTimer.timerId, now: 205 })).toMatchObject(
+        {
+          status: "fired",
+          firedAt: 205,
+        },
+      );
+      expect(
+        store.fireDueTimer({ timerId: atomicallyFiredTimer.timerId, now: 206 }),
+      ).toBeUndefined();
 
       const signal = store.createSignal({
         runtimeRunId: parent.runtimeRunId,
@@ -721,7 +740,20 @@ describe("durable runtime sqlite store", () => {
         signalId: signal.signalId,
         consumedAt: 220,
       });
-      expect(store.listSignals(parent.runtimeRunId)).toHaveLength(1);
+      const atomicallyConsumedSignal = store.createSignal({
+        runtimeRunId: parent.runtimeRunId,
+        stepId: step.stepId,
+        signalType: "resume",
+        idempotencyKey: "signal-atomic-consume",
+        now: 221,
+      });
+      expect(
+        store.consumePendingSignal({ signalId: atomicallyConsumedSignal.signalId, now: 222 }),
+      ).toMatchObject({ signalId: atomicallyConsumedSignal.signalId, consumedAt: 222 });
+      expect(
+        store.consumePendingSignal({ signalId: atomicallyConsumedSignal.signalId, now: 223 }),
+      ).toBeUndefined();
+      expect(store.listSignals(parent.runtimeRunId)).toHaveLength(2);
       expect(store.listPendingSignals()).toEqual([]);
       expect(store.getStats()).toMatchObject({ runs: 2, steps: 2 });
     } finally {
@@ -1360,6 +1392,8 @@ describe("durable runtime sqlite store", () => {
         now: 110,
       });
       expect(claim?.wake.wakeId).toBe(first.wake.wakeId);
+      expect(claim?.wake.deliveryRevision).toMatch(/^v1:[a-f0-9]{64}$/);
+      expect(claim?.deliveryAttempt).not.toHaveProperty("metadata");
       firstStore.completeWakeObligationClaim({
         wakeId: claim!.wake.wakeId,
         deliveryAttemptId: claim!.deliveryAttempt.deliveryAttemptId,
@@ -1369,10 +1403,12 @@ describe("durable runtime sqlite store", () => {
         now: 120,
       });
 
-      const coalesced = secondStore.reconcileWakeObligation({
-        candidate: candidate("child-progress:2", "revision-2", 200),
-        policy: { mode: "while_unresolved", recurrence: "after_terminal" },
-      });
+      const coalesced = requireAppliedWakeResult(
+        secondStore.reconcileWakeObligation({
+          candidate: candidate("child-progress:2", "revision-2", 200),
+          policy: { mode: "while_unresolved", recurrence: "after_terminal" },
+        }),
+      );
       expect(coalesced).toMatchObject({
         disposition: "coalesced",
         duplicateWakeIds: [],
@@ -1390,6 +1426,7 @@ describe("durable runtime sqlite store", () => {
           },
         },
       });
+      expect(coalesced.wake.deliveryRevision).not.toBe(claim!.wake.deliveryRevision);
       expect(firstStore.listWakeObligations({ sourceRef: "child-run-1" })).toHaveLength(1);
       expect(firstStore.listDeliveryAttemptEvidence({ wakeId: first.wake.wakeId })).toHaveLength(1);
 
@@ -1400,12 +1437,32 @@ describe("durable runtime sqlite store", () => {
         }),
       ).toMatchObject({ disposition: "exact_match", wake: { wakeId: first.wake.wakeId } });
 
-      firstStore.acknowledgeWakeObligation({
-        wakeId: first.wake.wakeId,
-        actorKind: "system_worker",
-        actorRef: "test-consumer",
-        now: 220,
-      });
+      expect(
+        firstStore.acknowledgeWakeObligation({
+          wakeId: first.wake.wakeId,
+          actorKind: "system_worker",
+          actorRef: "test-consumer",
+          now: 220,
+        }),
+      ).toBeUndefined();
+      expect(
+        firstStore.acknowledgeWakeObligation({
+          wakeId: first.wake.wakeId,
+          actorKind: "system_worker",
+          actorRef: "test-consumer",
+          expectedDeliveryRevision: claim!.wake.deliveryRevision,
+          now: 220,
+        }),
+      ).toBeUndefined();
+      expect(
+        firstStore.acknowledgeWakeObligation({
+          wakeId: first.wake.wakeId,
+          actorKind: "system_worker",
+          actorRef: "test-consumer",
+          expectedDeliveryRevision: coalesced.wake.deliveryRevision,
+          now: 220,
+        }),
+      ).toMatchObject({ status: "acked" });
       expect(
         secondStore.reconcileWakeObligation({
           candidate: candidate("child-progress:2", "revision-2", 230),
@@ -1444,6 +1501,317 @@ describe("durable runtime sqlite store", () => {
           occurrenceKeysTruncated: false,
         },
       });
+    } finally {
+      secondStore.close();
+      firstStore.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fences an active delivery claim when coalescing advances the source revision", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-wake-revision-fence-"));
+    const dbPath = path.join(dir, "openclaw.sqlite");
+    const firstStore = openDurableRuntimeSqliteStore({ path: dbPath });
+    const secondStore = openDurableRuntimeSqliteStore({ path: dbPath });
+    const candidate = (occurrenceKey: string, sourceRevision: string, now: number) => ({
+      sourceOwner: "subagent_runs",
+      sourceRef: "child-run-revision-fence",
+      targetKind: "agent_session" as const,
+      targetRef: "agent:test:main",
+      ownerKind: "agent_session" as const,
+      ownerRef: "agent:test:main",
+      reportRouteRef: "agent:test:main",
+      targetResolutionStatus: "resolved" as const,
+      reason: "child_overdue" as const,
+      factsRef: `subagent_runs:child-run-revision-fence:${sourceRevision}`,
+      occurrenceKey,
+      sourceRevision,
+      now,
+    });
+    try {
+      const first = requireAppliedWakeResult(
+        firstStore.reconcileWakeObligation({
+          candidate: candidate("child-progress:1", "revision-1", 100),
+          policy: { mode: "while_unresolved", recurrence: "after_terminal" },
+        }),
+      );
+      const claim = firstStore.claimNextWakeObligation({
+        workerId: "worker-revision-1",
+        claimTtlMs: 1_000,
+        retryBaseMs: 1,
+        retryMaxMs: 1,
+        now: 110,
+      });
+      expect(claim?.wake.wakeId).toBe(first.wake.wakeId);
+
+      expect(
+        secondStore.reconcileWakeObligation({
+          candidate: candidate("child-progress:2", "revision-2", 120),
+          policy: { mode: "while_unresolved", recurrence: "after_terminal" },
+        }),
+      ).toMatchObject({
+        disposition: "coalesced",
+        wake: {
+          wakeId: first.wake.wakeId,
+          status: "pending",
+          metadata: { sourceRevision: "revision-2" },
+        },
+      });
+
+      expect(
+        firstStore.renewWakeObligationClaim({
+          wakeId: first.wake.wakeId,
+          deliveryAttemptId: claim!.deliveryAttempt.deliveryAttemptId,
+          claimToken: claim!.claimToken,
+          claimTtlMs: 1_000,
+          now: 130,
+        }),
+      ).toBe(false);
+      expect(
+        firstStore.completeWakeObligationClaim({
+          wakeId: first.wake.wakeId,
+          deliveryAttemptId: claim!.deliveryAttempt.deliveryAttemptId,
+          claimToken: claim!.claimToken,
+          attemptStatus: "handoff_accepted",
+          wakeStatus: "acked",
+          now: 140,
+        }),
+      ).toBeUndefined();
+      expect(firstStore.getWakeObligation(first.wake.wakeId)).toMatchObject({
+        status: "pending",
+        metadata: { sourceRevision: "revision-2" },
+      });
+      expect(
+        firstStore.getDeliveryAttemptEvidence(claim!.deliveryAttempt.deliveryAttemptId),
+      ).toMatchObject({ status: "attempted" });
+
+      const withoutRevision = (occurrenceKey: string, now: number) => ({
+        ...candidate(occurrenceKey, "unused", now),
+        sourceRef: "child-run-occurrence-fence",
+        factsRef: `subagent_runs:child-run-occurrence-fence:${occurrenceKey}`,
+        sourceRevision: undefined,
+      });
+      const occurrenceFenced = requireAppliedWakeResult(
+        firstStore.reconcileWakeObligation({
+          candidate: withoutRevision("child-progress:without-revision:1", 200),
+          policy: { mode: "while_unresolved", recurrence: "after_terminal" },
+        }),
+      );
+      const occurrenceClaim = firstStore.claimNextWakeObligation({
+        workerId: "worker-occurrence-1",
+        claimTtlMs: 1_000,
+        retryBaseMs: 1,
+        retryMaxMs: 1,
+        now: 210,
+      });
+      expect(occurrenceClaim?.wake.wakeId).toBe(occurrenceFenced.wake.wakeId);
+
+      expect(
+        secondStore.reconcileWakeObligation({
+          candidate: withoutRevision("child-progress:without-revision:2", 220),
+          policy: { mode: "while_unresolved", recurrence: "after_terminal" },
+        }),
+      ).toMatchObject({
+        disposition: "coalesced",
+        wake: { wakeId: occurrenceFenced.wake.wakeId, status: "pending" },
+      });
+      expect(
+        firstStore.renewWakeObligationClaim({
+          wakeId: occurrenceFenced.wake.wakeId,
+          deliveryAttemptId: occurrenceClaim!.deliveryAttempt.deliveryAttemptId,
+          claimToken: occurrenceClaim!.claimToken,
+          claimTtlMs: 1_000,
+          now: 230,
+        }),
+      ).toBe(false);
+      expect(
+        firstStore.completeWakeObligationClaim({
+          wakeId: occurrenceFenced.wake.wakeId,
+          deliveryAttemptId: occurrenceClaim!.deliveryAttempt.deliveryAttemptId,
+          claimToken: occurrenceClaim!.claimToken,
+          attemptStatus: "handoff_accepted",
+          wakeStatus: "acked",
+          now: 240,
+        }),
+      ).toBeUndefined();
+      expect(firstStore.getWakeObligation(occurrenceFenced.wake.wakeId)).toMatchObject({
+        status: "pending",
+        metadata: {
+          wakeReconciliation: { latestOccurrenceKey: "child-progress:without-revision:2" },
+        },
+      });
+    } finally {
+      secondStore.close();
+      firstStore.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fences claims and automated controls across direct projection updates", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-projection-fence-"));
+    const dbPath = path.join(dir, "openclaw.sqlite");
+    const firstStore = openDurableRuntimeSqliteStore({ path: dbPath });
+    const secondStore = openDurableRuntimeSqliteStore({ path: dbPath });
+    try {
+      const wake = firstStore.createWakeObligation({
+        sourceOwner: "task_runs",
+        sourceRef: "task-projection-fence",
+        targetKind: "agent_session",
+        targetRef: "agent:test:main",
+        reason: "child_overdue",
+        factsRef: "task_runs:task-projection-fence:1",
+        occurrenceKey: "task-projection-fence:1",
+        metadata: { progress: "first" },
+        now: 100,
+      });
+      const claim = firstStore.claimNextWakeObligation({
+        workerId: "worker-projection-1",
+        claimTtlMs: 1_000,
+        retryBaseMs: 1,
+        retryMaxMs: 1,
+        now: 110,
+      });
+      expect(claim?.wake.wakeId).toBe(wake.wakeId);
+
+      const diagnosticOnly = secondStore.updateWakeObligationProjection({
+        wakeId: wake.wakeId,
+        metadata: { diagnostics: { wakeOverdue: { overdue: true, thresholdMs: 1_000 } } },
+        now: 115,
+      });
+      expect(diagnosticOnly?.deliveryRevision).toBe(claim!.wake.deliveryRevision);
+
+      const updated = secondStore.updateWakeObligationProjection({
+        wakeId: wake.wakeId,
+        factsRef: "task_runs:task-projection-fence:2",
+        metadata: { progress: "second" },
+        now: 120,
+      });
+      expect(updated).toMatchObject({
+        wakeId: wake.wakeId,
+        factsRef: "task_runs:task-projection-fence:2",
+        metadata: { progress: "second" },
+      });
+      expect(updated?.deliveryRevision).not.toBe(claim!.wake.deliveryRevision);
+
+      expect(
+        firstStore.renewWakeObligationClaim({
+          wakeId: wake.wakeId,
+          deliveryAttemptId: claim!.deliveryAttempt.deliveryAttemptId,
+          claimToken: claim!.claimToken,
+          claimTtlMs: 1_000,
+          now: 130,
+        }),
+      ).toBe(false);
+      expect(
+        firstStore.completeWakeObligationClaim({
+          wakeId: wake.wakeId,
+          deliveryAttemptId: claim!.deliveryAttempt.deliveryAttemptId,
+          claimToken: claim!.claimToken,
+          attemptStatus: "handoff_accepted",
+          wakeStatus: "acked",
+          now: 140,
+        }),
+      ).toBeUndefined();
+      expect(
+        firstStore.acknowledgeWakeObligation({
+          wakeId: wake.wakeId,
+          actorKind: "system_worker",
+          actorRef: "projection-consumer",
+          expectedDeliveryRevision: claim!.wake.deliveryRevision,
+          now: 150,
+        }),
+      ).toBeUndefined();
+      expect(
+        firstStore.acknowledgeWakeObligation({
+          wakeId: wake.wakeId,
+          actorKind: "system_worker",
+          actorRef: "projection-consumer",
+          expectedDeliveryRevision: updated!.deliveryRevision,
+          now: 160,
+        }),
+      ).toMatchObject({ status: "acked" });
+    } finally {
+      secondStore.close();
+      firstStore.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("attributes an expired coalesced claim to the projection that was attempted", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-coalesced-unknown-"));
+    const dbPath = path.join(dir, "openclaw.sqlite");
+    const firstStore = openDurableRuntimeSqliteStore({ path: dbPath });
+    const secondStore = openDurableRuntimeSqliteStore({ path: dbPath });
+    const candidate = (
+      occurrenceKey: string,
+      sourceRevision: string,
+      sourceRunId: string,
+      now: number,
+    ) => ({
+      sourceOwner: "subagent_runs",
+      sourceRef: "child-coalesced-unknown",
+      targetKind: "agent_session" as const,
+      targetRef: "agent:test:main",
+      reason: "child_overdue" as const,
+      factsRef: `subagent_runs:child-coalesced-unknown:${sourceRevision}`,
+      sourceRunId,
+      occurrenceKey,
+      sourceRevision,
+      now,
+    });
+    try {
+      const first = requireAppliedWakeResult(
+        firstStore.reconcileWakeObligation({
+          candidate: candidate("child-progress:1", "revision-1", "run-attempted", 100),
+          policy: { mode: "while_unresolved", recurrence: "after_terminal" },
+        }),
+      );
+      const claim = firstStore.claimNextWakeObligation({
+        workerId: "worker-coalesced-unknown",
+        claimTtlMs: 100,
+        retryBaseMs: 1,
+        retryMaxMs: 1,
+        now: 100,
+      });
+      expect(claim?.wake.wakeId).toBe(first.wake.wakeId);
+
+      expect(
+        secondStore.reconcileWakeObligation({
+          candidate: candidate("child-progress:2", "revision-2", "run-coalesced", 150),
+          policy: { mode: "while_unresolved", recurrence: "after_terminal" },
+        }),
+      ).toMatchObject({
+        disposition: "coalesced",
+        wake: {
+          factsRef: "subagent_runs:child-coalesced-unknown:revision-2",
+          sourceRunId: "run-coalesced",
+        },
+      });
+      expect(
+        firstStore.claimNextWakeObligation({
+          workerId: "worker-after-coalesce",
+          claimTtlMs: 100,
+          retryBaseMs: 1,
+          retryMaxMs: 1,
+          now: 201,
+        }),
+      ).toBeUndefined();
+      expect(firstStore.getWakeObligation(first.wake.wakeId)).toMatchObject({
+        status: "suspended",
+        factsRef: "subagent_runs:child-coalesced-unknown:revision-2",
+      });
+      expect(firstStore.listUncertaintyFacts({ sourceRef: "child-coalesced-unknown" })).toEqual([
+        expect.objectContaining({
+          kind: "delivery_unknown",
+          factsRef: "subagent_runs:child-coalesced-unknown:revision-1",
+          sourceRunId: "run-attempted",
+          facts: expect.objectContaining({
+            claimedWakeDeliveryRevision: claim!.wake.deliveryRevision,
+            claimedFactsRef: "subagent_runs:child-coalesced-unknown:revision-1",
+            claimedSourceRunId: "run-attempted",
+          }),
+        }),
+      ]);
     } finally {
       secondStore.close();
       firstStore.close();
@@ -2031,6 +2399,7 @@ describe("durable runtime sqlite store", () => {
             wakeId: wake.wakeId,
             actorKind: "system_worker",
             actorRef: "test-consumer",
+            expectedDeliveryRevision: wake.deliveryRevision,
             now: index + 1,
           });
         }
@@ -2130,6 +2499,40 @@ describe("durable runtime sqlite store", () => {
       expect(new Set(result.duplicateWakeIds).size).toBe(69);
       expect(result.duplicateWakeIds).toContain("wake_cursor_0069");
     } finally {
+      store.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("hashes projection metadata without ambient locale collation", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-stable-hash-"));
+    const store = openDurableRuntimeSqliteStore({ path: path.join(dir, "openclaw.sqlite") });
+    const localeCompare = vi.spyOn(String.prototype, "localeCompare").mockImplementation(() => {
+      throw new Error("projection hashing must not use ambient locale collation");
+    });
+    try {
+      const base = {
+        sourceOwner: "task_runs",
+        sourceRef: "task-stable-hash",
+        targetKind: "agent_session" as const,
+        targetRef: "agent:test:main",
+        reason: "operator_requested" as const,
+        occurrenceKey: "task-stable-hash:1",
+        now: 100,
+      };
+      const first = store.reconcileWakeObligation({
+        candidate: { ...base, metadata: { "\u00e4": 1, z: 2 } },
+        policy: { mode: "while_unresolved", recurrence: "after_terminal" },
+      });
+      expect(first).toMatchObject({ disposition: "created" });
+      expect(
+        store.reconcileWakeObligation({
+          candidate: { ...base, metadata: { z: 2, "\u00e4": 1 }, now: 110 },
+          policy: { mode: "while_unresolved", recurrence: "after_terminal" },
+        }),
+      ).toMatchObject({ disposition: "exact_match" });
+    } finally {
+      localeCompare.mockRestore();
       store.close();
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -2376,7 +2779,7 @@ describe("durable runtime sqlite store", () => {
     }
   });
 
-  it("paginates every unresolved wake for owner reconciliation", () => {
+  it("paginates unresolved wakes with optional owner and creation cutoff filters", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-owner-wake-scan-"));
     const store = openDurableRuntimeSqliteStore({ path: path.join(dir, "openclaw.sqlite") });
     try {
@@ -2392,6 +2795,46 @@ describe("durable runtime sqlite store", () => {
           now: index,
         });
       }
+      const otherOwner = store.createWakeObligation({
+        wakeId: "wake_other_owner",
+        sourceOwner: "task_runs",
+        sourceRef: "task-other-owner",
+        targetKind: "agent_session",
+        targetRef: "agent:test:main",
+        reason: "operator_requested",
+        occurrenceKey: "task-other-owner:1",
+        now: 100,
+      });
+      const future = store.createWakeObligation({
+        wakeId: "wake_future",
+        sourceOwner: "subagent_runs",
+        sourceRef: "child-future",
+        targetKind: "agent_session",
+        targetRef: "agent:test:main",
+        reason: "child_overdue",
+        occurrenceKey: "child-progress:future",
+        now: 2_000,
+      });
+      const forwardStatus = store.createWakeObligation({
+        wakeId: "wake_forward_status",
+        sourceOwner: "subagent_runs",
+        sourceRef: "child-forward-status",
+        targetKind: "agent_session",
+        targetRef: "agent:test:main",
+        reason: "child_overdue",
+        occurrenceKey: "child-progress:forward-status",
+        now: 200,
+      });
+      const { DatabaseSync } = requireNodeSqlite();
+      const forwardDb = new DatabaseSync(path.join(dir, "openclaw.sqlite"));
+      try {
+        forwardDb.exec("PRAGMA ignore_check_constraints = ON");
+        forwardDb
+          .prepare("UPDATE wake_obligations SET status = 'paused' WHERE wake_id = ?")
+          .run(forwardStatus.wakeId);
+      } finally {
+        forwardDb.close();
+      }
       const terminal = store.createWakeObligation({
         wakeId: "wake_terminal",
         sourceOwner: "subagent_runs",
@@ -2406,14 +2849,16 @@ describe("durable runtime sqlite store", () => {
         wakeId: terminal.wakeId,
         actorKind: "system_worker",
         actorRef: "test",
+        expectedDeliveryRevision: terminal.deliveryRevision,
         now: 1_001,
       });
 
       const wakeIds: string[] = [];
       let afterWakeId: string | undefined;
       for (;;) {
-        const page = store.listOwnerWakeObligationsForReconciliation({
+        const page = store.listUnresolvedWakeObligationsPage({
           sourceOwner: "subagent_runs",
+          createdAtOrBefore: 1_000,
           afterWakeId,
           limit: 100,
         });
@@ -2424,9 +2869,22 @@ describe("durable runtime sqlite store", () => {
         afterWakeId = page.at(-1)!.wakeId;
       }
 
-      expect(wakeIds).toHaveLength(503);
-      expect(new Set(wakeIds).size).toBe(503);
+      expect(wakeIds).toHaveLength(504);
+      expect(new Set(wakeIds).size).toBe(504);
       expect(wakeIds).not.toContain(terminal.wakeId);
+      expect(wakeIds).not.toContain(otherOwner.wakeId);
+      expect(wakeIds).not.toContain(future.wakeId);
+      expect(wakeIds).toContain(forwardStatus.wakeId);
+      const allOwners = store
+        .listUnresolvedWakeObligationsPage({ createdAtOrBefore: 1_000, limit: 1_000 })
+        .map((wake) => wake.wakeId);
+      expect(allOwners).toHaveLength(505);
+      expect(allOwners).toContain(otherOwner.wakeId);
+      expect(allOwners).not.toContain(terminal.wakeId);
+      expect(allOwners).not.toContain(future.wakeId);
+      expect(() =>
+        store.listUnresolvedWakeObligationsPage({ createdAtOrBefore: -1, limit: 100 }),
+      ).toThrow(/createdAtOrBefore must be a non-negative safe integer/);
     } finally {
       store.close();
       fs.rmSync(dir, { recursive: true, force: true });
@@ -2456,6 +2914,7 @@ describe("durable runtime sqlite store", () => {
         wakeId: first.wake.wakeId,
         actorKind: "system_worker",
         actorRef: "test-consumer",
+        expectedDeliveryRevision: first.wake.deliveryRevision,
         now: 150,
       });
 
@@ -2603,6 +3062,401 @@ describe("durable runtime sqlite store", () => {
     }
   });
 
+  it("rejects completion when attempt status or expiry disagrees with the lease", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-claim-consistency-"));
+    const dbPath = path.join(dir, "openclaw.sqlite");
+    const store = openDurableRuntimeSqliteStore({ path: dbPath });
+    try {
+      const wake = store.createWakeObligation({
+        sourceOwner: "session_store",
+        sourceRef: "agent:test:claim-consistency",
+        targetKind: "agent_session",
+        targetRef: "agent:test:claim-consistency",
+        reason: "operator_requested",
+        occurrenceKey: "session:agent:test:claim-consistency",
+        now: 100,
+      });
+      const claim = store.claimNextWakeObligation({
+        workerId: "worker-consistency",
+        claimTtlMs: 100,
+        retryBaseMs: 1,
+        retryMaxMs: 1,
+        now: 100,
+      });
+      expect(claim?.wake.wakeId).toBe(wake.wakeId);
+
+      const { DatabaseSync } = requireNodeSqlite();
+      const seedDb = new DatabaseSync(dbPath);
+      try {
+        seedDb
+          .prepare(
+            `UPDATE state_leases
+                SET expires_at = 1000
+              WHERE scope = 'wake_obligation'
+                AND lease_key = ?`,
+          )
+          .run(wake.wakeId);
+      } finally {
+        seedDb.close();
+      }
+      expect(
+        store.completeWakeObligationClaim({
+          wakeId: wake.wakeId,
+          deliveryAttemptId: claim!.deliveryAttempt.deliveryAttemptId,
+          claimToken: claim!.claimToken,
+          attemptStatus: "handoff_accepted",
+          wakeStatus: "acked",
+          now: 201,
+        }),
+      ).toBeUndefined();
+
+      const statusDb = new DatabaseSync(dbPath);
+      try {
+        statusDb
+          .prepare(
+            `UPDATE delivery_attempt_evidence
+                SET status = 'failed', delivery_claim_expires_at = 1000
+              WHERE delivery_attempt_id = ?`,
+          )
+          .run(claim!.deliveryAttempt.deliveryAttemptId);
+      } finally {
+        statusDb.close();
+      }
+      expect(
+        store.completeWakeObligationClaim({
+          wakeId: wake.wakeId,
+          deliveryAttemptId: claim!.deliveryAttempt.deliveryAttemptId,
+          claimToken: claim!.claimToken,
+          attemptStatus: "handoff_accepted",
+          wakeStatus: "acked",
+          now: 202,
+        }),
+      ).toBeUndefined();
+      expect(store.getWakeObligation(wake.wakeId)?.status).toBe("pending");
+    } finally {
+      store.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed and records uncertainty for a pre-fence active attempt", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-prefence-claim-"));
+    const dbPath = path.join(dir, "openclaw.sqlite");
+    const initialStore = openDurableRuntimeSqliteStore({ path: dbPath });
+    const wake = initialStore.createWakeObligation({
+      sourceOwner: "session_store",
+      sourceRef: "agent:test:prefence",
+      targetKind: "agent_session",
+      targetRef: "agent:test:prefence",
+      reason: "operator_requested",
+      occurrenceKey: "session:agent:test:prefence",
+      now: 100,
+    });
+    const claim = initialStore.claimNextWakeObligation({
+      workerId: "worker-prefence",
+      claimTtlMs: 100,
+      retryBaseMs: 1,
+      retryMaxMs: 1,
+      now: 100,
+    });
+    expect(claim?.wake.wakeId).toBe(wake.wakeId);
+    initialStore.close();
+
+    const { DatabaseSync } = requireNodeSqlite();
+    const seedDb = new DatabaseSync(dbPath);
+    try {
+      seedDb
+        .prepare(
+          `UPDATE delivery_attempt_evidence
+              SET metadata_json = ?
+            WHERE delivery_attempt_id = ?`,
+        )
+        .run(
+          JSON.stringify({
+            claimedWakeSourceRevision: null,
+            claimedWakeOccurrenceKey: "session:agent:test:prefence",
+          }),
+          claim!.deliveryAttempt.deliveryAttemptId,
+        );
+    } finally {
+      seedDb.close();
+    }
+
+    const reopenedStore = openDurableRuntimeSqliteStore({ path: dbPath });
+    try {
+      expect(
+        reopenedStore.getDeliveryAttemptEvidence(claim!.deliveryAttempt.deliveryAttemptId),
+      ).not.toHaveProperty("metadata");
+      expect(
+        reopenedStore.renewWakeObligationClaim({
+          wakeId: wake.wakeId,
+          deliveryAttemptId: claim!.deliveryAttempt.deliveryAttemptId,
+          claimToken: claim!.claimToken,
+          claimTtlMs: 100,
+          now: 150,
+        }),
+      ).toBe(false);
+      expect(
+        reopenedStore.completeWakeObligationClaim({
+          wakeId: wake.wakeId,
+          deliveryAttemptId: claim!.deliveryAttempt.deliveryAttemptId,
+          claimToken: claim!.claimToken,
+          attemptStatus: "handoff_accepted",
+          wakeStatus: "acked",
+          now: 150,
+        }),
+      ).toBeUndefined();
+      expect(
+        reopenedStore.claimNextWakeObligation({
+          workerId: "worker-after-upgrade",
+          claimTtlMs: 100,
+          retryBaseMs: 1,
+          retryMaxMs: 1,
+          now: 201,
+        }),
+      ).toBeUndefined();
+      expect(reopenedStore.getWakeObligation(wake.wakeId)).toMatchObject({
+        status: "suspended",
+        failedReason: "dispatch_outcome_unknown",
+      });
+      expect(
+        reopenedStore.getDeliveryAttemptEvidence(claim!.deliveryAttempt.deliveryAttemptId),
+      ).toMatchObject({ status: "unknown", unknownAt: 201 });
+      expect(reopenedStore.listUncertaintyFacts({ sourceRef: "agent:test:prefence" })).toEqual([
+        expect.objectContaining({
+          kind: "delivery_unknown",
+          refId: claim!.deliveryAttempt.deliveryAttemptId,
+          status: "open",
+        }),
+      ]);
+    } finally {
+      reopenedStore.close();
+    }
+
+    const verifyDb = new DatabaseSync(dbPath);
+    try {
+      expect(
+        verifyDb
+          .prepare(
+            `SELECT COUNT(*) AS count
+               FROM state_leases
+              WHERE scope = 'wake_obligation'
+                AND lease_key = ?`,
+          )
+          .get(wake.wakeId),
+      ).toEqual({ count: 0 });
+    } finally {
+      verifyDb.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("atomically records an active dispatch as unknown when its wake is suspended", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-suspend-claim-"));
+    const store = openDurableRuntimeSqliteStore({ path: path.join(dir, "openclaw.sqlite") });
+    try {
+      const wake = store.createWakeObligation({
+        sourceOwner: "task_runs",
+        sourceRef: "task-suspend-claim",
+        targetKind: "agent_session",
+        targetRef: "agent:test:main",
+        reason: "side_effect_uncertain",
+        factsRef: "task_runs:task-suspend-claim:1",
+        occurrenceKey: "task-suspend-claim:1",
+        now: 100,
+      });
+      const claim = store.claimNextWakeObligation({
+        workerId: "worker-suspend-claim",
+        claimTtlMs: 1_000,
+        retryBaseMs: 1,
+        retryMaxMs: 1,
+        now: 110,
+      });
+      expect(claim?.wake.wakeId).toBe(wake.wakeId);
+
+      expect(
+        store.suspendWakeObligation({
+          wakeId: wake.wakeId,
+          failedReason: "owner_decision_required",
+          now: 120,
+        }),
+      ).toMatchObject({ status: "suspended", failedReason: "owner_decision_required" });
+      expect(
+        store.getDeliveryAttemptEvidence(claim!.deliveryAttempt.deliveryAttemptId),
+      ).toMatchObject({
+        status: "unknown",
+        unknownAt: 120,
+      });
+      expect(store.listUncertaintyFacts({ sourceRef: "task-suspend-claim" })).toEqual([
+        expect.objectContaining({
+          kind: "delivery_unknown",
+          factsRef: "task_runs:task-suspend-claim:1",
+          refId: claim!.deliveryAttempt.deliveryAttemptId,
+        }),
+      ]);
+      expect(
+        store.renewWakeObligationClaim({
+          wakeId: wake.wakeId,
+          deliveryAttemptId: claim!.deliveryAttempt.deliveryAttemptId,
+          claimToken: claim!.claimToken,
+          claimTtlMs: 1_000,
+          now: 130,
+        }),
+      ).toBe(false);
+      expect(
+        store.completeWakeObligationClaim({
+          wakeId: wake.wakeId,
+          deliveryAttemptId: claim!.deliveryAttempt.deliveryAttemptId,
+          claimToken: claim!.claimToken,
+          attemptStatus: "handoff_accepted",
+          wakeStatus: "acked",
+          now: 130,
+        }),
+      ).toBeUndefined();
+    } finally {
+      store.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("completes an active dispatch with an explicit unknown outcome", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-complete-unknown-"));
+    const dbPath = path.join(dir, "openclaw.sqlite");
+    const store = openDurableRuntimeSqliteStore({ path: dbPath });
+    try {
+      const wake = store.createWakeObligation({
+        sourceOwner: "task_runs",
+        sourceRef: "task-complete-unknown",
+        targetKind: "agent_session",
+        targetRef: "agent:test:main",
+        reason: "side_effect_uncertain",
+        factsRef: "task_runs:task-complete-unknown:1",
+        sourceRunId: "run-complete-unknown",
+        occurrenceKey: "task-complete-unknown:1",
+        now: 100,
+      });
+      const claim = store.claimNextWakeObligation({
+        workerId: "worker-complete-unknown",
+        claimTtlMs: 1_000,
+        retryBaseMs: 1,
+        retryMaxMs: 1,
+        now: 110,
+      });
+
+      expect(
+        store.completeWakeObligationClaim({
+          wakeId: wake.wakeId,
+          deliveryAttemptId: claim!.deliveryAttempt.deliveryAttemptId,
+          claimToken: claim!.claimToken,
+          attemptStatus: "unknown",
+          wakeStatus: "suspended",
+          error: "transport disconnected after dispatch",
+          evidence: { transport: "disconnected" },
+          now: 120,
+        }),
+      ).toMatchObject({
+        status: "unknown",
+        error: "transport disconnected after dispatch",
+        evidence: { transport: "disconnected" },
+        unknownAt: 120,
+      });
+      expect(store.getWakeObligation(wake.wakeId)).toMatchObject({
+        status: "suspended",
+        failedReason: "transport disconnected after dispatch",
+      });
+      expect(store.listUncertaintyFacts({ sourceRef: "task-complete-unknown" })).toEqual([
+        expect.objectContaining({
+          kind: "delivery_unknown",
+          sourceRunId: "run-complete-unknown",
+          factsRef: "task_runs:task-complete-unknown:1",
+          refId: claim!.deliveryAttempt.deliveryAttemptId,
+        }),
+      ]);
+      expect(
+        store.renewWakeObligationClaim({
+          wakeId: wake.wakeId,
+          deliveryAttemptId: claim!.deliveryAttempt.deliveryAttemptId,
+          claimToken: claim!.claimToken,
+          claimTtlMs: 1_000,
+          now: 130,
+        }),
+      ).toBe(false);
+    } finally {
+      store.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rolls back wake suspension when unknown-attempt finalization fails", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-suspend-rollback-"));
+    const dbPath = path.join(dir, "openclaw.sqlite");
+    const store = openDurableRuntimeSqliteStore({ path: dbPath });
+    try {
+      const wake = store.createWakeObligation({
+        wakeId: "wake-suspend-atomic-rollback",
+        sourceOwner: "task_runs",
+        sourceRef: "task-suspend-rollback",
+        targetKind: "agent_session",
+        targetRef: "agent:test:main",
+        reason: "side_effect_uncertain",
+        occurrenceKey: "task-suspend-rollback:1",
+        now: 100,
+      });
+      const claim = store.claimNextWakeObligation({
+        workerId: "worker-suspend-rollback",
+        claimTtlMs: 1_000,
+        retryBaseMs: 1,
+        retryMaxMs: 1,
+        now: 110,
+      });
+      const { DatabaseSync } = requireNodeSqlite();
+      const faultDb = new DatabaseSync(dbPath);
+      try {
+        faultDb.exec(`
+          CREATE TRIGGER abort_suspend_unknown_fact
+          BEFORE INSERT ON uncertainty_facts
+          WHEN NEW.ref_id = '${claim!.deliveryAttempt.deliveryAttemptId}'
+          BEGIN
+            SELECT RAISE(ABORT, 'fault-injected unknown fact insert');
+          END;
+        `);
+      } finally {
+        faultDb.close();
+      }
+
+      expect(() =>
+        store.suspendWakeObligation({
+          wakeId: wake.wakeId,
+          failedReason: "owner_decision_required",
+          now: 120,
+        }),
+      ).toThrow(/fault-injected unknown fact insert/);
+      const rolledBackWake = store.getWakeObligation(wake.wakeId);
+      expect(rolledBackWake).toMatchObject({ status: "pending" });
+      expect(rolledBackWake).not.toHaveProperty("failedReason");
+      expect(
+        store.getDeliveryAttemptEvidence(claim!.deliveryAttempt.deliveryAttemptId),
+      ).toMatchObject({
+        status: "attempted",
+        deliveryClaimedBy: claim!.claimToken,
+        deliveryClaimExpiresAt: 1_110,
+      });
+      expect(store.listUncertaintyFacts({ sourceRef: "task-suspend-rollback" })).toEqual([]);
+      expect(
+        store.renewWakeObligationClaim({
+          wakeId: wake.wakeId,
+          deliveryAttemptId: claim!.deliveryAttempt.deliveryAttemptId,
+          claimToken: claim!.claimToken,
+          claimTtlMs: 1_000,
+          now: 130,
+        }),
+      ).toBe(true);
+    } finally {
+      store.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("closes active delivery claims when terminal wake control wins the race", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-wake-control-race-"));
     const store = openDurableRuntimeSqliteStore({ path: path.join(dir, "openclaw.sqlite") });
@@ -2630,6 +3484,7 @@ describe("durable runtime sqlite store", () => {
           wakeId: acknowledgedWake.wakeId,
           actorKind: "system_worker",
           actorRef: "session_attention_consumer",
+          expectedDeliveryRevision: acknowledgedWake.deliveryRevision,
           now: 120,
         }),
       ).toMatchObject({ status: "acked", ackedAt: 120 });
@@ -2675,6 +3530,7 @@ describe("durable runtime sqlite store", () => {
           wakeId: supersededWake.wakeId,
           actorKind: "system_worker",
           actorRef: "session_delivery_recovery",
+          expectedDeliveryRevision: supersededWake.deliveryRevision,
           reason: "session generation changed",
           now: 220,
         }),
@@ -2737,6 +3593,7 @@ describe("durable runtime sqlite store", () => {
           wakeId: wake.wakeId,
           actorKind: "system_worker",
           actorRef: "session_attention_consumer",
+          expectedDeliveryRevision: wake.deliveryRevision,
           now: 120,
         }),
       ).toThrow(/fault-injected control claim finalization/);
@@ -2880,58 +3737,6 @@ describe("durable runtime sqlite store", () => {
         ]),
       );
       expect(store.getStats().pendingWakes).toBe(1);
-    } finally {
-      store.close();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("finds overdue wakes whose no-silence diagnostic is missing or stale", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-wake-diagnostic-"));
-    const store = openDurableRuntimeSqliteStore({ path: path.join(dir, "openclaw.sqlite") });
-    try {
-      const missing = store.createWakeObligation({
-        wakeId: "wake-diagnostic-missing",
-        sourceOwner: "task_runs",
-        sourceRef: "task-diagnostic-missing",
-        targetKind: "agent_session",
-        targetRef: "agent:test:main",
-        reason: "operator_requested",
-        occurrenceKey: "wake-diagnostic-missing",
-        now: 100,
-      });
-      const current = store.createWakeObligation({
-        wakeId: "wake-diagnostic-current",
-        sourceOwner: "task_runs",
-        sourceRef: "task-diagnostic-current",
-        targetKind: "agent_session",
-        targetRef: "agent:test:main",
-        reason: "operator_requested",
-        occurrenceKey: "wake-diagnostic-current",
-        metadata: { diagnostics: { noSilenceSla: { overdue: true, slaMs: 500 } } },
-        now: 110,
-      });
-      const stale = store.createWakeObligation({
-        wakeId: "wake-diagnostic-stale",
-        sourceOwner: "task_runs",
-        sourceRef: "task-diagnostic-stale",
-        targetKind: "agent_session",
-        targetRef: "agent:test:main",
-        reason: "operator_requested",
-        occurrenceKey: "wake-diagnostic-stale",
-        metadata: { diagnostics: { noSilenceSla: { overdue: true, slaMs: 250 } } },
-        now: 120,
-      });
-
-      expect(
-        store
-          .listWakeObligationsNeedingNoSilenceDiagnostic({
-            overdueBefore: 200,
-            slaMs: 500,
-          })
-          .map((wake) => wake.wakeId),
-      ).toEqual([missing.wakeId, stale.wakeId]);
-      expect(store.getWakeObligation(current.wakeId)).toMatchObject({ status: "pending" });
     } finally {
       store.close();
       fs.rmSync(dir, { recursive: true, force: true });

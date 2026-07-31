@@ -1100,8 +1100,8 @@ export function closeOpenClawStateDatabase(): void {
   }
 }
 
-/** Close one cached shared state database handle resolved from the provided options. */
-export function closeOpenClawStateDatabaseForPath(
+/** Test hook for closing one cached shared state database handle. */
+export function closeOpenClawStateDatabaseForPathForTest(
   options: OpenClawStateDatabaseOptions = {},
 ): void {
   const pathname = resolveDatabasePath(options);

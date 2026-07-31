@@ -71,7 +71,6 @@ export type DurableRuntimeLinkStatus =
   | "lost";
 
 export type DurableRuntimeTimerStatus = "pending" | "fired" | "cancelled";
-export type DurableRuntimeSignalStatus = "pending" | "consumed";
 
 export type WakeObligationStatus =
   | "pending"
@@ -162,16 +161,10 @@ export type WakeObligationControlDecision = {
   decisionRef?: string;
   idempotencyKey?: string;
   expectedSourceRevision?: string;
+  expectedDeliveryRevision?: string;
   evidence?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
   decidedAt: number;
-};
-
-export type DurableSourceRef = {
-  /** Canonical owner table/service for the source fact, e.g. task_runs or subagent_runs. */
-  sourceOwner: string;
-  /** Stable primary key/ref owned by sourceOwner. */
-  sourceRef: string;
 };
 
 export type DurableRuntimeRun = {
@@ -318,6 +311,8 @@ export type WakeObligation = {
   factsRef?: string;
   sourceRunId?: string;
   sourceRevision?: string;
+  /** Store-owned projection and occurrence revision used to fence delivery consumers. */
+  deliveryRevision: string;
   attemptCount: number;
   lastAttemptAt?: number;
   nextAttemptAt?: number;
@@ -660,19 +655,6 @@ export type ReconcileWakeObligationResult =
   | ReconcileWakeObligationAppliedResult
   | ReconcileWakeObligationConflictResult;
 
-export type UpdateWakeObligationInput = {
-  wakeId: string;
-  status: WakeObligationStatus;
-  attemptCount?: number;
-  lastAttemptAt?: number | null;
-  nextAttemptAt?: number | null;
-  ackedAt?: number | null;
-  failedReason?: string | null;
-  metadata?: Record<string, unknown>;
-  factsRef?: string;
-  now?: number;
-};
-
 export type UpdateWakeObligationProjectionInput = {
   wakeId: string;
   metadata: Record<string, unknown>;
@@ -698,6 +680,7 @@ export type WakeObligationControlInput = {
   metadata?: Record<string, unknown>;
   idempotencyKey?: string;
   expectedSourceRevision?: string;
+  expectedDeliveryRevision?: string;
   now?: number;
 };
 
@@ -860,10 +843,12 @@ export type DurableRuntimeStore = {
   listParentLinks(childRuntimeRunId: string): DurableRuntimeLink[];
   createTimer(input: CreateDurableRuntimeTimerInput): DurableRuntimeTimer;
   updateTimer(input: UpdateDurableRuntimeTimerInput): DurableRuntimeTimer | undefined;
+  fireDueTimer(input: { timerId: string; now?: number }): DurableRuntimeTimer | undefined;
   listTimers(runtimeRunId?: string): DurableRuntimeTimer[];
   listDueTimers(now: number, options?: { limit?: number }): DurableRuntimeTimer[];
   createSignal(input: CreateDurableRuntimeSignalInput): DurableRuntimeSignal;
   consumeSignal(input: { signalId: string; now?: number }): DurableRuntimeSignal | undefined;
+  consumePendingSignal(input: { signalId: string; now?: number }): DurableRuntimeSignal | undefined;
   listPendingSignals(options?: { limit?: number }): DurableRuntimeSignal[];
   listSignals(runtimeRunId: string): DurableRuntimeSignal[];
   reconcileWakeObligation(input: ReconcileWakeObligationInput): ReconcileWakeObligationResult;
@@ -899,15 +884,11 @@ export type DurableRuntimeStore = {
     status?: WakeObligationStatus;
     limit?: number;
   }): WakeObligation[];
-  listOwnerWakeObligationsForReconciliation(input: {
-    sourceOwner: string;
+  listUnresolvedWakeObligationsPage(input: {
+    sourceOwner?: string;
+    createdAtOrBefore?: number;
     afterWakeId?: string;
     limit: number;
-  }): WakeObligation[];
-  listWakeObligationsNeedingNoSilenceDiagnostic(input: {
-    overdueBefore: number;
-    slaMs: number;
-    limit?: number;
   }): WakeObligation[];
   recordUncertaintyFact(input: CreateUncertaintyFactInput): UncertaintyFact;
   resolveUncertaintyFact(input: ResolveUncertaintyFactInput): UncertaintyFact | undefined;

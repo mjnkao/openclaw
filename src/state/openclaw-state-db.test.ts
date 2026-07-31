@@ -19,7 +19,7 @@ import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import type { DB as OpenClawStateKyselyDatabase } from "./openclaw-state-db.generated.js";
 import {
   acquireOpenClawStateDatabaseLease,
-  closeOpenClawStateDatabaseForPath,
+  closeOpenClawStateDatabaseForPathForTest,
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
   runOpenClawStateWriteTransaction,
@@ -911,7 +911,7 @@ describe("openclaw state database", () => {
     const firstLease = acquireOpenClawStateDatabaseLease({ path: databasePath });
     const secondLease = acquireOpenClawStateDatabaseLease({ path: databasePath });
 
-    closeOpenClawStateDatabaseForPath({ path: databasePath });
+    closeOpenClawStateDatabaseForPathForTest({ path: databasePath });
     firstLease.release();
 
     expect(firstLease.database.db.isOpen).toBe(true);
@@ -926,7 +926,7 @@ describe("openclaw state database", () => {
     const lease = acquireOpenClawStateDatabaseLease({ path: databasePath });
     const firstGeneration = lease.database;
 
-    closeOpenClawStateDatabaseForPath({ path: databasePath });
+    closeOpenClawStateDatabaseForPathForTest({ path: databasePath });
     lease.release();
     const secondGeneration = openOpenClawStateDatabase({ path: databasePath });
 
@@ -939,12 +939,12 @@ describe("openclaw state database", () => {
     const databasePath = path.join(createTempStateDir(), "state", "leased.sqlite");
     const staleLease = acquireOpenClawStateDatabaseLease({ path: databasePath });
 
-    closeOpenClawStateDatabaseForPath({ path: databasePath });
+    closeOpenClawStateDatabaseForPathForTest({ path: databasePath });
     staleLease.database.db.close();
 
     const currentLease = acquireOpenClawStateDatabaseLease({ path: databasePath });
     const currentGeneration = currentLease.database;
-    closeOpenClawStateDatabaseForPath({ path: databasePath });
+    closeOpenClawStateDatabaseForPathForTest({ path: databasePath });
 
     staleLease.release();
     staleLease.release();
