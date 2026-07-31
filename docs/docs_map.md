@@ -8778,6 +8778,8 @@ Do not edit it by hand; run `pnpm docs:map:gen`.
   - H2: Ownership And Source-Of-Truth Position
   - H3: Candidate Residual Schema
   - H2: Durable Core Boundary
+  - H2: Canonical Owner And Capability Contract
+  - H2: Bounded Reconciliation
   - H2: Candidate Integration Boundary
   - H2: Intended User Value
   - H2: Core Invariants
@@ -8801,9 +8803,11 @@ Do not edit it by hand; run `pnpm docs:map:gen`.
   - H3: Disabled Paths Never Mutate
   - H3: Runtime Opt-In Without Worker Mutation
   - H3: Wake And Owner Attention
+  - H3: Canonical Owner And Bounded Recovery
+  - H3: Admission Boundaries
   - H3: Restart And Side-Effect Uncertainty
   - H3: Privacy, Retention, And Compaction
-  - H2: Live Proof Policy
+  - H2: Claim And Live-Proof Policy
   - H2: Related
 
 ## start/bootstrapping.md

@@ -149,6 +149,11 @@ read paths must neither open or migrate durable storage nor eagerly load the
 recovery and owner-adapter module graph. A future durable schema version must be
 rejected by read-only preflight before any DDL, metadata update, or backfill.
 
+A new column or table is justified only when a proven residual fact cannot be
+represented by these bounded records without taking lifecycle ownership away
+from an existing owner. A newer runtime API or a larger context window is not,
+by itself, a schema reason.
+
 ## Durable Core Boundary
 
 Durable core is proposed as a local-first runtime substrate, not a product UI
@@ -170,6 +175,48 @@ runtime interpretation derives safe state from those facts; projection policy
 maps facts into Workboard, Task Flow, or channel views; agent policy decides what
 the model or owner should do next.
 
+## Canonical Owner And Capability Contract
+
+The composition root selects one immutable binding set at startup. For each
+accepted occurrence, exactly one canonical volatile execution owner within that
+binding retains active handles, duplicate-run rejection, cancellation, progress
+ordering, approvals, presentation settlement, and process-local cleanup. A
+durable execution record is evidence that work was accepted; it is not an
+active-run registry and does not authorize cancellation, resume, retry, or
+replay. Domain owners may coexist only for non-overlapping facts.
+
+The binding set exposes execution, session, attention, and delivery-evidence
+adapters. Binding validation rejects competing claims for the same role and
+scope. Core storage, recovery, and projection code depend on stable owner facts
+rather than release-specific module, class, or file names,
+so a later canonical owner can replace an adapter without changing durable
+schema, wake semantics, or public projections.
+
+Live host objects, callbacks, approval leases, process handles, cancellation
+controllers, credentials, and listener closures remain process-local. They are
+never persisted or reconstructed from durable metadata. After restart, an
+operation that requires a missing live capability fails closed as explicit
+uncertainty or `requires_owner_decision`; it must not select an ambient fallback
+owner. Capability checks apply per operation so one unavailable optional
+capability does not disable unrelated recording, inspection, or sibling
+reconciliation.
+
+## Bounded Reconciliation
+
+Every reconciliation pass and owner projection is bounded by an absolute
+deadline, finite page/item/byte limits, bounded concurrency, and an opaque
+continuation cursor. Adapters used for authoritative absence checks must provide
+their own finite operation contract. A truncated page, repeated cursor, timeout,
+or unavailable probe is an unresolved outcome, not proof that owner state is
+absent or complete.
+
+Completed siblings retain their monotonic evidence when another owner stalls.
+Unresolved items remain inspectable as uncertainty or
+`requires_owner_decision`; recovery must not erase the source, start an
+unbounded retry loop, or create a duplicate obligation merely because a scan
+could not finish. These bounds are runtime policy and bounded metadata, not a
+new durable table.
+
 ## Candidate Integration Boundary
 
 An owner front door is the narrow existing API allowed to mutate or deliver for
@@ -189,12 +236,18 @@ identity before it reports acceptance or emits success-shaped stream framing:
 | OpenAI-compatible HTTP       | Before success framing or the first assistant stream chunk |
 | OpenResponses HTTP           | Before `response.created` or `response.in_progress`        |
 | Local `agent` command        | Before internal runner dispatch                            |
+| Process-local runtime host   | After authorization and before owner start acceptance      |
+| ACP or TUI adapter           | After canonical session resolution and before owner start  |
 | Channel auto-reply           | Before typing, compaction, or model work                   |
 | Queued follow-up / heartbeat | Before each follow-up runner invocation                    |
 | Isolated cron execution      | Before the isolated prompt executes                        |
 
-Each accepted turn should settle through one fenced lifecycle path so success,
-failure, and cancellation cannot race into contradictory terminal facts.
+Authorization and canonical routing happen before durable mutation. Durable
+intake commits before volatile owner dispatch or success-shaped acceptance.
+Each accepted turn then settles through one fenced owner lifecycle path so
+success, failure, and cancellation cannot race into contradictory terminal
+facts. Execution terminal settlement and user-visible presentation remain
+separate proof axes; execution success cannot acknowledge presentation.
 
 The first public operational surface should be additive and read-only:
 
@@ -251,6 +304,17 @@ The proposal does not promise:
 - Every standalone obligation or uncertainty fact is source-backed by an
   existing owner/ref; only a true root generic execution may carry a documented
   root-operation reason instead.
+- Exactly one immutable startup-selected owner binding has authority for a role
+  and occurrence; durable records never become a second active-run authority.
+- Authorization and canonical owner/session resolution complete before durable
+  admission; admission completes before owner dispatch or acceptance framing.
+- Process-local capabilities are not durable data. Missing fresh authority after
+  restart fails closed without capability reconstruction or owner fallback.
+- Reconciliation uses finite pages, absolute deadlines, bounded evidence, and
+  inspectable continuation; truncation and timeout are not owner absence.
+- Occurrence dedupe identity and logical attention identity remain separate.
+- Queue acceptance, owner consumption, transport acknowledgement, and user
+  presentation remain distinct proof boundaries.
 - Public Gateway inspection is authorized before durable state access; Gateway
   and trusted local CLI inspection are side-effect-free, read-only, and
   projected through explicit field and result bounds.
@@ -268,6 +332,21 @@ Durable core may record wake-needed events, owner and target refs, bounded
 payload refs, delivery-attempt evidence, no-handler diagnostics, and
 acknowledgement state. It must not decide whether the owner should retry,
 resume, abandon, wait, ask the user, or create new work.
+
+Wake reconciliation distinguishes the canonical source revision, an occurrence
+dedupe key, and a logical attention identity. Exact retries of one occurrence
+are idempotent. For a declared coalesced attention policy, different occurrence
+keys for the same normalized source, reason, target, owner, and report route
+update at most one unresolved logical obligation. A changed owner, target,
+route, or reason is a different obligation.
+
+`pending`, `handoff_accepted`, `failed`, and `suspended` remain unresolved for
+that cardinality rule. Queue acceptance cannot authorize a second wake. After
+`acked` or `superseded`, a later occurrence creates a new wake only when the
+declared recurrence policy permits it and the canonical owner still requires
+attention. Reconciliation is atomic at the store boundary and keeps append-only
+attempt evidence; generic storage must not infer recurrence policy from reason
+names.
 
 The candidate wake lifecycle uses `pending`, `handoff_accepted`, `acked`,
 `failed`, `suspended`, and `superseded`. The term `handoff_accepted` names only
@@ -296,6 +375,11 @@ it directly.
 - No raw prompt, task, or tool-payload persistence by default.
 - No replay of side effects without idempotency, retention, and operation
   authority gates.
+- No persistence or reconstruction of process-local host, approval,
+  cancellation, credential, or execution capabilities.
+- No recurring user-visible progress, mobile/client presentation lifecycle, or
+  external-channel delivery claim unless later implementation proves that
+  boundary directly.
 - No external delivery claim without direct implementation and live or
   maintainer-grade proof.
 
