@@ -162,6 +162,7 @@ without requiring external orchestration.
 | Agent execution  | Generic evidence only when no lifecycle owner exists; stable cross-owner refs, links, checkpoints, and uncertainty | Session/task/flow/cron/subagent lifecycle, prompt policy, model choice, and tool work |
 | Subagents        | Source-backed parent/child correlations, bounded result refs, attention obligations, and attempt evidence          | Spawn, progress, timeout, cleanup, result capture, and final-delivery retry lifecycle |
 | Recovery         | Cross-owner stale/lost diagnostics, append-only recovery evidence, and owner attention                             | Lease authority and decisions to retry, resume, abandon, replace, or replay           |
+| Inspection       | Bounded, allowlisted, redacted projections and enforced result limits over durable facts                           | Gateway authentication, method scopes, trust policy, and canonical visibility policy  |
 | UX/product       | Read models and explanations over durable facts                                                                    | Workboard grouping, Task Flow authoring, channel UX, and product-specific task states |
 
 Layer separation is mandatory. Substrate facts are persisted in durable tables;
@@ -203,6 +204,17 @@ The first public operational surface should be additive and read-only:
 - no public acknowledge, retry, resume, abandon, replay, or direct owner
   mutation in the initial stack.
 
+Initial `durable.*` Gateway inspection uses the existing operator role and
+`operator.read` scope. Gateway authorization rejects unauthenticated or
+insufficient-scope callers before durable handlers open state. Within the
+existing trusted-operator model, authorized inspection is gateway-wide; Agent
+and session identifiers are routing and correlation facts, not authorization
+principals. Durable Core does not introduce an Agent-scoped authorization
+boundary. If Gateway visibility becomes narrower in the future, durable
+inspection must consume that canonical policy rather than create parallel
+permissions. Local CLI inspection is trusted local-operator access and uses the
+same projection policy.
+
 Any later owner-control surface needs a separate authority review with caller
 identity, authorization source, owner revision, idempotency key, reason, audit
 evidence, and an owner-adapter mutation path.
@@ -239,7 +251,9 @@ The proposal does not promise:
 - Every standalone obligation or uncertainty fact is source-backed by an
   existing owner/ref; only a true root generic execution may carry a documented
   root-operation reason instead.
-- Public CLI and Gateway inspection is side-effect-free and read-only.
+- Public Gateway inspection is authorized before durable state access; Gateway
+  and trusted local CLI inspection are side-effect-free, read-only, and
+  projected through explicit field and result bounds.
 - Unknown metadata is preserved across supported read/modify/write paths.
 - Bounded previews are the default. Full input capture is opt-in, hashes are not
   anonymization, and metadata can be sensitive.
@@ -277,6 +291,7 @@ it directly.
   docs-only RFC.
 - No default-on durable runtime behavior.
 - No public mutating durable CLI or Gateway controls in the initial stack.
+- No Agent-scoped authorization boundary inside an existing trusted Gateway.
 - No product-specific task-card or Workboard policy in durable core.
 - No raw prompt, task, or tool-payload persistence by default.
 - No replay of side effects without idempotency, retention, and operation
@@ -291,3 +306,5 @@ lease expiry, permission changes, provider outages, or uncertain side effects.
 ## Related
 
 - [Durable Core Residual-Gap Compatibility Check Plan](/specs/durable-core-proposal-test-plan)
+- [Security and trust model](/gateway/security)
+- [Operator scopes](/gateway/operator-scopes)

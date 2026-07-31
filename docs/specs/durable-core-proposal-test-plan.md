@@ -85,7 +85,7 @@ claim no runtime delivery behavior.
 | Wake target resolution        | Owner, parent, peer, scheduled, Task Flow, external route, missing, unauthorized, and ambiguous targets resolve or fail closed with inspectable evidence     | Wake routing                      |
 | Wake queue contract           | Wake records include stable ids, target refs, reason, facts refs, dedupe key, attempt fields, ack/failure fields, and lifecycle state                        | Wake storage                      |
 | Replay authority              | Automatic replay is denied unless operation registry, input material, idempotency, side-effect class, dedupe/CAS or reconciliation, and retention gates pass | Replay safeguards                 |
-| CLI/Gateway inspection        | Read APIs expose runs, facts, wake queue, unresolved obligations, and uncertainty without worker mutation                                                    | Read APIs                         |
+| CLI/Gateway inspection        | `operator.read` gates `durable.*` before state opens; gateway-wide reads use bounded/redacted allowlists. Agent/session refs do not grant access             | Gateway auth and projections      |
 | Owner decision boundary       | Initial public API remains read-only; any later decision validates caller authority and source revision, calls the owner API, and records audit evidence     | Owner adapters and audit          |
 | Worker no-handler behavior    | Empty registry and no-handler rows fail closed and do not mark unknown side effects as handled                                                               | Worker recovery                   |
 | Claim/lease recovery          | Expired claimed run/step rows are inspectable and reclaim only when eligible, with SQLite row evidence                                                       | Lease recovery                    |
@@ -168,6 +168,16 @@ fenced terminal settlement across success, failure, and cancellation races.
 - Default persistence stores refs, hashes, bounded previews, and structured
   metadata, not raw prompts/tasks/tool payloads.
 - Full input capture requires explicit opt-in and inspection authorization.
+- Call the real Gateway dispatcher without `operator.read`; assert denial before
+  handler entry or durable store access and no disclosure of store or ref
+  existence.
+- Seed records for two Agents; assert an authorized operator can inspect both
+  through the same bounded projection.
+- Seed raw prompt, task, tool input/result, secret-marker, private path/endpoint,
+  and unknown future metadata fields; assert the default inspection projection
+  omits them.
+- Enforce request, result, nested-collection, and serialization limits, plus any
+  declared pagination bounds, before returning inspection data.
 - Compaction preserves enough run, step, event, ref, claim, and recovery data to
   explain state while removing or truncating sensitive previews.
 
@@ -183,3 +193,5 @@ maintainer decisions about whether durable core is a shared subsystem at all.
 ## Related
 
 - [Durable Core Residual-Gap Architecture Proposal](/specs/durable-core-proposal-architecture)
+- [Security and trust model](/gateway/security)
+- [Operator scopes](/gateway/operator-scopes)
