@@ -69,6 +69,63 @@ describe("session-delivery queue storage", () => {
     });
   });
 
+  it("persists and scopes idempotency by durable wake delivery revision", async () => {
+    await withTempDir({ prefix: "openclaw-session-delivery-" }, async (tempDir) => {
+      const firstId = await enqueueSessionDelivery(
+        {
+          kind: "systemEvent",
+          sessionKey: "agent:main:main",
+          text: "inspect revision one",
+          idempotencyKey: "durable-wake:wake-bound",
+          source: {
+            owner: "durable_wake",
+            ref: "wake-bound",
+            deliveryRevision: 1,
+          },
+        },
+        tempDir,
+      );
+      const secondId = await enqueueSessionDelivery(
+        {
+          kind: "systemEvent",
+          sessionKey: "agent:main:main",
+          text: "inspect revision two",
+          idempotencyKey: "durable-wake:wake-bound",
+          source: {
+            owner: "durable_wake",
+            ref: "wake-bound",
+            deliveryRevision: 2,
+          },
+        },
+        tempDir,
+      );
+
+      expect(secondId).not.toBe(firstId);
+      const pending = await loadPendingSessionDeliveries(tempDir);
+      expect(pending).toHaveLength(2);
+      expect(pending).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: firstId,
+            source: {
+              owner: "durable_wake",
+              ref: "wake-bound",
+              deliveryRevision: 1,
+            },
+          }),
+          expect.objectContaining({
+            id: secondId,
+            source: {
+              owner: "durable_wake",
+              ref: "wake-bound",
+              deliveryRevision: 2,
+            },
+          }),
+        ]),
+      );
+    });
+  });
+
   it("moves entries out of pending retry state", async () => {
     await withTempDir({ prefix: "openclaw-session-delivery-" }, async (tempDir) => {
       const id = await enqueueSessionDelivery(

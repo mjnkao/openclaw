@@ -86,7 +86,10 @@ const mocks = vi.hoisted(() => {
     ackDelivery: vi.fn(async () => {}),
     failDelivery: vi.fn(async () => {}),
     enqueueSystemEvent: vi.fn(),
+    rejectSystemEventDeliveryQueueId: vi.fn(),
     requestHeartbeat: vi.fn(),
+    isDurableSessionWakeActiveForDelivery: vi.fn(() => true),
+    supersedeDurableSessionWakeForGenerationChange: vi.fn(),
     enqueueSessionDelivery: vi.fn(async (payload: Record<string, unknown>) => {
       state.queuedSessionDelivery = payload;
       return "session-delivery-1";
@@ -275,12 +278,17 @@ vi.mock("../infra/outbound/delivery-queue.js", () => ({
 vi.mock("../infra/system-events.js", () => ({
   enqueueSystemEvent: mocks.enqueueSystemEvent,
   enqueueSystemEventEntry: mocks.enqueueSystemEvent,
+}));
+
+vi.mock("../infra/system-event-delivery-state.js", () => ({
   peekConsumedSystemEventDeliveryQueueIds: vi.fn(() => []),
+  rejectSystemEventDeliveryQueueId: mocks.rejectSystemEventDeliveryQueueId,
 }));
 
 vi.mock("../durable/session-owner-adapter.js", () => ({
-  isDurableSessionWakeActiveForDelivery: vi.fn(() => true),
-  supersedeDurableSessionWakeForGenerationChange: vi.fn(),
+  isDurableSessionWakeActiveForDelivery: mocks.isDurableSessionWakeActiveForDelivery,
+  supersedeDurableSessionWakeForGenerationChange:
+    mocks.supersedeDurableSessionWakeForGenerationChange,
 }));
 
 vi.mock("../infra/heartbeat-wake.js", async () => {
@@ -432,7 +440,11 @@ describe("scheduleRestartSentinelWake", () => {
     mocks.ackDelivery.mockClear();
     mocks.failDelivery.mockClear();
     mocks.enqueueSystemEvent.mockClear();
+    mocks.rejectSystemEventDeliveryQueueId.mockClear();
     mocks.requestHeartbeat.mockClear();
+    mocks.isDurableSessionWakeActiveForDelivery.mockReset();
+    mocks.isDurableSessionWakeActiveForDelivery.mockReturnValue(true);
+    mocks.supersedeDurableSessionWakeForGenerationChange.mockClear();
     mocks.enqueueSessionDelivery.mockClear();
     mocks.loadPendingSessionDelivery.mockClear();
     mocks.drainPendingSessionDeliveries.mockClear();
@@ -483,16 +495,131 @@ describe("scheduleRestartSentinelWake", () => {
       sessionKey: "agent:main:main",
       text: "durable task completed",
       expectedSessionId: "agent:main:main",
-      source: { owner: "durable_wake", ref: "wake-1" },
+      source: {
+        owner: "durable_wake",
+        ref: "wake-1",
+        deliveryRevision: 1,
+      },
       retryCount: 0,
       enqueuedAt: 1,
     });
 
     expect(result).toEqual({ acknowledgement: "deferred" });
+    expect(mocks.isDurableSessionWakeActiveForDelivery).toHaveBeenCalledWith({
+      wakeId: "wake-1",
+      deliveryRevision: 1,
+      deliveryQueueId: "durable-delivery-1",
+      sessionKey: "agent:main:main",
+      queuedSessionKey: "agent:main:main",
+    });
     expect(mocks.enqueueSystemEvent).toHaveBeenCalledWith("durable task completed", {
       sessionKey: "agent:main:main",
       deliveryQueueId: "durable-delivery-1",
     });
+  });
+
+  it("retires a stale durable revision without replaying it through generic restart recovery", async () => {
+    mocks.readRestartSentinel.mockResolvedValue({
+      version: 1,
+      payload: {
+        kind: "restart",
+        status: "ok",
+        ts: 123,
+        sessionKey: "agent:main:main",
+        continuation: {
+          kind: "systemEvent",
+          text: "continue after restart",
+        },
+      },
+    } as Awaited<ReturnType<typeof mocks.readRestartSentinel>>);
+    await scheduleRestartSentinelWake({ deps: {} as never });
+    const drain = mockCallArg(mocks.drainPendingSessionDeliveries) as {
+      deliver: (entry: Record<string, unknown>) => Promise<void | { acknowledgement: "deferred" }>;
+    };
+    mocks.enqueueSystemEvent.mockClear();
+    mocks.isDurableSessionWakeActiveForDelivery.mockReturnValueOnce(false);
+
+    await expect(
+      drain.deliver({
+        id: "durable-delivery-stale",
+        kind: "systemEvent",
+        sessionKey: "agent:main:main",
+        text: "stale durable attention",
+        source: {
+          owner: "durable_wake",
+          ref: "wake-stale",
+          deliveryRevision: 1,
+        },
+        retryCount: 0,
+        enqueuedAt: 1,
+      }),
+    ).resolves.toBeUndefined();
+    expect(mocks.enqueueSystemEvent).not.toHaveBeenCalled();
+    expect(mocks.supersedeDurableSessionWakeForGenerationChange).not.toHaveBeenCalled();
+  });
+
+  it("checks durable binding before generation supersession", async () => {
+    mocks.readRestartSentinel.mockResolvedValue({
+      version: 1,
+      payload: {
+        kind: "restart",
+        status: "ok",
+        ts: 123,
+        sessionKey: "agent:main:main",
+        continuation: {
+          kind: "systemEvent",
+          text: "continue after restart",
+        },
+      },
+    } as Awaited<ReturnType<typeof mocks.readRestartSentinel>>);
+    await scheduleRestartSentinelWake({ deps: {} as never });
+    const drain = mockCallArg(mocks.drainPendingSessionDeliveries) as {
+      deliver: (entry: Record<string, unknown>) => Promise<void | { acknowledgement: "deferred" }>;
+    };
+    mocks.loadSessionEntry.mockReturnValue({
+      cfg: {},
+      entry: { sessionId: "session-new", updatedAt: 2 },
+      store: {},
+      storePath: "/tmp/sessions.json",
+      canonicalKey: "agent:main:main",
+      storeKeys: ["agent:main:main"],
+      legacyKey: undefined,
+    });
+
+    await drain.deliver({
+      id: "durable-delivery-generation",
+      kind: "systemEvent",
+      sessionKey: "agent:main:main",
+      text: "durable attention",
+      expectedSessionId: "session-old",
+      source: {
+        owner: "durable_wake",
+        ref: "wake-generation",
+        deliveryRevision: 1,
+      },
+      retryCount: 0,
+      enqueuedAt: 1,
+    });
+
+    expect(mocks.isDurableSessionWakeActiveForDelivery).toHaveBeenCalledWith({
+      wakeId: "wake-generation",
+      deliveryRevision: 1,
+      deliveryQueueId: "durable-delivery-generation",
+      sessionKey: "agent:main:main",
+      queuedSessionKey: "agent:main:main",
+    });
+    expect(mocks.supersedeDurableSessionWakeForGenerationChange).toHaveBeenCalledWith({
+      wakeId: "wake-generation",
+      deliveryRevision: 1,
+      deliveryQueueId: "durable-delivery-generation",
+      sessionKey: "agent:main:main",
+      queuedSessionKey: "agent:main:main",
+      expectedSessionId: "session-old",
+      actualSessionId: "session-new",
+    });
+    expect(mocks.rejectSystemEventDeliveryQueueId).toHaveBeenCalledWith(
+      "durable-delivery-generation",
+    );
   });
 
   it("enqueues the sentinel note and wakes the session even when outbound delivery succeeds", async () => {

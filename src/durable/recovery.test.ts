@@ -157,6 +157,133 @@ describe("durable runtime recovery", () => {
     }
   });
 
+  it("refuses to mark runs lost when their snapshot or eligibility changes after scan", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-recovery-race-"));
+    const store = openDurableRuntimeSqliteStore({ path: path.join(dir, "openclaw.sqlite") });
+    try {
+      const running = store.createRun({
+        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
+        rootOperationReason: "recovery_test_scan_race",
+        status: "running",
+        recoveryState: "running",
+        metadata: { ownerState: "scanned" },
+        now: 100,
+      });
+      const noLongerEligible = store.createRun({
+        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
+        rootOperationReason: "recovery_test_eligibility_race",
+        status: "running",
+        recoveryState: "running",
+        now: 100,
+      });
+      const listOpenRuns = store.listOpenRuns.bind(store);
+      const scan = vi.spyOn(store, "listOpenRuns").mockImplementationOnce((options) => {
+        const snapshots = listOpenRuns(options);
+        store.updateRun({
+          runtimeRunId: running.runtimeRunId,
+          heartbeatAt: 150,
+          metadata: { ownerState: "advanced" },
+          now: 150,
+        });
+        store.updateRun({
+          runtimeRunId: noLongerEligible.runtimeRunId,
+          status: "waiting_signal",
+          recoveryState: "waiting_signal",
+          now: 150,
+        });
+        return snapshots;
+      });
+      try {
+        expect(
+          reconcileDurableAgentTurnsOnGatewayStartup({
+            store,
+            processInstanceId: "process-race",
+            now: 200,
+          }),
+        ).toEqual({ scanned: 2, markedLost: 0 });
+      } finally {
+        scan.mockRestore();
+      }
+
+      expect(store.getRun(running.runtimeRunId)).toMatchObject({
+        status: "running",
+        recoveryState: "running",
+        heartbeatAt: 150,
+        metadata: { ownerState: "advanced" },
+      });
+      expect(store.getTimeline(running.runtimeRunId)).toEqual([]);
+      expect(store.getRun(noLongerEligible.runtimeRunId)).toMatchObject({
+        status: "waiting_signal",
+        recoveryState: "waiting_signal",
+      });
+      expect(store.getTimeline(noLongerEligible.runtimeRunId)).toEqual([]);
+      expect(store.listWakeObligations()).toEqual([]);
+    } finally {
+      store.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not mark a run lost while a step claim is active", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-recovery-claim-"));
+    const store = openDurableRuntimeSqliteStore({ path: path.join(dir, "openclaw.sqlite") });
+    try {
+      const running = store.createRun({
+        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
+        rootOperationReason: "recovery_test_active_claim",
+        status: "running",
+        recoveryState: "running",
+        now: 100,
+      });
+      store.createStep({
+        runtimeRunId: running.runtimeRunId,
+        stepId: "agent_invocation",
+        stepType: "agent",
+        status: "pending",
+        recoveryState: "runnable",
+        now: 100,
+      });
+      const claim = store.claimNextRunnableStep({
+        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
+        workerId: "active-worker",
+        claimTtlMs: 200,
+        now: 100,
+      });
+      expect(claim?.step.stepId).toBe("agent_invocation");
+
+      expect(
+        reconcileDurableAgentTurnsOnGatewayStartup({
+          store,
+          processInstanceId: "process-active-claim",
+          now: 200,
+        }),
+      ).toEqual({ scanned: 1, markedLost: 0 });
+      expect(store.getRun(running.runtimeRunId)?.status).toBe("running");
+      expect(store.listSteps(running.runtimeRunId)).toEqual([
+        expect.objectContaining({
+          recoveryState: "claimed",
+          claimedBy: claim?.claimToken,
+          claimExpiresAt: 300,
+        }),
+      ]);
+
+      expect(
+        reconcileDurableAgentTurnsOnGatewayStartup({
+          store,
+          processInstanceId: "process-expired-claim",
+          now: 301,
+        }),
+      ).toEqual({ scanned: 1, markedLost: 1 });
+      expect(store.getRun(running.runtimeRunId)?.status).toBe("lost");
+      expect(store.listSteps(running.runtimeRunId)).toEqual([
+        expect.objectContaining({ status: "lost", recoveryState: "terminal" }),
+      ]);
+    } finally {
+      store.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("rolls back the lost transition when its recovery wake cannot be recorded", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-recovery-atomic-"));
     const store = openDurableRuntimeSqliteStore({ path: path.join(dir, "openclaw.sqlite") });
@@ -173,10 +300,17 @@ describe("durable runtime recovery", () => {
         runtimeRunId: running.runtimeRunId,
         stepId: "agent_invocation",
         stepType: "agent",
-        status: "running",
-        recoveryState: "running",
+        status: "pending",
+        recoveryState: "runnable",
         now: 100,
       });
+      const claim = store.claimNextRunnableStep({
+        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
+        workerId: "expired-worker",
+        claimTtlMs: 50,
+        now: 100,
+      });
+      expect(claim?.step.stepId).toBe("agent_invocation");
       const createWakeObligation = store.createWakeObligation.bind(store);
       store.createWakeObligation = () => {
         throw new Error("injected recovery wake failure");
@@ -199,11 +333,24 @@ describe("durable runtime recovery", () => {
       });
       expect(store.getRun(running.runtimeRunId)?.completedAt).toBeUndefined();
       expect(store.listSteps(running.runtimeRunId)).toEqual([
-        expect.objectContaining({ status: "running", recoveryState: "running" }),
+        expect.objectContaining({
+          status: "queued",
+          recoveryState: "claimed",
+          claimedBy: claim?.claimToken,
+          claimExpiresAt: 150,
+        }),
       ]);
       expect(store.getTimeline(running.runtimeRunId)).toEqual([]);
       expect(store.listUncertaintyFacts()).toEqual([]);
       expect(store.listWakeObligations()).toEqual([]);
+      expect(
+        store.releaseStepClaim({
+          runtimeRunId: running.runtimeRunId,
+          stepId: "agent_invocation",
+          claimToken: claim!.claimToken,
+          now: 201,
+        }),
+      ).toMatchObject({ status: "queued", recoveryState: "runnable" });
     } finally {
       store.close();
       fs.rmSync(dir, { recursive: true, force: true });
@@ -271,7 +418,7 @@ describe("durable runtime recovery", () => {
           now: 2_000,
           staleAfterMs: 1_000,
         }),
-      ).toMatchObject({ scanned: 2, markedLost: 1 });
+      ).toMatchObject({ scanned: 1, markedLost: 1 });
       expect(
         reconcileStaleDurableChatSends({
           store,
@@ -283,6 +430,84 @@ describe("durable runtime recovery", () => {
       expect(store.getRun(staleAgent.runtimeRunId)?.status).toBe("lost");
       expect(store.getRun(freshAgent.runtimeRunId)?.status).toBe("running");
       expect(store.getRun(staleChat.runtimeRunId)?.status).toBe("lost");
+    } finally {
+      store.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("advances stale-run scans past an active-claim prefix", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-stale-cursor-"));
+    const store = openDurableRuntimeSqliteStore({ path: path.join(dir, "openclaw.sqlite") });
+    try {
+      for (const [index, runtimeRunId] of ["run_active_1", "run_active_2"].entries()) {
+        store.createRun({
+          runtimeRunId,
+          operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
+          rootOperationReason: `recovery_test_active_prefix_${index}`,
+          status: "running",
+          recoveryState: "running",
+          now: 100 + index,
+        });
+        store.createStep({
+          runtimeRunId,
+          stepId: "agent_invocation",
+          stepType: "agent",
+          status: "pending",
+          recoveryState: "runnable",
+          now: 100 + index,
+        });
+        expect(
+          store.claimNextRunnableStep({
+            operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
+            workerId: `active-worker-${index}`,
+            claimTtlMs: 10_000,
+            now: 200 + index,
+          })?.step.runtimeRunId,
+        ).toBe(runtimeRunId);
+      }
+      const lostCandidate = store.createRun({
+        runtimeRunId: "run_lost_after_active_prefix",
+        operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
+        rootOperationReason: "recovery_test_after_active_prefix",
+        status: "running",
+        recoveryState: "running",
+        now: 102,
+      });
+
+      const first = reconcileStaleDurableAgentTurns({
+        store,
+        processInstanceId: "process-cursor-1",
+        now: 2_000,
+        staleAfterMs: 1_000,
+        limit: 1,
+      });
+      expect(first).toMatchObject({ scanned: 1, markedLost: 0, complete: false });
+      if (!first.nextCursor) {
+        throw new Error("expected a continuation after the first stale-run page");
+      }
+      const second = reconcileStaleDurableAgentTurns({
+        store,
+        processInstanceId: "process-cursor-2",
+        now: 2_100,
+        staleAfterMs: 1_000,
+        cursor: first.nextCursor,
+        limit: 1,
+      });
+      expect(second).toMatchObject({ scanned: 1, markedLost: 0, complete: false });
+      if (!second.nextCursor) {
+        throw new Error("expected a continuation after the second stale-run page");
+      }
+      const third = reconcileStaleDurableAgentTurns({
+        store,
+        processInstanceId: "process-cursor-3",
+        now: 2_200,
+        staleAfterMs: 1_000,
+        cursor: second.nextCursor,
+        limit: 1,
+      });
+      expect(third).toMatchObject({ scanned: 1, markedLost: 1, complete: true });
+      expect(store.getRun(lostCandidate.runtimeRunId)?.status).toBe("lost");
     } finally {
       store.close();
       fs.rmSync(dir, { recursive: true, force: true });
@@ -349,6 +574,92 @@ describe("durable runtime recovery", () => {
     }
   });
 
+  it("fires stale timers without requeueing nonmatching steps or live runs", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-recovery-timer-race-"));
+    const store = openDurableRuntimeSqliteStore({ path: path.join(dir, "openclaw.sqlite") });
+    try {
+      const nonmatchingStepRun = store.createRun({
+        operationKind: "test.timer-stale-step",
+        rootOperationReason: "recovery_test_timer_stale_step",
+        status: "waiting_timer",
+        recoveryState: "waiting_timer",
+        now: 100,
+      });
+      store.createStep({
+        runtimeRunId: nonmatchingStepRun.runtimeRunId,
+        stepId: "wait",
+        stepType: "timer",
+        status: "waiting",
+        recoveryState: "waiting_timer",
+        now: 100,
+      });
+      store.createTimer({
+        runtimeRunId: nonmatchingStepRun.runtimeRunId,
+        stepId: "wait",
+        timerType: "sleep",
+        dueAt: 200,
+        now: 100,
+      });
+      store.updateStep({
+        runtimeRunId: nonmatchingStepRun.runtimeRunId,
+        stepId: "wait",
+        status: "queued",
+        recoveryState: "runnable",
+        now: 150,
+      });
+
+      const liveRun = store.createRun({
+        operationKind: "test.timer-live-run",
+        rootOperationReason: "recovery_test_timer_live_run",
+        status: "waiting_timer",
+        recoveryState: "waiting_timer",
+        now: 100,
+      });
+      store.createStep({
+        runtimeRunId: liveRun.runtimeRunId,
+        stepId: "wait",
+        stepType: "timer",
+        status: "waiting",
+        recoveryState: "waiting_timer",
+        now: 100,
+      });
+      store.createTimer({
+        runtimeRunId: liveRun.runtimeRunId,
+        stepId: "wait",
+        timerType: "sleep",
+        dueAt: 200,
+        now: 100,
+      });
+      store.updateRun({
+        runtimeRunId: liveRun.runtimeRunId,
+        status: "running",
+        recoveryState: "running",
+        now: 150,
+      });
+
+      expect(
+        reconcileDueDurableTimers({ store, processInstanceId: "process-stale-timer", now: 200 }),
+      ).toMatchObject({ firedTimers: 2, queuedRuns: 0 });
+      expect(store.getRun(nonmatchingStepRun.runtimeRunId)).toMatchObject({
+        status: "waiting_timer",
+        recoveryState: "waiting_timer",
+      });
+      expect(store.listSteps(nonmatchingStepRun.runtimeRunId)).toEqual([
+        expect.objectContaining({ status: "queued", recoveryState: "runnable" }),
+      ]);
+      expect(store.getRun(liveRun.runtimeRunId)).toMatchObject({
+        status: "running",
+        recoveryState: "running",
+      });
+      expect(store.listSteps(liveRun.runtimeRunId)).toEqual([
+        expect.objectContaining({ status: "waiting", recoveryState: "waiting_timer" }),
+      ]);
+    } finally {
+      store.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("consumes resume signals once and requeues their waiting run", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-recovery-"));
     const store = openDurableRuntimeSqliteStore({ path: path.join(dir, "openclaw.sqlite") });
@@ -399,6 +710,62 @@ describe("durable runtime recovery", () => {
         status: "queued",
         recoveryState: "runnable",
       });
+      expect(store.listSignals(run.runtimeRunId)).toEqual([
+        expect.objectContaining({ signalId: signal.signalId, consumedAt: 200 }),
+      ]);
+    } finally {
+      store.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("consumes stale resume signals without requeueing a nonmatching step", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-durable-recovery-signal-race-"));
+    const store = openDurableRuntimeSqliteStore({ path: path.join(dir, "openclaw.sqlite") });
+    try {
+      const run = store.createRun({
+        operationKind: "test.signal-stale-step",
+        rootOperationReason: "recovery_test_signal_stale_step",
+        status: "waiting_signal",
+        recoveryState: "waiting_signal",
+        now: 100,
+      });
+      store.createStep({
+        runtimeRunId: run.runtimeRunId,
+        stepId: "wait",
+        stepType: "signal",
+        status: "waiting",
+        recoveryState: "waiting_signal",
+        now: 100,
+      });
+      const signal = store.createSignal({
+        runtimeRunId: run.runtimeRunId,
+        stepId: "wait",
+        signalType: "resume",
+        now: 120,
+      });
+      store.updateStep({
+        runtimeRunId: run.runtimeRunId,
+        stepId: "wait",
+        status: "queued",
+        recoveryState: "runnable",
+        now: 150,
+      });
+
+      expect(
+        reconcilePendingDurableSignals({
+          store,
+          processInstanceId: "process-stale-signal",
+          now: 200,
+        }),
+      ).toMatchObject({ consumedSignals: 1, queuedRuns: 0 });
+      expect(store.getRun(run.runtimeRunId)).toMatchObject({
+        status: "waiting_signal",
+        recoveryState: "waiting_signal",
+      });
+      expect(store.listSteps(run.runtimeRunId)).toEqual([
+        expect.objectContaining({ status: "queued", recoveryState: "runnable" }),
+      ]);
       expect(store.listSignals(run.runtimeRunId)).toEqual([
         expect.objectContaining({ signalId: signal.signalId, consumedAt: 200 }),
       ]);

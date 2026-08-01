@@ -37,10 +37,10 @@ import {
   type SessionDeliveryRoute,
 } from "../infra/session-delivery-queue.js";
 import {
-  enqueueSystemEvent,
-  enqueueSystemEventEntry,
   peekConsumedSystemEventDeliveryQueueIds,
-} from "../infra/system-events.js";
+  rejectSystemEventDeliveryQueueId,
+} from "../infra/system-event-delivery-state.js";
+import { enqueueSystemEvent, enqueueSystemEventEntry } from "../infra/system-events.js";
 import { isPendingControlPlaneUpdateRestartSentinel } from "../infra/update-control-plane-sentinel.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { stringifyRouteThreadId } from "../plugin-sdk/channel-route.js";
@@ -245,6 +245,7 @@ function resolveQueuedSessionDeliveryContext(entry: QueuedSessionDelivery):
 
 async function supersedeQueuedDurableWake(params: {
   entry: Extract<QueuedSessionDelivery, { kind: "systemEvent" }>;
+  sessionKey: string;
   actualSessionId?: string;
 }): Promise<void> {
   if (params.entry.source?.owner !== "durable_wake") {
@@ -254,10 +255,14 @@ async function supersedeQueuedDurableWake(params: {
     await import("../durable/session-owner-adapter.js");
   supersedeDurableSessionWakeForGenerationChange({
     wakeId: params.entry.source.ref,
+    deliveryRevision: params.entry.source.deliveryRevision,
     deliveryQueueId: params.entry.id,
+    sessionKey: params.sessionKey,
+    queuedSessionKey: params.entry.sessionKey,
     expectedSessionId: params.entry.expectedSessionId,
     actualSessionId: params.actualSessionId,
   });
+  rejectSystemEventDeliveryQueueId(params.entry.id);
 }
 
 async function deliverQueuedSessionDelivery(params: {
@@ -272,6 +277,19 @@ async function deliverQueuedSessionDelivery(params: {
       enqueueRestartSentinelWake(params.entry.text, canonicalKey, queuedDeliveryContext);
       return undefined;
     }
+    const { isDurableSessionWakeActiveForDelivery } =
+      await import("../durable/session-owner-adapter.js");
+    if (
+      !isDurableSessionWakeActiveForDelivery({
+        wakeId: params.entry.source.ref,
+        deliveryRevision: params.entry.source.deliveryRevision,
+        deliveryQueueId: params.entry.id,
+        sessionKey: canonicalKey,
+        queuedSessionKey: params.entry.sessionKey,
+      })
+    ) {
+      return undefined;
+    }
     if (
       params.entry.expectedSessionId &&
       (!entry?.sessionId || entry.sessionId !== params.entry.expectedSessionId)
@@ -284,13 +302,9 @@ async function deliverQueuedSessionDelivery(params: {
       });
       await supersedeQueuedDurableWake({
         entry: params.entry,
+        sessionKey: canonicalKey,
         actualSessionId: entry?.sessionId,
       });
-      return undefined;
-    }
-    const { isDurableSessionWakeActiveForDelivery } =
-      await import("../durable/session-owner-adapter.js");
-    if (!isDurableSessionWakeActiveForDelivery(params.entry.source.ref)) {
       return undefined;
     }
     if (!peekConsumedSystemEventDeliveryQueueIds(canonicalKey).includes(params.entry.id)) {

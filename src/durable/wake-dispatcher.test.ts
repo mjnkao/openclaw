@@ -280,6 +280,7 @@ describe("durable wake dispatcher", () => {
           wakeId: wake.wakeId,
           actorKind: "system_worker",
           actorRef: "session_attention_consumer",
+          expectedDeliveryRevision: wake.deliveryRevision,
           now: 110,
         });
       } finally {
@@ -328,14 +329,19 @@ describe("durable wake dispatcher", () => {
       occurrenceKey: "sla-first",
       now: 0,
     });
-    store.suspendWakeObligation({ wakeId: first.wakeId, failedReason: "test", now: 1 });
+    store.suspendWakeObligation({
+      wakeId: first.wakeId,
+      suspensionClass: "capability_unavailable",
+      failedReason: "test",
+      now: 1,
+    });
 
     const firstPass = await runDurableWakeDispatcherOnce({
       store,
       workerId: "sla-worker",
       now: 200,
       limit: 1,
-      noSilenceSlaMs: 100,
+      wakeOverdueAfterMs: 100,
       reconcileOwnerFacts: false,
     });
     expect(firstPass.overdue).toBe(1);
@@ -350,14 +356,19 @@ describe("durable wake dispatcher", () => {
       occurrenceKey: "sla-second",
       now: 50,
     });
-    store.suspendWakeObligation({ wakeId: second.wakeId, failedReason: "test", now: 51 });
+    store.suspendWakeObligation({
+      wakeId: second.wakeId,
+      suspensionClass: "capability_unavailable",
+      failedReason: "test",
+      now: 51,
+    });
 
     const secondPass = await runDurableWakeDispatcherOnce({
       store,
       workerId: "sla-worker",
       now: 200,
       limit: 1,
-      noSilenceSlaMs: 100,
+      wakeOverdueAfterMs: 100,
       reconcileOwnerFacts: false,
     });
     const settledPass = await runDurableWakeDispatcherOnce({
@@ -365,16 +376,83 @@ describe("durable wake dispatcher", () => {
       workerId: "sla-worker",
       now: 200,
       limit: 1,
-      noSilenceSlaMs: 100,
+      wakeOverdueAfterMs: 100,
       reconcileOwnerFacts: false,
     });
 
     expect(secondPass.overdue).toBe(1);
     expect(settledPass.overdue).toBe(0);
     expect(store.getWakeObligation(second.wakeId)?.metadata).toMatchObject({
-      diagnostics: { noSilenceSla: { overdue: true, slaMs: 100 } },
+      diagnostics: { wakeOverdue: { overdue: true, thresholdMs: 100 } },
     });
     store.close();
+  });
+
+  it("advances the overdue scan past a full page of already diagnosed wakes", async () => {
+    let store = openDurableRuntimeStore();
+    try {
+      const target = store.withTransaction(() => {
+        for (let index = 0; index < 500; index += 1) {
+          store.createWakeObligation({
+            wakeId: `wake-overdue-${String(index).padStart(4, "0")}`,
+            sourceOwner: "session_store",
+            sourceRef: `agent:test:diagnosed:${index}`,
+            targetKind: "agent_session",
+            targetRef: `agent:test:diagnosed:${index}`,
+            targetResolutionStatus: "resolved",
+            reason: "operator_requested",
+            occurrenceKey: `overdue-diagnosed:${index}`,
+            metadata: { diagnostics: { wakeOverdue: { overdue: true, thresholdMs: 100 } } },
+            now: 0,
+          });
+        }
+        return store.createWakeObligation({
+          wakeId: "wake-overdue-9999",
+          sourceOwner: "session_store",
+          sourceRef: "agent:test:overdue-target",
+          targetKind: "agent_session",
+          targetRef: "agent:test:overdue-target",
+          targetResolutionStatus: "resolved",
+          reason: "operator_requested",
+          occurrenceKey: "overdue-target",
+          now: 0,
+        });
+      });
+
+      const firstPass = await runDurableWakeDispatcherOnce({
+        store,
+        workerId: "overdue-page-worker",
+        now: 200,
+        limit: 1,
+        wakeOverdueAfterMs: 100,
+        reconcileOwnerFacts: false,
+      });
+      const wakeOverdueScanCursor = firstPass.wakeOverdueNextCursor;
+      expect(wakeOverdueScanCursor).toEqual(expect.any(String));
+      expect(wakeOverdueScanCursor).not.toBe("wake-overdue-0499");
+      if (!wakeOverdueScanCursor) {
+        throw new Error("expected the first overdue page to return a continuation cursor");
+      }
+      store.close();
+      store = openDurableRuntimeStore();
+      const secondPass = await runDurableWakeDispatcherOnce({
+        store,
+        workerId: "overdue-page-worker",
+        now: 200,
+        limit: 1,
+        wakeOverdueAfterMs: 100,
+        reconcileOwnerFacts: false,
+        wakeOverdueScanCursor,
+      });
+
+      expect(firstPass.overdue).toBe(0);
+      expect(secondPass.overdue).toBe(1);
+      expect(store.getWakeObligation(target.wakeId)?.metadata).toMatchObject({
+        diagnostics: { wakeOverdue: { overdue: true, thresholdMs: 100 } },
+      });
+    } finally {
+      store.close();
+    }
   });
 
   it("suspends on the configured final dispatch attempt without creating a phantom attempt", async () => {

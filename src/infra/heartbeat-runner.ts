@@ -157,6 +157,7 @@ import {
   resolveHeartbeatDeliveryTargetWithSessionRoute,
   resolveHeartbeatSenderContext,
 } from "./outbound/targets.js";
+import { filterSystemEventEntriesForPrompt } from "./system-event-delivery-state.js";
 import {
   consumeSelectedSystemEventEntries,
   peekSystemEventEntries,
@@ -1250,7 +1251,10 @@ function resolveHeartbeatRunPrompt(params: {
   useHeartbeatResponseTool: boolean;
   runScope: HeartbeatRunScope;
 }): HeartbeatPromptResolution {
-  const pendingEventEntries = params.preflight.pendingEventEntries;
+  const pendingEventEntries = filterSystemEventEntriesForPrompt(
+    params.preflight.session.sessionKey,
+    params.preflight.pendingEventEntries,
+  );
   const cronEvents = pendingEventEntries
     .filter(
       (event) =>
@@ -1549,6 +1553,13 @@ export async function runHeartbeatOnce(opts: {
     return { status: "skipped", reason: preflight.skipReason };
   }
   const { entry, sessionKey, storePath, suppressOriginatingContext } = preflight.session;
+  preflight.pendingEventEntries = filterSystemEventEntriesForPrompt(
+    sessionKey,
+    preflight.pendingEventEntries,
+  );
+  preflight.turnSourceDeliveryContext = resolveSystemEventDeliveryContext(
+    preflight.pendingEventEntries,
+  );
   const isReplyRunActive =
     opts.deps?.isReplyRunActive ?? ((key: string) => replyRunRegistry.isActive(key));
   if (isReplyRunActive(sessionKey) || hasActiveRunForSession(sessionKey, listActiveEmbeddedRuns)) {
@@ -1790,14 +1801,10 @@ export async function runHeartbeatOnce(opts: {
       });
     }
   }
-  const {
-    hasExecCompletion,
-    hasRelayableExecCompletion,
-    hasCronEvents,
-    hasDueCommitments,
-    usesHeartbeatResponseTool,
-  } = heartbeatRunPrompt;
-  const prompt = heartbeatRunPrompt.prompt;
+  let { hasExecCompletion, hasCronEvents, hasDueCommitments } = heartbeatRunPrompt;
+  let hasRelayableExecCompletion: boolean;
+  let usesHeartbeatResponseTool: boolean;
+  let prompt = heartbeatRunPrompt.prompt;
   if (prompt === null) {
     return { status: "skipped", reason: "no-tasks-due" };
   }
@@ -2006,6 +2013,33 @@ export async function runHeartbeatOnce(opts: {
     const bootstrapContextMode: "lightweight" | undefined =
       heartbeat?.lightContext === true ? "lightweight" : undefined;
     const replyOperationRunState: ReplyOperationRunState = {};
+    const getReplyFromConfig =
+      opts.deps?.getReplyFromConfig ?? (await loadHeartbeatRunnerRuntime()).getReplyFromConfig;
+    heartbeatRunPrompt = resolveHeartbeatRunPrompt({
+      cfg,
+      heartbeat,
+      preflight,
+      canRelayToUser,
+      workspaceDir,
+      startedAt,
+      dueTasks: dueHeartbeatTasks,
+      heartbeatFileContent: preflight.heartbeatFileContent,
+      useHeartbeatResponseTool: useHeartbeatResponseToolPrompt,
+      runScope,
+    });
+    if (heartbeatRunPrompt.prompt === null) {
+      return { status: "skipped", reason: "no-tasks-due" };
+    }
+    ({
+      hasExecCompletion,
+      hasRelayableExecCompletion,
+      hasCronEvents,
+      hasDueCommitments,
+      usesHeartbeatResponseTool,
+    } = heartbeatRunPrompt);
+    prompt = heartbeatRunPrompt.prompt;
+    ctx.Body = appendCronStyleCurrentTimeLine(prompt, cfg, startedAt);
+    ctx.Provider = hasExecCompletion ? "exec-event" : hasCronEvents ? "cron-event" : "heartbeat";
     const replyOpts = {
       isHeartbeat: true,
       [HEARTBEAT_RUN_SCOPE]: runScope,
@@ -2022,8 +2056,6 @@ export async function runHeartbeatOnce(opts: {
       bootstrapContextMode,
       onModelSelected: replyPrefix.onModelSelected,
     };
-    const getReplyFromConfig =
-      opts.deps?.getReplyFromConfig ?? (await loadHeartbeatRunnerRuntime()).getReplyFromConfig;
     const replyResult = await getReplyFromConfig(ctx, replyOpts, cfg);
     const heartbeatToolResponse = resolveHeartbeatToolResponseFromReplyResult(replyResult);
     const replyPayload = resolveHeartbeatReplyPayload(replyResult);

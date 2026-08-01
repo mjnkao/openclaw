@@ -7,7 +7,10 @@ import type { SubagentRunRecord } from "../agents/subagent-registry.types.js";
 import { resetConfigRuntimeState, setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import { resolveStorePath } from "../config/sessions/paths.js";
 import { updateSessionStore } from "../config/sessions/store.js";
-import { loadPendingSessionDeliveries } from "../infra/session-delivery-queue.js";
+import {
+  enqueueSessionDelivery,
+  loadPendingSessionDeliveries,
+} from "../infra/session-delivery-queue.js";
 import {
   consumeSelectedSystemEventEntries,
   peekSystemEventEntries,
@@ -33,6 +36,8 @@ import {
 import {
   flowRunsOwnerAdapter,
   reconcileDurableOwnerAttentionFact,
+  reconcileDurableOwnerAttentionFacts,
+  resetDurableOwnerAttentionReconciliationCursorsForTest,
   sessionStoreOwnerAdapter,
   subagentRunsOwnerAdapter,
   taskRunsOwnerAdapter,
@@ -55,12 +60,14 @@ describe("durable canonical owner adapters", () => {
     setRuntimeConfigSnapshot({ durable: { mode: "observe" } });
     resetTaskRegistryForTests({ persist: false });
     resetTaskFlowRegistryForTests({ persist: false });
+    resetDurableOwnerAttentionReconciliationCursorsForTest();
     resetSystemEventsForTest();
   });
 
   afterEach(() => {
     resetTaskRegistryForTests({ persist: false });
     resetTaskFlowRegistryForTests({ persist: false });
+    resetDurableOwnerAttentionReconciliationCursorsForTest();
     resetSystemEventsForTest();
     resetConfigRuntimeState();
     if (previousStateDir === undefined) {
@@ -112,6 +119,7 @@ describe("durable canonical owner adapters", () => {
       };
       store.suspendWakeObligation({
         wakeId: store.listWakeObligations({ sourceOwner: "task_runs" })[0]!.wakeId,
+        suspensionClass: "capability_unavailable",
         failedReason: "interrupted_dispatch",
         now: 1_000_050,
       });
@@ -254,6 +262,182 @@ describe("durable canonical owner adapters", () => {
     ]);
   });
 
+  it("pages task attention records in a stable canonical order", () => {
+    const tasks = ["third task", "first task", "second task"].map((task) =>
+      createTaskRecord({
+        runtime: "cli",
+        requesterSessionKey: "agent:test:main",
+        ownerKey: "agent:test:main",
+        task,
+        status: "running",
+        deliveryStatus: "pending",
+        notifyPolicy: "done_only",
+        startedAt: 100,
+        lastEventAt: 100,
+      }),
+    );
+    expect(tasks.every(Boolean)).toBe(true);
+    const expected = tasks
+      .map((task) => task!)
+      .toSorted(
+        (left, right) =>
+          left.createdAt - right.createdAt ||
+          (left.taskId < right.taskId ? -1 : left.taskId > right.taskId ? 1 : 0),
+      )
+      .map((task) => task.taskId);
+    const actual: string[] = [];
+    let cursor: string | undefined;
+    let complete = false;
+    while (!complete) {
+      const page = taskRunsOwnerAdapter.listAttentionFactsPage!({
+        cursor,
+        limit: 1,
+        now: 1_000_000,
+      });
+      actual.push(...page.facts.map((fact) => fact.sourceRef));
+      cursor = page.nextCursor;
+      complete = page.complete;
+    }
+
+    expect(actual).toEqual(expected);
+  });
+
+  it("pages managed flow attention records deterministically", () => {
+    const flows = [300, 100, 200].map((createdAt) =>
+      createManagedTaskFlow({
+        ownerKey: "agent:test:main",
+        controllerId: `controller-${createdAt}`,
+        status: "blocked",
+        notifyPolicy: "state_changes",
+        goal: `flow-${createdAt}`,
+        createdAt,
+        updatedAt: createdAt,
+      }),
+    );
+    expect(flows.every(Boolean)).toBe(true);
+    const expected = flows
+      .map((flow) => flow!)
+      .toSorted(
+        (left, right) =>
+          left.createdAt - right.createdAt ||
+          (left.flowId < right.flowId ? -1 : left.flowId > right.flowId ? 1 : 0),
+      )
+      .map((flow) => flow.flowId);
+    const actual: string[] = [];
+    let cursor: string | undefined;
+    let complete = false;
+    while (!complete) {
+      const page = flowRunsOwnerAdapter.listAttentionFactsPage!({
+        cursor,
+        limit: 1,
+        now: 1_000_000,
+      });
+      actual.push(...page.facts.map((fact) => fact.sourceRef));
+      cursor = page.nextCursor;
+      complete = page.complete;
+    }
+
+    expect(actual).toEqual(expected);
+  });
+
+  it("advances past non-fact subagent prefixes across reopened-store ticks", () => {
+    const quietRun = (runId: string, createdAt: number): SubagentRunRecord => ({
+      runId,
+      childSessionKey: `agent:test:subagent:${runId}`,
+      requesterSessionKey: "agent:test:main",
+      requesterDisplayKey: "test",
+      task: `quiet ${runId}`,
+      cleanup: "keep",
+      expectsCompletionMessage: true,
+      createdAt,
+      startedAt: 400,
+      execution: { status: "running", startedAt: 400 },
+    });
+    const terminal: SubagentRunRecord = {
+      runId: "run-terminal",
+      childSessionKey: "agent:test:subagent:terminal",
+      requesterSessionKey: "agent:test:main",
+      requesterDisplayKey: "test",
+      task: "terminal result requiring attention",
+      cleanup: "keep",
+      expectsCompletionMessage: true,
+      createdAt: 100,
+      startedAt: 350,
+      endedAt: 400,
+      outcome: { status: "ok" },
+      execution: { status: "terminal", startedAt: 350, endedAt: 400, outcome: { status: "ok" } },
+      delivery: { status: "pending" },
+    };
+    saveSubagentRegistryToSqlite(
+      new Map([
+        ["run-quiet-one", quietRun("run-quiet-one", 100)],
+        ["run-quiet-two", quietRun("run-quiet-two", 100)],
+        [terminal.runId, terminal],
+      ]),
+    );
+    const reconcileTick = () => {
+      const store = openDurableRuntimeStore();
+      try {
+        return reconcileDurableOwnerAttentionFacts({ store, now: 500, limit: 1 });
+      } finally {
+        store.close();
+      }
+    };
+
+    expect(reconcileTick()).toEqual({ scanned: 0, created: 0, suspended: 0, conflicts: 0 });
+    expect(reconcileTick()).toEqual({ scanned: 0, created: 0, suspended: 0, conflicts: 0 });
+    expect(reconcileTick()).toEqual({ scanned: 1, created: 1, suspended: 0, conflicts: 0 });
+
+    const verify = openDurableRuntimeStore();
+    try {
+      expect(verify.listWakeObligations({ sourceOwner: "subagent_runs" })).toEqual([
+        expect.objectContaining({ sourceRef: terminal.runId, status: "pending" }),
+      ]);
+    } finally {
+      verify.close();
+    }
+  });
+
+  it("gives every owner a bounded reconciliation page on the same tick", () => {
+    const quiet: SubagentRunRecord = {
+      runId: "run-quiet-prefix",
+      childSessionKey: "agent:test:subagent:quiet-prefix",
+      requesterSessionKey: "agent:test:main",
+      requesterDisplayKey: "test",
+      task: "quiet subagent prefix",
+      cleanup: "keep",
+      expectsCompletionMessage: true,
+      createdAt: 100,
+      startedAt: 400,
+      execution: { status: "running", startedAt: 400 },
+    };
+    saveSubagentRegistryToSqlite(new Map([[quiet.runId, quiet]]));
+    const task = createTaskRecord({
+      runtime: "cli",
+      requesterSessionKey: "agent:test:main",
+      ownerKey: "agent:test:main",
+      task: "task owner still receives its page",
+      status: "failed",
+      deliveryStatus: "pending",
+      notifyPolicy: "done_only",
+    });
+    const store = openDurableRuntimeStore();
+    try {
+      expect(reconcileDurableOwnerAttentionFacts({ store, now: 500, limit: 1 })).toEqual({
+        scanned: 1,
+        created: 1,
+        suspended: 0,
+        conflicts: 0,
+      });
+      expect(store.listWakeObligations({ sourceOwner: "task_runs" })).toEqual([
+        expect.objectContaining({ sourceRef: task!.taskId, status: "pending" }),
+      ]);
+      expect(store.listWakeObligations({ sourceOwner: "subagent_runs" })).toEqual([]);
+    } finally {
+      store.close();
+    }
+  });
+
   it("uses one persistent fallback for overdue task progress", async () => {
     const sessionKey = "agent:test:task-progress";
     const storePath = resolveStorePath(undefined, { agentId: "test", env: process.env });
@@ -304,7 +488,11 @@ describe("durable canonical owner adapters", () => {
       expect.objectContaining({
         kind: "systemEvent",
         sessionKey,
-        source: { owner: "durable_wake", ref: wake.wakeId },
+        source: {
+          owner: "durable_wake",
+          ref: wake.wakeId,
+          deliveryRevision: wake.deliveryRevision,
+        },
       }),
     ]);
     expect(getTaskById(task!.taskId)?.lastEventAt).toBe(100);
@@ -363,7 +551,11 @@ describe("durable canonical owner adapters", () => {
       expect.objectContaining({
         kind: "systemEvent",
         sessionKey,
-        source: { owner: "durable_wake", ref: wake.wakeId },
+        source: {
+          owner: "durable_wake",
+          ref: wake.wakeId,
+          deliveryRevision: wake.deliveryRevision,
+        },
       }),
     ]);
   });
@@ -517,7 +709,11 @@ describe("durable canonical owner adapters", () => {
         kind: "systemEvent",
         sessionKey,
         text: originalEvents[0]!.text,
-        source: { owner: "durable_wake", ref: wake.wakeId },
+        source: {
+          owner: "durable_wake",
+          ref: wake.wakeId,
+          deliveryRevision: wake.deliveryRevision,
+        },
       }),
     ]);
   });
@@ -580,7 +776,11 @@ describe("durable canonical owner adapters", () => {
       expect.objectContaining({
         kind: "systemEvent",
         sessionKey,
-        source: { owner: "durable_wake", ref: wake.wakeId },
+        source: {
+          owner: "durable_wake",
+          ref: wake.wakeId,
+          deliveryRevision: wake.deliveryRevision,
+        },
       }),
     ]);
   });
@@ -713,7 +913,11 @@ describe("durable canonical owner adapters", () => {
         kind: "systemEvent",
         sessionKey,
         expectedSessionId: "session-flow-owner",
-        source: { owner: "durable_wake", ref: wake.wakeId },
+        source: {
+          owner: "durable_wake",
+          ref: wake.wakeId,
+          deliveryRevision: wake.deliveryRevision,
+        },
       }),
     ]);
   });
@@ -797,6 +1001,11 @@ describe("durable canonical owner adapters", () => {
       expect.objectContaining({
         id: result.evidence.deliveryQueueId,
         expectedSessionId: "session-restart",
+        source: {
+          owner: "durable_wake",
+          ref: wake.wakeId,
+          deliveryRevision: wake.deliveryRevision,
+        },
       }),
     ]);
 
@@ -837,13 +1046,49 @@ describe("durable canonical owner adapters", () => {
         totalTokensFresh: true,
       };
     });
-    const accepted = await requestSessionAttentionDelivery({
-      sessionKey,
-      text: "orphaned durable attention",
-      idempotencyKey: "durable-wake:missing-wake",
-      wakeId: "missing-wake",
+    await expect(
+      requestSessionAttentionDelivery({
+        sessionKey,
+        text: "orphaned durable attention",
+        idempotencyKey: "durable-wake:missing-wake",
+        wakeId: "missing-wake",
+        deliveryRevision: 1,
+      }),
+    ).rejects.toThrow("durable session delivery references a missing wake");
+    expect(peekSystemEvents(sessionKey)).toEqual([]);
+    expect(await loadPendingSessionDeliveries()).toEqual([]);
+  });
+
+  it("fails closed for a legacy durable queue row without a wake revision", async () => {
+    const sessionKey = "agent:test:legacy-durable-delivery";
+    const storePath = resolveStorePath(undefined, { agentId: "test", env: process.env });
+    await updateSessionStore(storePath, (store) => {
+      store[sessionKey] = {
+        sessionId: "session-legacy-delivery",
+        updatedAt: Date.now(),
+        totalTokens: 0,
+        totalTokensFresh: true,
+      };
     });
-    expect(accepted.status).toBe("handoff_accepted");
+    const store = openDurableRuntimeStore();
+    const wake = store.createWakeObligation({
+      sourceOwner: "session_store",
+      sourceRef: sessionKey,
+      targetKind: "agent_session",
+      targetRef: sessionKey,
+      reason: "restart_interrupted",
+      occurrenceKey: "legacy-durable-delivery",
+      now: 100,
+    });
+    store.close();
+    const deliveryQueueId = await enqueueSessionDelivery({
+      kind: "systemEvent",
+      sessionKey,
+      text: "legacy durable attention",
+      expectedSessionId: "session-legacy-delivery",
+      idempotencyKey: "durable-wake:legacy-delivery",
+      source: { owner: "durable_wake", ref: wake.wakeId },
+    });
     resetSystemEventsForTest();
     const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 
@@ -852,14 +1097,214 @@ describe("durable canonical owner adapters", () => {
     expect(peekSystemEvents(sessionKey)).toEqual([]);
     expect(await loadPendingSessionDeliveries()).toEqual([
       expect.objectContaining({
-        id: accepted.status === "handoff_accepted" ? accepted.deliveryQueueId : undefined,
+        id: deliveryQueueId,
         retryCount: 1,
-        source: { owner: "durable_wake", ref: "missing-wake" },
       }),
     ]);
     expect(log.warn).toHaveBeenCalledWith(
-      expect.stringContaining("durable session delivery references a missing wake"),
+      expect.stringContaining("durable session delivery is missing its wake revision"),
     );
+    const verify = openDurableRuntimeStore();
+    try {
+      expect(verify.getWakeObligation(wake.wakeId)?.status).toBe("pending");
+    } finally {
+      verify.close();
+    }
+  });
+
+  it("fails closed when a durable queue row targets a different session", async () => {
+    const wakeSessionKey = "agent:test:bound-session";
+    const queuedSessionKey = "agent:test:other-session";
+    const storePath = resolveStorePath(undefined, { agentId: "test", env: process.env });
+    await updateSessionStore(storePath, (store) => {
+      store[queuedSessionKey] = {
+        sessionId: "session-other",
+        updatedAt: Date.now(),
+        totalTokens: 0,
+        totalTokensFresh: true,
+      };
+    });
+    const store = openDurableRuntimeStore();
+    const wake = store.createWakeObligation({
+      sourceOwner: "session_store",
+      sourceRef: wakeSessionKey,
+      targetKind: "agent_session",
+      targetRef: wakeSessionKey,
+      reason: "restart_interrupted",
+      occurrenceKey: "mismatched-durable-session",
+      now: 100,
+    });
+    store.close();
+    await expect(
+      requestSessionAttentionDelivery({
+        sessionKey: queuedSessionKey,
+        text: "misbound durable attention",
+        idempotencyKey: "durable-wake:misbound-delivery",
+        wakeId: wake.wakeId,
+        deliveryRevision: wake.deliveryRevision,
+      }),
+    ).rejects.toThrow("durable session delivery target does not match its session");
+    expect(peekSystemEvents(queuedSessionKey)).toEqual([]);
+    expect(await loadPendingSessionDeliveries()).toEqual([]);
+    const verify = openDurableRuntimeStore();
+    try {
+      expect(verify.getWakeObligation(wake.wakeId)?.status).toBe("pending");
+    } finally {
+      verify.close();
+    }
+  });
+
+  it("removes a coalesced stale revision before prompt visibility", async () => {
+    const sessionKey = "agent:test:coalesced-session-delivery";
+    const storePath = resolveStorePath(undefined, { agentId: "test", env: process.env });
+    await updateSessionStore(storePath, (store) => {
+      store[sessionKey] = {
+        sessionId: "session-coalesced-delivery",
+        updatedAt: Date.now(),
+        totalTokens: 0,
+        totalTokensFresh: true,
+      };
+    });
+    const store = openDurableRuntimeStore();
+    const first = store.reconcileWakeObligation({
+      candidate: {
+        sourceOwner: "session_store",
+        sourceRef: sessionKey,
+        targetKind: "agent_session",
+        targetRef: sessionKey,
+        reason: "restart_interrupted",
+        factsRef: "session-delivery:revision-1",
+        sourceRevision: "revision-1",
+        occurrenceKey: "coalesced-session-delivery:1",
+        now: 100,
+      },
+      policy: { mode: "while_unresolved", recurrence: "after_terminal" },
+    });
+    if (first.disposition === "conflict") {
+      throw new Error(`unexpected wake conflict: ${first.reason}`);
+    }
+    const firstDelivery = await requestSessionAttentionDelivery({
+      sessionKey,
+      text: "inspect revision one",
+      idempotencyKey: `durable-wake:${first.wake.wakeId}`,
+      wakeId: first.wake.wakeId,
+      deliveryRevision: first.wake.deliveryRevision,
+    });
+    if (firstDelivery.status !== "handoff_accepted") {
+      throw new Error(`expected handoff_accepted, received ${firstDelivery.status}`);
+    }
+    const second = store.reconcileWakeObligation({
+      candidate: {
+        sourceOwner: "session_store",
+        sourceRef: sessionKey,
+        targetKind: "agent_session",
+        targetRef: sessionKey,
+        reason: "restart_interrupted",
+        factsRef: "session-delivery:revision-2",
+        sourceRevision: "revision-2",
+        occurrenceKey: "coalesced-session-delivery:2",
+        now: 110,
+      },
+      policy: { mode: "while_unresolved", recurrence: "after_terminal" },
+    });
+    store.close();
+    if (second.disposition === "conflict") {
+      throw new Error(`unexpected wake conflict: ${second.reason}`);
+    }
+    expect(second.disposition).toBe("coalesced");
+    expect(second.wake.deliveryRevision).not.toBe(first.wake.deliveryRevision);
+    const secondDelivery = await requestSessionAttentionDelivery({
+      sessionKey,
+      text: "inspect revision two",
+      idempotencyKey: `durable-wake:${second.wake.wakeId}`,
+      wakeId: second.wake.wakeId,
+      deliveryRevision: second.wake.deliveryRevision,
+    });
+    if (secondDelivery.status !== "handoff_accepted") {
+      throw new Error(`expected handoff_accepted, received ${secondDelivery.status}`);
+    }
+    expect(secondDelivery.deliveryQueueId).not.toBe(firstDelivery.deliveryQueueId);
+
+    expect(peekSystemEvents(sessionKey)).toEqual(["inspect revision two"]);
+    expect(await loadPendingSessionDeliveries()).toEqual([
+      expect.objectContaining({
+        id: secondDelivery.deliveryQueueId,
+        source: expect.objectContaining({ deliveryRevision: second.wake.deliveryRevision }),
+      }),
+    ]);
+    const verify = openDurableRuntimeStore();
+    try {
+      expect(verify.getWakeObligation(second.wake.wakeId)?.status).toBe("pending");
+    } finally {
+      verify.close();
+    }
+  });
+
+  it("removes an admitted stale revision when recovery retires its queue row", async () => {
+    const sessionKey = "agent:test:stale-recovery-retirement";
+    const storePath = resolveStorePath(undefined, { agentId: "test", env: process.env });
+    await updateSessionStore(storePath, (sessions) => {
+      sessions[sessionKey] = {
+        sessionId: "session-stale-recovery",
+        updatedAt: Date.now(),
+        totalTokens: 0,
+        totalTokensFresh: true,
+      };
+    });
+    const store = openDurableRuntimeStore();
+    const first = store.reconcileWakeObligation({
+      candidate: {
+        sourceOwner: "session_store",
+        sourceRef: sessionKey,
+        targetKind: "agent_session",
+        targetRef: sessionKey,
+        reason: "restart_interrupted",
+        factsRef: "stale-recovery:revision-1",
+        sourceRevision: "revision-1",
+        occurrenceKey: "stale-recovery:1",
+        now: 100,
+      },
+      policy: { mode: "while_unresolved", recurrence: "after_terminal" },
+    });
+    if (first.disposition === "conflict") {
+      throw new Error(`unexpected wake conflict: ${first.reason}`);
+    }
+    const handoff = await requestSessionAttentionDelivery({
+      sessionKey,
+      text: "stale revision must be removed",
+      idempotencyKey: `durable-wake:${first.wake.wakeId}`,
+      wakeId: first.wake.wakeId,
+      deliveryRevision: first.wake.deliveryRevision,
+    });
+    if (handoff.status !== "handoff_accepted") {
+      throw new Error(`expected handoff_accepted, received ${handoff.status}`);
+    }
+    const revised = store.reconcileWakeObligation({
+      candidate: {
+        sourceOwner: "session_store",
+        sourceRef: sessionKey,
+        targetKind: "agent_session",
+        targetRef: sessionKey,
+        reason: "restart_interrupted",
+        factsRef: "stale-recovery:revision-2",
+        sourceRevision: "revision-2",
+        occurrenceKey: "stale-recovery:2",
+        now: 110,
+      },
+      policy: { mode: "while_unresolved", recurrence: "after_terminal" },
+    });
+    store.close();
+    if (revised.disposition === "conflict") {
+      throw new Error(`unexpected wake conflict: ${revised.reason}`);
+    }
+    expect(revised.wake.deliveryRevision).not.toBe(first.wake.deliveryRevision);
+
+    await recoverDurableSessionAttentionDeliveries({
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    });
+
+    expect(peekSystemEvents(sessionKey)).toEqual([]);
+    expect(await loadPendingSessionDeliveries()).toEqual([]);
   });
 
   it("converges when the wake is acked before its queue row is deleted", async () => {
@@ -919,6 +1364,7 @@ describe("durable canonical owner adapters", () => {
 
     acknowledgeDurableSessionWakeConsumption({
       wakeId: wake.wakeId,
+      deliveryRevision: wake.deliveryRevision,
       deliveryQueueId,
       sessionKey,
       expectedSessionId: "session-finalize-crash",
@@ -942,6 +1388,7 @@ describe("durable canonical owner adapters", () => {
         targetKind: "agent_session",
         targetRef: "agent:test:missing",
         reason: "restart_interrupted",
+        deliveryRevision: 1,
       } as never,
       claimToken: "claim-missing",
     });
@@ -981,7 +1428,9 @@ describe("durable canonical owner adapters", () => {
 
     supersedeDurableSessionWakeForGenerationChange({
       wakeId: wake.wakeId,
+      deliveryRevision: wake.deliveryRevision,
       deliveryQueueId: "queue-generation-change",
+      sessionKey: "agent:test:old-generation",
       expectedSessionId: "session-old",
       actualSessionId: "session-new",
     });
@@ -1035,6 +1484,7 @@ describe("durable canonical owner adapters", () => {
       text: "inspect interrupted durable work",
       idempotencyKey: "durable-wake:generation-race",
       wakeId: wake.wakeId,
+      deliveryRevision: wake.deliveryRevision,
     });
     if (handoff.status !== "handoff_accepted") {
       throw new Error(`expected handoff_accepted, received ${handoff.status}`);
@@ -1071,5 +1521,103 @@ describe("durable canonical owner adapters", () => {
     } finally {
       verify.close();
     }
+  });
+
+  it("removes an admitted event when the session generation changes before prompt inspection", async () => {
+    const sessionKey = "agent:test:generation-before-prompt";
+    const storePath = resolveStorePath(undefined, { agentId: "test", env: process.env });
+    await updateSessionStore(storePath, (sessions) => {
+      sessions[sessionKey] = {
+        sessionId: "session-old",
+        updatedAt: Date.now(),
+        totalTokens: 0,
+        totalTokensFresh: true,
+      };
+    });
+    const store = openDurableRuntimeStore();
+    const wake = store.createWakeObligation({
+      sourceOwner: "session_store",
+      sourceRef: sessionKey,
+      targetKind: "agent_session",
+      targetRef: sessionKey,
+      targetResolutionStatus: "resolved",
+      reason: "restart_interrupted",
+      occurrenceKey: "session-generation-before-prompt",
+      now: 100,
+    });
+    store.close();
+    const handoff = await requestSessionAttentionDelivery({
+      sessionKey,
+      text: "must not cross the generation boundary",
+      idempotencyKey: "durable-wake:generation-before-prompt",
+      wakeId: wake.wakeId,
+      deliveryRevision: wake.deliveryRevision,
+    });
+    if (handoff.status !== "handoff_accepted") {
+      throw new Error(`expected handoff_accepted, received ${handoff.status}`);
+    }
+    await updateSessionStore(storePath, (sessions) => {
+      sessions[sessionKey] = {
+        sessionId: "session-new",
+        updatedAt: Date.now(),
+        totalTokens: 0,
+        totalTokensFresh: true,
+      };
+    });
+
+    expect(peekSystemEvents(sessionKey)).toEqual([]);
+    expect(await loadPendingSessionDeliveries()).toEqual([]);
+    const verify = openDurableRuntimeStore();
+    try {
+      expect(verify.getWakeObligation(wake.wakeId)).toMatchObject({ status: "superseded" });
+    } finally {
+      verify.close();
+    }
+  });
+
+  it("removes an admitted event when its wake becomes terminal before prompt inspection", async () => {
+    const sessionKey = "agent:test:terminal-before-prompt";
+    const storePath = resolveStorePath(undefined, { agentId: "test", env: process.env });
+    await updateSessionStore(storePath, (sessions) => {
+      sessions[sessionKey] = {
+        sessionId: "session-terminal",
+        updatedAt: Date.now(),
+        totalTokens: 0,
+        totalTokensFresh: true,
+      };
+    });
+    const store = openDurableRuntimeStore();
+    const wake = store.createWakeObligation({
+      sourceOwner: "session_store",
+      sourceRef: sessionKey,
+      targetKind: "agent_session",
+      targetRef: sessionKey,
+      targetResolutionStatus: "resolved",
+      reason: "restart_interrupted",
+      occurrenceKey: "session-terminal-before-prompt",
+      now: 100,
+    });
+    store.close();
+    const handoff = await requestSessionAttentionDelivery({
+      sessionKey,
+      text: "must not outlive its wake",
+      idempotencyKey: "durable-wake:terminal-before-prompt",
+      wakeId: wake.wakeId,
+      deliveryRevision: wake.deliveryRevision,
+    });
+    if (handoff.status !== "handoff_accepted") {
+      throw new Error(`expected handoff_accepted, received ${handoff.status}`);
+    }
+    const controlStore = openDurableRuntimeStore();
+    controlStore.acknowledgeWakeObligation({
+      wakeId: wake.wakeId,
+      actorKind: "operator",
+      actorRef: "test",
+      now: 110,
+    });
+    controlStore.close();
+
+    expect(peekSystemEvents(sessionKey)).toEqual([]);
+    expect(await loadPendingSessionDeliveries()).toEqual([]);
   });
 });

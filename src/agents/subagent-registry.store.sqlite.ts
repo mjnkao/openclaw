@@ -296,6 +296,17 @@ export function listSubagentRunsFromSqlite(options?: { limit?: number }): Subage
   });
 }
 
+export type SubagentAttentionCandidateCursor = {
+  createdAt: number;
+  runId: string;
+};
+
+export type SubagentAttentionCandidatePage = {
+  records: SubagentRunRecord[];
+  nextCursor?: SubagentAttentionCandidateCursor;
+  complete: boolean;
+};
+
 /**
  * Lists only canonical subagent rows that can still require owner attention.
  * The durable reconciler applies the time/revision policy after hydration; this
@@ -304,35 +315,70 @@ export function listSubagentRunsFromSqlite(options?: { limit?: number }): Subage
 export function listSubagentAttentionCandidatesFromSqlite(options?: {
   limit?: number;
 }): SubagentRunRecord[] {
+  return listSubagentAttentionCandidatesPageFromSqlite(options).records;
+}
+
+export function listSubagentAttentionCandidatesPageFromSqlite(options?: {
+  after?: SubagentAttentionCandidateCursor;
+  limit?: number;
+}): SubagentAttentionCandidatePage {
   const limit = Math.max(1, Math.min(5000, Math.trunc(options?.limit ?? 500)));
   const { db } = openOpenClawStateDatabase();
   const stateDb = getNodeSqliteKysely<SubagentRegistryDatabase>(db);
-  return executeSqliteQuerySync(
-    db,
-    stateDb
-      .selectFrom("subagent_runs")
-      .selectAll()
-      .where((eb) =>
-        eb.or([
-          eb("ended_at", "is", null),
-          eb.and([
-            eb("ended_at", "is not", null),
-            eb("outcome_json", "is not", null),
-            eb("completion_announced_at", "is", null),
-            eb.or([
-              eb("expects_completion_message", "is", null),
-              eb("expects_completion_message", "!=", 0),
-            ]),
+  let query = stateDb
+    .selectFrom("subagent_runs")
+    .selectAll()
+    .where((eb) =>
+      eb.or([
+        eb("ended_at", "is", null),
+        eb.and([
+          eb("ended_at", "is not", null),
+          eb("outcome_json", "is not", null),
+          eb("completion_announced_at", "is", null),
+          eb.or([
+            eb("expects_completion_message", "is", null),
+            eb("expects_completion_message", "!=", 0),
           ]),
         ]),
-      )
+      ]),
+    );
+  if (options?.after) {
+    query = query.where((eb) =>
+      eb.or([
+        eb("created_at", ">", options.after!.createdAt),
+        eb.and([
+          eb("created_at", "=", options.after!.createdAt),
+          eb("run_id", ">", options.after!.runId),
+        ]),
+      ]),
+    );
+  }
+  const rows = executeSqliteQuerySync(
+    db,
+    query
       .orderBy("created_at", "asc")
       .orderBy("run_id", "asc")
-      .limit(limit),
-  ).rows.flatMap((row) => {
+      .limit(limit + 1),
+  ).rows;
+  const complete = rows.length <= limit;
+  const scannedRows = rows.slice(0, limit);
+  const records = scannedRows.flatMap((row) => {
     const entry = rowToSubagentRunRecord(row);
     return entry ? [entry] : [];
   });
+  const lastScanned = scannedRows.at(-1);
+  return {
+    records,
+    ...(complete || !lastScanned
+      ? {}
+      : {
+          nextCursor: {
+            createdAt: lastScanned.created_at,
+            runId: lastScanned.run_id,
+          },
+        }),
+    complete,
+  };
 }
 
 function removeLegacySubagentRegistryFile(): void {

@@ -14,6 +14,11 @@ import {
   normalizeDeliveryContext,
 } from "../utils/delivery-context.shared.js";
 import type { DeliveryContext } from "../utils/delivery-context.types.js";
+import {
+  isSystemEventDeliveryAllowed,
+  recordConsumedSystemEventDeliveryQueueIds,
+  resetSystemEventDeliveryStateForTest,
+} from "./system-event-delivery-state.js";
 
 export type SystemEvent = {
   text: string;
@@ -31,12 +36,8 @@ type SessionQueue = {
 };
 
 const SYSTEM_EVENT_QUEUES_KEY = Symbol.for("openclaw.systemEvents.queues");
-const CONSUMED_SYSTEM_EVENT_DELIVERIES_KEY = Symbol.for("openclaw.systemEvents.consumedDeliveries");
 
 const queues = resolveGlobalMap<string, SessionQueue>(SYSTEM_EVENT_QUEUES_KEY);
-const consumedDeliveryQueueIds = resolveGlobalMap<string, Set<string>>(
-  CONSUMED_SYSTEM_EVENT_DELIVERIES_KEY,
-);
 
 type SystemEventOptions = {
   sessionKey: string;
@@ -73,6 +74,32 @@ function getOrCreateSessionQueue(sessionKey: string): SessionQueue {
   };
   queues.set(key, created);
   return created;
+}
+
+function pruneRejectedSystemEventDeliveries(key: string, entry: SessionQueue): void {
+  let changed = false;
+  for (let index = entry.queue.length - 1; index >= 0; index -= 1) {
+    const event = entry.queue[index];
+    const deliveryQueueIds = event?.deliveryQueueIds;
+    if (!event || !deliveryQueueIds || deliveryQueueIds.length === 0) {
+      continue;
+    }
+    const allowedIds = deliveryQueueIds.filter((deliveryQueueId) =>
+      isSystemEventDeliveryAllowed(key, deliveryQueueId),
+    );
+    if (allowedIds.length === deliveryQueueIds.length) {
+      continue;
+    }
+    changed = true;
+    if (allowedIds.length === 0) {
+      entry.queue.splice(index, 1);
+    } else {
+      event.deliveryQueueIds = allowedIds;
+    }
+  }
+  if (changed) {
+    resetQueueState(key, entry);
+  }
 }
 
 function cloneSystemEvent(event: SystemEvent): SystemEvent {
@@ -169,6 +196,10 @@ export function drainSystemEventEntries(sessionKey: string): SystemEvent[] {
   if (!entry || entry.queue.length === 0) {
     return [];
   }
+  pruneRejectedSystemEventDeliveries(key, entry);
+  if (entry.queue.length === 0) {
+    return [];
+  }
   const out = entry.queue.map(cloneSystemEvent);
   entry.queue.length = 0;
   entry.lastContextKey = null;
@@ -207,18 +238,6 @@ function areSystemEventsEqual(left: SystemEvent, right: SystemEvent): boolean {
   );
 }
 
-function recordConsumedDeliveryQueueIds(sessionKey: string, events: readonly SystemEvent[]): void {
-  const ids = events.flatMap((event) => event.deliveryQueueIds ?? []);
-  if (ids.length === 0) {
-    return;
-  }
-  const pending = consumedDeliveryQueueIds.get(sessionKey) ?? new Set<string>();
-  for (const id of ids) {
-    pending.add(id);
-  }
-  consumedDeliveryQueueIds.set(sessionKey, pending);
-}
-
 function resetQueueState(key: string, entry: SessionQueue) {
   if (entry.queue.length === 0) {
     entry.lastContextKey = null;
@@ -244,6 +263,10 @@ export function consumeSystemEventEntries(
   if (!entry || entry.queue.length === 0 || consumedEntries.length === 0) {
     return [];
   }
+  pruneRejectedSystemEventDeliveries(key, entry);
+  if (entry.queue.length === 0) {
+    return [];
+  }
   if (
     consumedEntries.length > entry.queue.length ||
     !consumedEntries.every((event, index) => areSystemEventsEqual(entry.queue[index], event))
@@ -252,7 +275,7 @@ export function consumeSystemEventEntries(
   }
   const removed = entry.queue.splice(0, consumedEntries.length).map(cloneSystemEvent);
   resetQueueState(key, entry);
-  recordConsumedDeliveryQueueIds(key, removed);
+  recordConsumedSystemEventDeliveryQueueIds(key, removed);
   return removed;
 }
 
@@ -263,6 +286,10 @@ export function consumeSelectedSystemEventEntries(
   const key = requireSessionKey(sessionKey);
   const entry = getSessionQueue(key);
   if (!entry || entry.queue.length === 0 || consumedEntries.length === 0) {
+    return [];
+  }
+  pruneRejectedSystemEventDeliveries(key, entry);
+  if (entry.queue.length === 0) {
     return [];
   }
   const removed: SystemEvent[] = [];
@@ -277,7 +304,7 @@ export function consumeSelectedSystemEventEntries(
     }
   }
   resetQueueState(key, entry);
-  recordConsumedDeliveryQueueIds(key, removed);
+  recordConsumedSystemEventDeliveryQueueIds(key, removed);
   return removed;
 }
 
@@ -286,7 +313,13 @@ export function drainSystemEvents(sessionKey: string): string[] {
 }
 
 export function peekSystemEventEntries(sessionKey: string): SystemEvent[] {
-  return getSessionQueue(sessionKey)?.queue.map(cloneSystemEvent) ?? [];
+  const key = requireSessionKey(sessionKey);
+  const entry = getSessionQueue(key);
+  if (!entry) {
+    return [];
+  }
+  pruneRejectedSystemEventDeliveries(key, entry);
+  return entry.queue.map(cloneSystemEvent);
 }
 
 export function peekSystemEvents(sessionKey: string): string[] {
@@ -294,7 +327,7 @@ export function peekSystemEvents(sessionKey: string): string[] {
 }
 
 export function hasSystemEvents(sessionKey: string) {
-  return (getSessionQueue(sessionKey)?.queue.length ?? 0) > 0;
+  return peekSystemEventEntries(sessionKey).length > 0;
 }
 
 export function resolveSystemEventDeliveryContext(
@@ -307,35 +340,7 @@ export function resolveSystemEventDeliveryContext(
   return resolved;
 }
 
-/** Queue ids whose events crossed into an attached session prompt. */
-export function peekConsumedSystemEventDeliveryQueueIds(sessionKey: string): string[] {
-  return [...(consumedDeliveryQueueIds.get(requireSessionKey(sessionKey)) ?? [])];
-}
-
-/** Forget queue ids only after their attached-session agent run succeeds. */
-export function forgetConsumedSystemEventDeliveryQueueIds(
-  sessionKey: string,
-  acknowledgedIds: readonly string[],
-): void {
-  const key = requireSessionKey(sessionKey);
-  const pending = consumedDeliveryQueueIds.get(key);
-  if (!pending) {
-    return;
-  }
-  for (const id of acknowledgedIds) {
-    pending.delete(id);
-  }
-  if (pending.size === 0) {
-    consumedDeliveryQueueIds.delete(key);
-  }
-}
-
-/** Release in-flight queue ids after an attached-session run fails before acknowledgement. */
-export function releaseConsumedSystemEventDeliveryQueueIds(sessionKey: string): void {
-  consumedDeliveryQueueIds.delete(requireSessionKey(sessionKey));
-}
-
 export function resetSystemEventsForTest() {
   queues.clear();
-  consumedDeliveryQueueIds.clear();
+  resetSystemEventDeliveryStateForTest();
 }

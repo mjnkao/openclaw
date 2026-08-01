@@ -2,6 +2,7 @@ import { createSubsystemLogger } from "../logging/subsystem.js";
 // Recovery reconciliation for durable runtime runs.
 import {
   isDurableWorkerEnabled,
+  resolveDurableRuntimeSqlitePath,
   resolveDurableWorkerClaimTtlMs,
   resolveDurableWorkerPollIntervalMs,
 } from "./config.js";
@@ -25,6 +26,7 @@ const log = createSubsystemLogger("durable/recovery");
 
 const MIN_STALE_RUNTIME_RUN_AFTER_MS = 2 * 60_000;
 const DEFAULT_STALE_SCAN_INTERVAL_MS = 60_000;
+const RECOVERY_RUN_SCAN_PAGE_SIZE = 500;
 const RECOVERY_DIAGNOSTIC_METADATA_KEY = "recoveryDiagnostic";
 
 export function resolveDurableStaleRuntimeRunAfterMs(): number {
@@ -37,6 +39,11 @@ export type DurableRecoveryResult = {
   firedTimers?: number;
   consumedSignals?: number;
   queuedRuns?: number;
+};
+
+export type DurableStaleRecoveryResult = DurableRecoveryResult & {
+  nextCursor?: string;
+  complete: boolean;
 };
 
 function shouldMarkAgentTurnLost(run: DurableRuntimeRun): boolean {
@@ -186,9 +193,35 @@ function mergeRecoveryDiagnosticMetadata(
   };
 }
 
+function matchesLostRecoverySnapshot(
+  scanned: DurableRuntimeRun,
+  current: DurableRuntimeRun,
+): boolean {
+  // updatedAt fences metadata and other persisted run changes; the remaining
+  // fields make the eligibility/liveness comparison explicit at this boundary.
+  return (
+    scanned.runtimeRunId === current.runtimeRunId &&
+    scanned.operationKind === current.operationKind &&
+    scanned.status === current.status &&
+    scanned.recoveryState === current.recoveryState &&
+    scanned.updatedAt === current.updatedAt &&
+    scanned.completedAt === current.completedAt &&
+    scanned.heartbeatAt === current.heartbeatAt
+  );
+}
+
+function hasUnexpiredStepClaim(step: DurableRuntimeStep, now: number): boolean {
+  return (
+    !isTerminalStep(step) &&
+    Boolean(step.claimedBy) &&
+    (step.claimExpiresAt === undefined || step.claimExpiresAt > now)
+  );
+}
+
 function markRunLost(params: {
   store: DurableRuntimeStore;
   run: DurableRuntimeRun;
+  isEligible: (run: DurableRuntimeRun) => boolean;
   now: number;
   reason: string;
   processInstanceId: string;
@@ -197,28 +230,58 @@ function markRunLost(params: {
   agentInvocationId?: string;
 }): boolean {
   return params.store.withTransaction(() => {
-    const diagnostic = buildLostRecoveryDiagnostic(params);
+    const currentRun = params.store.getRun(params.run.runtimeRunId);
+    if (
+      !currentRun ||
+      !matchesLostRecoverySnapshot(params.run, currentRun) ||
+      !params.isEligible(currentRun)
+    ) {
+      return false;
+    }
+    const scannedSteps = params.store.listSteps(currentRun.runtimeRunId);
+    if (scannedSteps.some((step) => hasUnexpiredStepClaim(step, params.now))) {
+      return false;
+    }
+    for (const step of scannedSteps) {
+      if (isTerminalStep(step) || !step.claimedBy) {
+        continue;
+      }
+      const released = params.store.releaseStepClaim({
+        runtimeRunId: currentRun.runtimeRunId,
+        stepId: step.stepId,
+        claimToken: step.claimedBy,
+        now: params.now,
+      });
+      if (!released) {
+        throw new Error(
+          `durable expired step claim could not be released: ${currentRun.runtimeRunId}:${step.stepId}`,
+        );
+      }
+    }
+    const currentSteps = params.store.listSteps(currentRun.runtimeRunId);
+    const diagnostic = buildLostRecoveryDiagnostic({
+      run: currentRun,
+      now: params.now,
+      reason: params.reason,
+      processInstanceId: params.processInstanceId,
+    });
     const updatedRun = params.store.updateRun({
-      runtimeRunId: params.run.runtimeRunId,
+      runtimeRunId: currentRun.runtimeRunId,
       status: "lost",
       recoveryState: "terminal",
       completedAt: params.now,
-      metadata: mergeRecoveryDiagnosticMetadata(params.run.metadata, diagnostic),
+      metadata: mergeRecoveryDiagnosticMetadata(currentRun.metadata, diagnostic),
       now: params.now,
     });
     if (!updatedRun) {
-      const current = params.store.getRun(params.run.runtimeRunId);
-      if (current && isTerminalRun(current)) {
-        return false;
-      }
-      throw new Error(`durable run could not be marked lost: ${params.run.runtimeRunId}`);
+      throw new Error(`durable run could not be marked lost: ${currentRun.runtimeRunId}`);
     }
-    for (const step of params.store.listSteps(params.run.runtimeRunId)) {
+    for (const step of currentSteps) {
       if (isTerminalStep(step)) {
         continue;
       }
-      params.store.updateStep({
-        runtimeRunId: params.run.runtimeRunId,
+      const updatedStep = params.store.updateStep({
+        runtimeRunId: currentRun.runtimeRunId,
         stepId: step.stepId,
         status: "lost",
         recoveryState: "terminal",
@@ -226,37 +289,42 @@ function markRunLost(params: {
         metadata: mergeRecoveryDiagnosticMetadata(step.metadata, diagnostic),
         now: params.now,
       });
+      if (!updatedStep) {
+        throw new Error(
+          `durable step could not be marked lost: ${currentRun.runtimeRunId}:${step.stepId}`,
+        );
+      }
     }
     params.store.appendEvent({
-      runtimeRunId: params.run.runtimeRunId,
+      runtimeRunId: currentRun.runtimeRunId,
       eventType: params.eventType,
       eventTime: params.now,
       stepId: params.stepId,
       agentInvocationId: params.agentInvocationId,
-      idempotencyKey: params.run.idempotencyKey,
-      correlationId: correlationIdForRun(params.run),
+      idempotencyKey: currentRun.idempotencyKey,
+      correlationId: correlationIdForRun(currentRun),
       payload: {
         reason: params.reason,
         processInstanceId: params.processInstanceId,
-        previousStatus: params.run.status,
-        previousRecoveryState: params.run.recoveryState,
+        previousStatus: currentRun.status,
+        previousRecoveryState: currentRun.recoveryState,
         recoveryDiagnostic: diagnostic,
       },
     });
-    const sourceOwner = params.run.sourceOwner ?? "durable_execution_records";
-    const sourceRef = params.run.sourceRef ?? params.run.runtimeRunId;
+    const sourceOwner = currentRun.sourceOwner ?? "durable_execution_records";
+    const sourceRef = currentRun.sourceRef ?? currentRun.runtimeRunId;
     const sessionKey = firstString(
-      params.run.metadata?.sessionKey,
-      params.run.sourceOwner === "session_store" ? params.run.sourceRef : undefined,
+      currentRun.metadata?.sessionKey,
+      currentRun.sourceOwner === "session_store" ? currentRun.sourceRef : undefined,
     );
     const fact = params.store.recordUncertaintyFact({
       sourceOwner,
       sourceRef,
       kind: "lost_after_dispatch",
-      sourceRunId: params.run.runtimeRunId,
+      sourceRunId: currentRun.runtimeRunId,
       stepId: params.stepId,
       refId: params.processInstanceId,
-      dedupeKey: `restart-lost:${params.run.runtimeRunId}:${params.processInstanceId}`,
+      dedupeKey: `restart-lost:${currentRun.runtimeRunId}:${params.processInstanceId}`,
       facts: diagnostic,
       now: params.now,
     });
@@ -264,9 +332,9 @@ function markRunLost(params: {
       sourceOwner,
       sourceRef,
       targetKind: sessionKey ? "agent_session" : "run",
-      targetRef: sessionKey ?? params.run.runtimeRunId,
+      targetRef: sessionKey ?? currentRun.runtimeRunId,
       ownerKind: sessionKey ? "agent_session" : "run",
-      ownerRef: sessionKey ?? params.run.runtimeRunId,
+      ownerRef: sessionKey ?? currentRun.runtimeRunId,
       reportRouteRef: sessionKey,
       targetResolutionStatus: "resolved",
       targetResolutionReason: sessionKey
@@ -274,8 +342,8 @@ function markRunLost(params: {
         : "durable execution record is the inspectable owner",
       reason: "restart_interrupted",
       factsRef: `uncertainty_facts:${fact.factId}`,
-      sourceRunId: params.run.runtimeRunId,
-      occurrenceKey: `restart-wake:${params.run.runtimeRunId}:${sessionKey ?? "run"}`,
+      sourceRunId: currentRun.runtimeRunId,
+      occurrenceKey: `restart-wake:${currentRun.runtimeRunId}:${sessionKey ?? "run"}`,
       metadata: diagnostic,
       now: params.now,
     });
@@ -295,6 +363,7 @@ function markAgentTurnLost(params: {
   }
   return markRunLost({
     ...params,
+    isEligible: shouldMarkAgentTurnLost,
     eventType: "agent.turn.lost",
     stepId: "recovery",
     agentInvocationId: params.run.idempotencyKey,
@@ -313,6 +382,7 @@ function markChatSendLost(params: {
   }
   return markRunLost({
     ...params,
+    isEligible: shouldMarkChatSendLost,
     eventType: "chat.send.lost",
     stepId: "intake",
   });
@@ -324,12 +394,18 @@ export function reconcileDurableAgentTurnsOnGatewayStartup(params: {
   now: number;
   limit?: number;
 }): DurableRecoveryResult {
-  const openRuns = params.store.listOpenRuns({
+  const page = params.store.listOpenRuns({
     operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-    limit: params.limit ?? 5000,
+    limit: Math.max(
+      1,
+      Math.min(
+        RECOVERY_RUN_SCAN_PAGE_SIZE,
+        Math.trunc(params.limit ?? RECOVERY_RUN_SCAN_PAGE_SIZE),
+      ),
+    ),
   });
   let markedLost = 0;
-  for (const run of openRuns) {
+  for (const run of page.runs) {
     if (
       markAgentTurnLost({
         store: params.store,
@@ -342,7 +418,7 @@ export function reconcileDurableAgentTurnsOnGatewayStartup(params: {
       markedLost += 1;
     }
   }
-  return { scanned: openRuns.length, markedLost };
+  return { scanned: page.runs.length, markedLost };
 }
 
 export function reconcileDurableChatSendsOnGatewayStartup(params: {
@@ -351,12 +427,18 @@ export function reconcileDurableChatSendsOnGatewayStartup(params: {
   now: number;
   limit?: number;
 }): DurableRecoveryResult {
-  const openRuns = params.store.listOpenRuns({
+  const page = params.store.listOpenRuns({
     operationKind: DURABLE_CHAT_SEND_OPERATION_KIND,
-    limit: params.limit ?? 5000,
+    limit: Math.max(
+      1,
+      Math.min(
+        RECOVERY_RUN_SCAN_PAGE_SIZE,
+        Math.trunc(params.limit ?? RECOVERY_RUN_SCAN_PAGE_SIZE),
+      ),
+    ),
   });
   let markedLost = 0;
-  for (const run of openRuns) {
+  for (const run of page.runs) {
     if (
       markChatSendLost({
         store: params.store,
@@ -369,7 +451,7 @@ export function reconcileDurableChatSendsOnGatewayStartup(params: {
       markedLost += 1;
     }
   }
-  return { scanned: openRuns.length, markedLost };
+  return { scanned: page.runs.length, markedLost };
 }
 
 export function reconcileStaleDurableAgentTurns(params: {
@@ -377,18 +459,21 @@ export function reconcileStaleDurableAgentTurns(params: {
   processInstanceId: string;
   now: number;
   staleAfterMs: number;
+  cursor?: string;
   limit?: number;
-}): DurableRecoveryResult {
+}): DurableStaleRecoveryResult {
   const cutoff = params.now - params.staleAfterMs;
-  const openRuns = params.store.listOpenRuns({
+  const limit = Math.max(
+    1,
+    Math.min(RECOVERY_RUN_SCAN_PAGE_SIZE, Math.trunc(params.limit ?? RECOVERY_RUN_SCAN_PAGE_SIZE)),
+  );
+  const page = params.store.listOpenRuns({
     operationKind: DURABLE_AGENT_TURN_OPERATION_KIND,
-    limit: params.limit ?? 5000,
+    ...(params.cursor ? { cursor: params.cursor } : { updatedAtOrBefore: cutoff }),
+    limit,
   });
   let markedLost = 0;
-  for (const run of openRuns) {
-    if (run.updatedAt > cutoff) {
-      continue;
-    }
+  for (const run of page.runs) {
     if (
       markAgentTurnLost({
         store: params.store,
@@ -401,7 +486,12 @@ export function reconcileStaleDurableAgentTurns(params: {
       markedLost += 1;
     }
   }
-  return { scanned: openRuns.length, markedLost };
+  return {
+    scanned: page.runs.length,
+    markedLost,
+    complete: page.complete,
+    ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+  };
 }
 
 export function reconcileStaleDurableChatSends(params: {
@@ -409,18 +499,21 @@ export function reconcileStaleDurableChatSends(params: {
   processInstanceId: string;
   now: number;
   staleAfterMs: number;
+  cursor?: string;
   limit?: number;
-}): DurableRecoveryResult {
+}): DurableStaleRecoveryResult {
   const cutoff = params.now - params.staleAfterMs;
-  const openRuns = params.store.listOpenRuns({
+  const limit = Math.max(
+    1,
+    Math.min(RECOVERY_RUN_SCAN_PAGE_SIZE, Math.trunc(params.limit ?? RECOVERY_RUN_SCAN_PAGE_SIZE)),
+  );
+  const page = params.store.listOpenRuns({
     operationKind: DURABLE_CHAT_SEND_OPERATION_KIND,
-    limit: params.limit ?? 5000,
+    ...(params.cursor ? { cursor: params.cursor } : { updatedAtOrBefore: cutoff }),
+    limit,
   });
   let markedLost = 0;
-  for (const run of openRuns) {
-    if (run.updatedAt > cutoff) {
-      continue;
-    }
+  for (const run of page.runs) {
     if (
       markChatSendLost({
         store: params.store,
@@ -433,7 +526,12 @@ export function reconcileStaleDurableChatSends(params: {
       markedLost += 1;
     }
   }
-  return { scanned: openRuns.length, markedLost };
+  return {
+    scanned: page.runs.length,
+    markedLost,
+    complete: page.complete,
+    ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+  };
 }
 
 function isTerminalRun(run: DurableRuntimeRun): boolean {
@@ -483,7 +581,8 @@ function queueStepForRecovery(params: {
   store: DurableRuntimeStore;
   runtimeRunId: string;
   stepId?: string;
-  recoveryState?: "waiting_signal" | "waiting_timer" | "retry_scheduled";
+  expectedStatus: "waiting" | "retry_scheduled";
+  expectedRecoveryState: "waiting_signal" | "waiting_timer" | "retry_scheduled";
   now: number;
 }): number {
   let queued = 0;
@@ -494,10 +593,13 @@ function queueStepForRecovery(params: {
     if (params.stepId && step.stepId !== params.stepId) {
       continue;
     }
-    if (!params.stepId && params.recoveryState && step.recoveryState !== params.recoveryState) {
+    if (
+      step.status !== params.expectedStatus ||
+      step.recoveryState !== params.expectedRecoveryState
+    ) {
       continue;
     }
-    params.store.updateStep({
+    const updated = params.store.updateStep({
       runtimeRunId: params.runtimeRunId,
       stepId: step.stepId,
       status: "queued",
@@ -507,7 +609,9 @@ function queueStepForRecovery(params: {
       heartbeatAt: null,
       now: params.now,
     });
-    queued += 1;
+    if (updated?.status === "queued" && updated.recoveryState === "runnable") {
+      queued += 1;
+    }
   }
   return queued;
 }
@@ -539,19 +643,29 @@ function reconcileDueDurableTimer(params: {
       return { fired: true, queued: false };
     }
     if (fired.timerType === "retry") {
-      queueStepForRecovery({
+      if (run.status !== "retry_scheduled" || run.recoveryState !== "retry_scheduled") {
+        return { fired: true, queued: false };
+      }
+      const queuedSteps = queueStepForRecovery({
         store: params.store,
         runtimeRunId: fired.runtimeRunId,
         stepId: fired.stepId,
-        recoveryState: "retry_scheduled",
+        expectedStatus: "retry_scheduled",
+        expectedRecoveryState: "retry_scheduled",
         now: params.now,
       });
-      params.store.updateRun({
+      if (queuedSteps === 0) {
+        return { fired: true, queued: false };
+      }
+      const updatedRun = params.store.updateRun({
         runtimeRunId: fired.runtimeRunId,
         status: "queued",
         recoveryState: "runnable",
         now: params.now,
       });
+      if (!updatedRun) {
+        throw new Error(`durable retry run could not be queued: ${fired.runtimeRunId}`);
+      }
       params.store.appendEvent({
         runtimeRunId: fired.runtimeRunId,
         eventType: "runtime.retry_due",
@@ -564,20 +678,27 @@ function reconcileDueDurableTimer(params: {
       });
       return { fired: true, queued: true };
     }
-    if (run.status === "waiting_timer" || run.recoveryState === "waiting_timer") {
-      queueStepForRecovery({
+    if (run.status === "waiting_timer" && run.recoveryState === "waiting_timer") {
+      const queuedSteps = queueStepForRecovery({
         store: params.store,
         runtimeRunId: fired.runtimeRunId,
         stepId: fired.stepId,
-        recoveryState: "waiting_timer",
+        expectedStatus: "waiting",
+        expectedRecoveryState: "waiting_timer",
         now: params.now,
       });
-      params.store.updateRun({
+      if (queuedSteps === 0) {
+        return { fired: true, queued: false };
+      }
+      const updatedRun = params.store.updateRun({
         runtimeRunId: fired.runtimeRunId,
         status: "queued",
         recoveryState: "runnable",
         now: params.now,
       });
+      if (!updatedRun) {
+        throw new Error(`durable timer run could not be queued: ${fired.runtimeRunId}`);
+      }
       params.store.appendEvent({
         runtimeRunId: fired.runtimeRunId,
         eventType: "runtime.timer.resume_queued",
@@ -660,27 +781,35 @@ function reconcilePendingDurableSignal(params: {
       });
       return { consumed: true, queued: false };
     }
-    if (
-      signal.signalType === "resume" ||
-      run.recoveryState === "waiting_signal" ||
-      run.status === "waiting_signal"
-    ) {
+    const runIsWaitingForSignal =
+      run.status === "waiting_signal" && run.recoveryState === "waiting_signal";
+    if (signal.signalType === "resume" || runIsWaitingForSignal) {
       if (!params.store.consumePendingSignal({ signalId: signal.signalId, now: params.now })) {
         return { consumed: false, queued: false };
       }
-      queueStepForRecovery({
+      if (!runIsWaitingForSignal) {
+        return { consumed: true, queued: false };
+      }
+      const queuedSteps = queueStepForRecovery({
         store: params.store,
         runtimeRunId: run.runtimeRunId,
         stepId: signal.stepId,
-        recoveryState: "waiting_signal",
+        expectedStatus: "waiting",
+        expectedRecoveryState: "waiting_signal",
         now: params.now,
       });
-      params.store.updateRun({
+      if (queuedSteps === 0) {
+        return { consumed: true, queued: false };
+      }
+      const updatedRun = params.store.updateRun({
         runtimeRunId: run.runtimeRunId,
         status: "queued",
         recoveryState: "runnable",
         now: params.now,
       });
+      if (!updatedRun) {
+        throw new Error(`durable signal run could not be queued: ${run.runtimeRunId}`);
+      }
       params.store.appendEvent({
         runtimeRunId: run.runtimeRunId,
         eventType: "runtime.signal.resume_queued",
@@ -734,6 +863,9 @@ export function startDurableRecoveryWorker(params: {
   let running = false;
   let stopped = false;
   let nextStaleScanAt = 0;
+  let staleAgentTurnCursor: string | undefined;
+  let staleChatSendCursor: string | undefined;
+  let wakeOverdueScanCursor: string | undefined;
   const idleWaiters = new Set<() => void>();
 
   const reconcileOnce = async () => {
@@ -752,18 +884,23 @@ export function startDurableRecoveryWorker(params: {
             processInstanceId: params.processInstanceId,
             now,
             staleAfterMs,
+            ...(staleAgentTurnCursor ? { cursor: staleAgentTurnCursor } : {}),
           })
-        : { scanned: 0, markedLost: 0 };
+        : { scanned: 0, markedLost: 0, complete: false };
       const chatSendResult = shouldScanStaleRuns
         ? reconcileStaleDurableChatSends({
             store,
             processInstanceId: params.processInstanceId,
             now,
             staleAfterMs,
+            ...(staleChatSendCursor ? { cursor: staleChatSendCursor } : {}),
           })
-        : { scanned: 0, markedLost: 0 };
+        : { scanned: 0, markedLost: 0, complete: false };
       if (shouldScanStaleRuns) {
-        nextStaleScanAt = now + staleScanIntervalMs;
+        staleAgentTurnCursor = result.complete ? undefined : result.nextCursor;
+        staleChatSendCursor = chatSendResult.complete ? undefined : chatSendResult.nextCursor;
+        nextStaleScanAt =
+          now + (result.complete && chatSendResult.complete ? staleScanIntervalMs : pollIntervalMs);
       }
       const timerResult = reconcileDueDurableTimers({
         store,
@@ -780,7 +917,10 @@ export function startDurableRecoveryWorker(params: {
         workerId: params.processInstanceId,
         claimTtlMs,
         reconcileOwnerFacts: shouldScanStaleRuns,
+        ownerFactReconciliationKey: resolveDurableRuntimeSqlitePath(env),
+        ...(wakeOverdueScanCursor ? { wakeOverdueScanCursor } : {}),
       });
+      wakeOverdueScanCursor = wakeResult.wakeOverdueNextCursor;
       await recoverDurableSessionAttentionDeliveries({ log });
       recordDurableRuntimeHealthSuccess();
       if (

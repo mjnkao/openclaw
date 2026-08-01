@@ -4,6 +4,7 @@ import {
   isDurableAuthorityEnabled,
   isDurableRuntimeEnabled,
   isDurableWorkerEnabled,
+  resolveDurableRuntimeSqlitePath,
 } from "./config.js";
 import { recordDurableRuntimeHealthFailure, recordDurableRuntimeHealthSuccess } from "./health.js";
 import { openDurableRuntimeStore } from "./store-factory.js";
@@ -80,6 +81,7 @@ export async function maybeRecordDurableGatewayStartup(params: {
       ownerAttentionRecovery = ownerAdaptersModule.reconcileDurableOwnerAttentionFacts({
         store,
         now: params.startupStartedAt,
+        reconciliationKey: resolveDurableRuntimeSqlitePath(env),
       });
     }
     const run = store.createRun({

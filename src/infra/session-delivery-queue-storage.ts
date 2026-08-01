@@ -30,6 +30,7 @@ type SessionDeliveryRetryPolicy = {
 type SessionDeliverySource = {
   owner: string;
   ref: string;
+  deliveryRevision?: number;
 };
 
 export type SessionDeliveryRoute = {
@@ -71,10 +72,21 @@ export type QueuedSessionDelivery = QueuedSessionDeliveryPayload & {
   lastError?: string;
 };
 
-function buildEntryId(idempotencyKey?: string): string {
-  if (!idempotencyKey) {
+function buildEntryId(params: QueuedSessionDeliveryPayload): string {
+  if (!params.idempotencyKey) {
     return generateSecureUuid();
   }
+  const durableWakeSource =
+    params.kind === "systemEvent" && params.source?.owner === "durable_wake"
+      ? params.source
+      : undefined;
+  const durableWakeDeliveryRevision = durableWakeSource?.deliveryRevision;
+  const hasDurableWakeDeliveryRevision =
+    Number.isSafeInteger(durableWakeDeliveryRevision) && (durableWakeDeliveryRevision ?? 0) > 0;
+  const idempotencyKey =
+    durableWakeSource && hasDurableWakeDeliveryRevision
+      ? `${params.idempotencyKey}\ndurable-wake-delivery-revision:${durableWakeDeliveryRevision}`
+      : params.idempotencyKey;
   return sha256Hex(idempotencyKey);
 }
 
@@ -94,7 +106,7 @@ export async function enqueueSessionDelivery(
   params: QueuedSessionDeliveryPayload,
   stateDir?: string,
 ): Promise<string> {
-  const id = buildEntryId(params.idempotencyKey);
+  const id = buildEntryId(params);
 
   if (params.idempotencyKey && loadDeliveryQueueEntry(QUEUE_NAME, id, stateDir)) {
     return id;
@@ -113,6 +125,36 @@ export async function enqueueSessionDelivery(
     stateDir,
   });
   return id;
+}
+
+/** Synchronous owner inspection used by the in-memory prompt admission boundary. */
+export function inspectSessionDeliveryForPrompt(
+  id: string,
+  stateDir?: string,
+): QueuedSessionDelivery | null {
+  return loadDeliveryQueueEntry(QUEUE_NAME, id, stateDir) as QueuedSessionDelivery | null;
+}
+
+/** Retire queue-only state that is no longer eligible to enter a session prompt. */
+export function retireSessionDeliveryBeforePrompt(id: string, stateDir?: string): void {
+  deleteDeliveryQueueEntry(QUEUE_NAME, id, stateDir);
+}
+
+/** Preserve malformed owner state for bounded retry/dead-letter handling without exposing it. */
+export function rejectSessionDeliveryBeforePrompt(
+  id: string,
+  error: string,
+  stateDir?: string,
+): void {
+  updateDeliveryQueueEntry(QUEUE_NAME, id, stateDir, (entry) => {
+    const queued = entry as QueuedSessionDelivery;
+    return {
+      ...queued,
+      retryCount: queued.retryCount + 1,
+      lastAttemptAt: Date.now(),
+      lastError: error,
+    };
+  });
 }
 
 /** Acknowledge a successfully delivered session entry. */

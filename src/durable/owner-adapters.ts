@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
   getSubagentRunFromSqlite,
   listSubagentAttentionCandidatesFromSqlite,
+  listSubagentAttentionCandidatesPageFromSqlite,
 } from "../agents/subagent-registry.store.sqlite.js";
 import type { SubagentRunRecord } from "../agents/subagent-registry.types.js";
 import {
@@ -16,9 +17,11 @@ import {
 import type { TaskFlowRecord } from "../tasks/task-flow-registry.types.js";
 import { getTaskFlowById, listTaskFlowRecords } from "../tasks/task-flow-runtime-internal.js";
 import type { TaskRecord } from "../tasks/task-registry.types.js";
+import { resolveDurableRuntimeSqlitePath } from "./config.js";
 import type {
   DurableOwnerAdapter,
   DurableOwnerAttentionFact,
+  DurableOwnerAttentionPage,
   DurableOwnerDispatchResult,
 } from "./owner-adapter-contract.js";
 import { sessionStoreOwnerAdapter } from "./session-owner-adapter.js";
@@ -31,6 +34,7 @@ import type {
 export type {
   DurableOwnerAdapter,
   DurableOwnerAttentionFact,
+  DurableOwnerAttentionPage,
   DurableOwnerDispatchResult,
 } from "./owner-adapter-contract.js";
 export { sessionStoreOwnerAdapter } from "./session-owner-adapter.js";
@@ -38,6 +42,111 @@ export { sessionStoreOwnerAdapter } from "./session-owner-adapter.js";
 const SUBAGENT_PROGRESS_SLA_MS = process.env.OPENCLAW_TEST_FAST === "1" ? 1_000 : 120_000;
 const TASK_PROGRESS_SLA_MS = process.env.OPENCLAW_TEST_FAST === "1" ? 1_000 : 120_000;
 const FLOW_PROGRESS_SLA_MS = process.env.OPENCLAW_TEST_FAST === "1" ? 1_000 : 120_000;
+const DEFAULT_OWNER_ATTENTION_PAGE_LIMIT = 500;
+const MAX_OWNER_ATTENTION_PAGE_LIMIT = 5000;
+const MAX_OWNER_ATTENTION_CURSOR_ROOTS = 64;
+
+type OwnerAttentionCursor = {
+  version: 1;
+  sourceOwner: string;
+  createdAt: number;
+  sourceRef: string;
+};
+
+function normalizeOwnerAttentionPageLimit(limit: number | undefined): number {
+  return Math.max(
+    1,
+    Math.min(
+      MAX_OWNER_ATTENTION_PAGE_LIMIT,
+      Math.trunc(limit ?? DEFAULT_OWNER_ATTENTION_PAGE_LIMIT),
+    ),
+  );
+}
+
+function compareStableStrings(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function compareOwnerAttentionPositions(
+  left: Pick<OwnerAttentionCursor, "createdAt" | "sourceRef">,
+  right: Pick<OwnerAttentionCursor, "createdAt" | "sourceRef">,
+): number {
+  return left.createdAt - right.createdAt || compareStableStrings(left.sourceRef, right.sourceRef);
+}
+
+function encodeOwnerAttentionCursor(cursor: OwnerAttentionCursor): string {
+  return `v1.${Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url")}`;
+}
+
+function decodeOwnerAttentionCursor(
+  sourceOwner: string,
+  cursor: string | undefined,
+): OwnerAttentionCursor | undefined {
+  if (!cursor?.startsWith("v1.")) {
+    return undefined;
+  }
+  try {
+    const value = JSON.parse(
+      Buffer.from(cursor.slice(3), "base64url").toString("utf8"),
+    ) as Partial<OwnerAttentionCursor>;
+    if (
+      value.version !== 1 ||
+      value.sourceOwner !== sourceOwner ||
+      typeof value.createdAt !== "number" ||
+      !Number.isFinite(value.createdAt) ||
+      typeof value.sourceRef !== "string" ||
+      !value.sourceRef
+    ) {
+      return undefined;
+    }
+    return value as OwnerAttentionCursor;
+  } catch {
+    return undefined;
+  }
+}
+
+function listDeterministicOwnerAttentionPage<T>(params: {
+  sourceOwner: string;
+  records: T[];
+  cursor?: string;
+  limit?: number;
+  createdAt: (record: T) => number;
+  sourceRef: (record: T) => string;
+  attentionFact: (record: T) => DurableOwnerAttentionFact | undefined;
+}): DurableOwnerAttentionPage {
+  const after = decodeOwnerAttentionCursor(params.sourceOwner, params.cursor);
+  const ordered = params.records
+    .map((record) => ({
+      record,
+      createdAt: params.createdAt(record),
+      sourceRef: params.sourceRef(record),
+    }))
+    .toSorted(compareOwnerAttentionPositions);
+  const remaining = after
+    ? ordered.filter((record) => compareOwnerAttentionPositions(record, after) > 0)
+    : ordered;
+  const limit = normalizeOwnerAttentionPageLimit(params.limit);
+  const scanned = remaining.slice(0, limit);
+  const complete = remaining.length <= limit;
+  const lastScanned = scanned.at(-1);
+  return {
+    facts: scanned.flatMap(({ record }) => {
+      const fact = params.attentionFact(record);
+      return fact ? [fact] : [];
+    }),
+    ...(complete || !lastScanned
+      ? {}
+      : {
+          nextCursor: encodeOwnerAttentionCursor({
+            version: 1,
+            sourceOwner: params.sourceOwner,
+            createdAt: lastScanned.createdAt,
+            sourceRef: lastScanned.sourceRef,
+          }),
+        }),
+    complete,
+  };
+}
 
 function wakeSourceRevision(wake: WakeObligation): string | undefined {
   if (wake.sourceRevision?.trim()) {
@@ -233,6 +342,32 @@ export const subagentRunsOwnerAdapter: DurableOwnerAdapter = {
     return options?.limit === undefined ? facts : facts.slice(0, options.limit);
   },
 
+  listAttentionFactsPage(options): DurableOwnerAttentionPage {
+    const sourceOwner = "subagent_runs";
+    const after = decodeOwnerAttentionCursor(sourceOwner, options?.cursor);
+    const page = listSubagentAttentionCandidatesPageFromSqlite({
+      ...(after ? { after: { createdAt: after.createdAt, runId: after.sourceRef } } : {}),
+      limit: normalizeOwnerAttentionPageLimit(options?.limit),
+    });
+    return {
+      facts: page.records.flatMap((entry) => {
+        const fact = subagentAttentionFact(entry, options?.now);
+        return fact ? [fact] : [];
+      }),
+      ...(page.nextCursor
+        ? {
+            nextCursor: encodeOwnerAttentionCursor({
+              version: 1,
+              sourceOwner,
+              createdAt: page.nextCursor.createdAt,
+              sourceRef: page.nextCursor.runId,
+            }),
+          }
+        : {}),
+      complete: page.complete,
+    };
+  },
+
   async dispatchAttention({ wake, claimToken }): Promise<DurableOwnerDispatchResult> {
     const entry = getSubagentRunFromSqlite(wake.sourceRef);
     if (!entry) {
@@ -414,6 +549,18 @@ export const taskRunsOwnerAdapter: DurableOwnerAdapter = {
     return options?.limit === undefined ? facts : facts.slice(0, options.limit);
   },
 
+  listAttentionFactsPage(options): DurableOwnerAttentionPage {
+    return listDeterministicOwnerAttentionPage({
+      sourceOwner: "task_runs",
+      records: listTaskRecords(),
+      cursor: options?.cursor,
+      limit: options?.limit,
+      createdAt: (task) => task.createdAt,
+      sourceRef: (task) => task.taskId,
+      attentionFact: (task) => taskAttentionFact(task, options?.now),
+    });
+  },
+
   async dispatchAttention({ wake, claimToken }): Promise<DurableOwnerDispatchResult> {
     const task = getTaskById(wake.sourceRef);
     if (!task) {
@@ -458,6 +605,7 @@ export const taskRunsOwnerAdapter: DurableOwnerAdapter = {
           deliveryContext: handoff.deliveryContext,
           idempotencyKey: `durable-wake:${wake.wakeId}`,
           wakeId: wake.wakeId,
+          deliveryRevision: wake.deliveryRevision,
         });
         return sessionHandoff.status === "handoff_accepted";
       },
@@ -611,6 +759,18 @@ export const flowRunsOwnerAdapter: DurableOwnerAdapter = {
     return options?.limit === undefined ? facts : facts.slice(0, options.limit);
   },
 
+  listAttentionFactsPage(options): DurableOwnerAttentionPage {
+    return listDeterministicOwnerAttentionPage({
+      sourceOwner: "flow_runs",
+      records: listTaskFlowRecords(),
+      cursor: options?.cursor,
+      limit: options?.limit,
+      createdAt: (flow) => flow.createdAt,
+      sourceRef: (flow) => flow.flowId,
+      attentionFact: (flow) => flowAttentionFact(flow, options?.now),
+    });
+  },
+
   async dispatchAttention({ wake, claimToken }): Promise<DurableOwnerDispatchResult> {
     const flow = getTaskFlowById(wake.sourceRef);
     if (!flow) {
@@ -638,6 +798,31 @@ const ownerAdapters = new Map<string, DurableOwnerAdapter>([
   [flowRunsOwnerAdapter.sourceOwner, flowRunsOwnerAdapter],
   [sessionStoreOwnerAdapter.sourceOwner, sessionStoreOwnerAdapter],
 ]);
+
+const ownerAttentionCursorsByReconciliationKey = new Map<string, Map<string, string>>();
+
+function ownerAttentionCursorsForKey(reconciliationKey: string): Map<string, string> {
+  const existing = ownerAttentionCursorsByReconciliationKey.get(reconciliationKey);
+  if (existing) {
+    ownerAttentionCursorsByReconciliationKey.delete(reconciliationKey);
+    ownerAttentionCursorsByReconciliationKey.set(reconciliationKey, existing);
+    return existing;
+  }
+  const cursors = new Map<string, string>();
+  ownerAttentionCursorsByReconciliationKey.set(reconciliationKey, cursors);
+  const oldestKey = ownerAttentionCursorsByReconciliationKey.keys().next().value;
+  if (
+    ownerAttentionCursorsByReconciliationKey.size > MAX_OWNER_ATTENTION_CURSOR_ROOTS &&
+    typeof oldestKey === "string"
+  ) {
+    ownerAttentionCursorsByReconciliationKey.delete(oldestKey);
+  }
+  return cursors;
+}
+
+export function resetDurableOwnerAttentionReconciliationCursorsForTest(): void {
+  ownerAttentionCursorsByReconciliationKey.clear();
+}
 
 export function getDurableOwnerAdapter(sourceOwner: string): DurableOwnerAdapter | undefined {
   return ownerAdapters.get(sourceOwner);
@@ -713,6 +898,7 @@ function failClosedOwnerReconciliationConflict(params: {
     wake =
       params.store.suspendWakeObligation({
         wakeId: wake.wakeId,
+        suspensionClass: "reconciliation_conflict",
         failedReason: `wake_reconciliation_${params.conflict.reason}`,
         metadata: {
           ...wake.metadata,
@@ -735,6 +921,7 @@ function failClosedOwnerReconciliationConflict(params: {
         decisionRef: `uncertainty_facts:${uncertainty.factId}`,
         idempotencyKey: `wake-reconciliation-conflict:${digest}`,
         expectedSourceRevision: wakeSourceRevision(wake),
+        expectedDeliveryRevision: wake.deliveryRevision,
         evidence: {
           occurrenceKey: params.fact.occurrenceKey,
           sourceRevision: params.fact.sourceRevision,
@@ -794,7 +981,17 @@ export function reconcileDurableOwnerAttentionFact(params: {
   }
   let wake = reconciliation.wake;
   const sourceRevisionAdvanced = reconciliation.disposition === "coalesced";
-  if (!fact.suspendedReason && sourceRevisionAdvanced && wake.status === "suspended") {
+  const autoResumableSuspension =
+    wake.suspensionClass === "capability_unavailable" ||
+    wake.suspensionClass === "target_unavailable_before_attempt"
+      ? wake.suspensionClass
+      : undefined;
+  if (
+    !fact.suspendedReason &&
+    sourceRevisionAdvanced &&
+    wake.status === "suspended" &&
+    autoResumableSuspension
+  ) {
     wake =
       params.store.resumeWakeObligation({
         wakeId: wake.wakeId,
@@ -804,6 +1001,8 @@ export function reconcileDurableOwnerAttentionFact(params: {
         decisionRef: factsRef,
         idempotencyKey: `source-revision:${fact.sourceRevision}`,
         expectedSourceRevision: fact.sourceRevision,
+        expectedDeliveryRevision: wake.deliveryRevision,
+        expectedSuspensionClass: autoResumableSuspension,
         evidence: {
           sourceRevision: fact.sourceRevision,
           occurrenceKey: fact.occurrenceKey,
@@ -820,6 +1019,11 @@ export function reconcileDurableOwnerAttentionFact(params: {
   }
   const updated = params.store.suspendWakeObligation({
     wakeId: wake.wakeId,
+    suspensionClass: fact.suspendedReason.startsWith("owner_delivery_discarded:")
+      ? "owner_decision_required"
+      : fact.suspendedReason.includes("retry")
+        ? "retry_exhausted"
+        : "capability_unavailable",
     failedReason: fact.suspendedReason,
     metadata: { ...wake.metadata, ...projectedMetadata },
     now: params.now,
@@ -835,13 +1039,32 @@ export function reconcileDurableOwnerAttentionFacts(params: {
   store: DurableRuntimeStore;
   now: number;
   limit?: number;
+  reconciliationKey?: string;
 }): { scanned: number; created: number; suspended: number; conflicts: number } {
   let scanned = 0;
   let created = 0;
   let suspended = 0;
   let conflicts = 0;
+  const reconciliationKey =
+    params.reconciliationKey?.trim() || resolveDurableRuntimeSqlitePath(process.env);
+  const cursors = ownerAttentionCursorsForKey(reconciliationKey);
   for (const adapter of ownerAdapters.values()) {
-    for (const fact of adapter.listAttentionFacts({ limit: params.limit, now: params.now })) {
+    const page = adapter.listAttentionFactsPage
+      ? adapter.listAttentionFactsPage({
+          cursor: cursors.get(adapter.sourceOwner),
+          limit: params.limit,
+          now: params.now,
+        })
+      : {
+          facts: adapter.listAttentionFacts({ limit: params.limit, now: params.now }),
+          complete: true,
+        };
+    if (!page.complete && !page.nextCursor) {
+      throw new Error(
+        `Durable owner adapter ${adapter.sourceOwner} returned an incomplete page without a cursor`,
+      );
+    }
+    for (const fact of page.facts) {
       scanned += 1;
       const reconciled = reconcileDurableOwnerAttentionFact({
         store: params.store,
@@ -857,6 +1080,11 @@ export function reconcileDurableOwnerAttentionFacts(params: {
       if (reconciled.conflict) {
         conflicts += 1;
       }
+    }
+    if (page.complete) {
+      cursors.delete(adapter.sourceOwner);
+    } else {
+      cursors.set(adapter.sourceOwner, page.nextCursor!);
     }
   }
   return { scanned, created, suspended, conflicts };

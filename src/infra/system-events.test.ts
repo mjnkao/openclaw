@@ -5,15 +5,20 @@ import type { OpenClawConfig } from "../config/config.js";
 import { resolveMainSessionKey } from "../config/sessions/main-session.js";
 import { isCronSystemEvent } from "./heartbeat-events-filter.js";
 import {
+  filterSystemEventEntriesForPrompt,
+  forgetConsumedSystemEventDeliveryQueueIds,
+  peekConsumedSystemEventDeliveryQueueIds,
+  registerSystemEventDeliveryInspector,
+  rejectSystemEventDeliveryQueueId,
+} from "./system-event-delivery-state.js";
+import {
   consumeSelectedSystemEventEntries,
   consumeSystemEventEntries,
   drainSystemEventEntries,
   enqueueSystemEvent,
-  forgetConsumedSystemEventDeliveryQueueIds,
   hasSystemEvents,
   isSystemEventContextChanged,
   peekSystemEventEntries,
-  peekConsumedSystemEventDeliveryQueueIds,
   peekSystemEvents,
   resetSystemEventsForTest,
   resolveSystemEventDeliveryContext,
@@ -161,6 +166,65 @@ describe("system events (session routing)", () => {
     expect(peekConsumedSystemEventDeliveryQueueIds(key)).toEqual(["queue-2"]);
     forgetConsumedSystemEventDeliveryQueueIds(key, ["queue-2"]);
     expect(peekConsumedSystemEventDeliveryQueueIds(key)).toEqual([]);
+  });
+
+  it("removes a rejected persisted event before prompt inspection", () => {
+    const key = "agent:main:test-rejected-prompt-admission";
+    const unregister = registerSystemEventDeliveryInspector(
+      "test-rejected-prompt-admission",
+      ({ deliveryQueueId }) => (deliveryQueueId === "queue-rejected" ? "reject" : undefined),
+    );
+    try {
+      enqueueSystemEvent("must not enter prompt", {
+        sessionKey: key,
+        deliveryQueueId: "queue-rejected",
+      });
+
+      expect(peekSystemEventEntries(key)).toEqual([]);
+      expect(peekConsumedSystemEventDeliveryQueueIds(key)).toEqual([]);
+    } finally {
+      unregister();
+    }
+  });
+
+  it("revalidates a persisted event after RAM admission and before consumption", () => {
+    const key = "agent:main:test-raced-prompt-admission";
+    let current = true;
+    const unregister = registerSystemEventDeliveryInspector(
+      "test-raced-prompt-admission",
+      ({ deliveryQueueId }) =>
+        deliveryQueueId === "queue-raced" ? (current ? "allow" : "reject") : undefined,
+    );
+    try {
+      expect(
+        enqueueSystemEvent("revision-bound attention", {
+          sessionKey: key,
+          deliveryQueueId: "queue-raced",
+        }),
+      ).toBe(true);
+      current = false;
+
+      expect(peekSystemEventEntries(key)).toEqual([]);
+      expect(peekConsumedSystemEventDeliveryQueueIds(key)).toEqual([]);
+    } finally {
+      unregister();
+    }
+  });
+
+  it("rejects a captured prompt snapshot after its queue id is retired", () => {
+    const key = "agent:main:test-retired-snapshot";
+    enqueueSystemEvent("retired delivery content", {
+      sessionKey: key,
+      deliveryQueueId: "queue-retired",
+    });
+    const captured = peekSystemEventEntries(key);
+    expect(captured).toHaveLength(1);
+
+    rejectSystemEventDeliveryQueueId("queue-retired");
+
+    expect(hasSystemEvents(key)).toBe(false);
+    expect(peekSystemEventEntries(key)).toEqual([]);
+    expect(filterSystemEventEntriesForPrompt(key, captured)).toEqual([]);
   });
 
   it("matches consumed delivery contexts through normalized route identity", () => {

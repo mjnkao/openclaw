@@ -3,15 +3,15 @@ import { requestHeartbeat } from "../infra/heartbeat-wake.js";
 import {
   ackSessionDelivery,
   enqueueSessionDelivery,
+  failSessionDelivery,
   loadPendingSessionDelivery,
 } from "../infra/session-delivery-queue.js";
 import {
-  enqueueSystemEventEntry,
   forgetConsumedSystemEventDeliveryQueueIds,
   peekConsumedSystemEventDeliveryQueueIds,
-  peekSystemEventEntries,
   releaseConsumedSystemEventDeliveryQueueIds,
-} from "../infra/system-events.js";
+} from "../infra/system-event-delivery-state.js";
+import { enqueueSystemEventEntry, peekSystemEventEntries } from "../infra/system-events.js";
 import type { DeliveryContext } from "../utils/delivery-context.types.js";
 
 export type SessionAttentionDeliveryResult =
@@ -24,7 +24,10 @@ export type SessionAttentionDeliveryResult =
       immediateAdmission: "queued" | "coalesced" | "deferred";
       queuedAt?: number;
     }
-  | { status: "missing"; reason: "invalid_session_key" | "session_not_found" };
+  | {
+      status: "missing";
+      reason: "invalid_session_key" | "session_not_found" | "delivery_not_current";
+    };
 
 export async function acknowledgeConsumedSessionAttentionDeliveries(
   sessionKey: string,
@@ -38,23 +41,34 @@ export async function acknowledgeConsumedSessionAttentionDeliveries(
         const currentSession = loadSessionEntry({ sessionKey, readConsistency: "latest" });
         const {
           acknowledgeDurableSessionWakeConsumption,
+          isDurableSessionWakeActiveForDelivery,
           supersedeDurableSessionWakeForGenerationChange,
         } = await import("../durable/session-owner-adapter.js");
+        const binding = {
+          wakeId: entry.source.ref,
+          deliveryRevision: entry.source.deliveryRevision,
+          sessionKey,
+          queuedSessionKey: entry.sessionKey,
+        };
+        if (!isDurableSessionWakeActiveForDelivery(binding)) {
+          await ackSessionDelivery(id);
+          acknowledgedIds.push(id);
+          continue;
+        }
         if (
           entry.expectedSessionId !== undefined &&
           currentSession?.sessionId !== entry.expectedSessionId
         ) {
           supersedeDurableSessionWakeForGenerationChange({
-            wakeId: entry.source.ref,
+            ...binding,
             deliveryQueueId: id,
             expectedSessionId: entry.expectedSessionId,
             actualSessionId: currentSession?.sessionId,
           });
         } else {
           acknowledgeDurableSessionWakeConsumption({
-            wakeId: entry.source.ref,
+            ...binding,
             deliveryQueueId: id,
-            sessionKey,
             expectedSessionId: entry.expectedSessionId,
           });
         }
@@ -79,6 +93,7 @@ export async function requestSessionAttentionDelivery(params: {
   text: string;
   idempotencyKey: string;
   wakeId: string;
+  deliveryRevision: number;
   contextKey?: string;
   deliveryContext?: DeliveryContext;
 }): Promise<SessionAttentionDeliveryResult> {
@@ -86,9 +101,24 @@ export async function requestSessionAttentionDelivery(params: {
   if (!sessionKey) {
     return { status: "missing", reason: "invalid_session_key" };
   }
+  const deliveryRevision = params.deliveryRevision;
+  if (!Number.isSafeInteger(deliveryRevision) || deliveryRevision <= 0) {
+    throw new Error("durable wake delivery revision is required");
+  }
+  const { isDurableSessionWakeActiveForDelivery, supersedeDurableSessionWakeForGenerationChange } =
+    await import("../durable/session-owner-adapter.js");
   const entry = loadSessionEntry({ sessionKey, readConsistency: "latest" });
   if (!entry) {
     return { status: "missing", reason: "session_not_found" };
+  }
+  const binding = {
+    wakeId: params.wakeId,
+    deliveryRevision,
+    sessionKey,
+    queuedSessionKey: sessionKey,
+  };
+  if (!isDurableSessionWakeActiveForDelivery(binding)) {
+    return { status: "missing", reason: "delivery_not_current" };
   }
 
   const deliveryQueueId = await enqueueSessionDelivery({
@@ -96,10 +126,40 @@ export async function requestSessionAttentionDelivery(params: {
     sessionKey,
     text: params.text,
     ...(entry.sessionId ? { expectedSessionId: entry.sessionId } : {}),
-    source: { owner: "durable_wake", ref: params.wakeId },
+    source: {
+      owner: "durable_wake",
+      ref: params.wakeId,
+      deliveryRevision,
+    },
     deliveryContext: params.deliveryContext,
     idempotencyKey: params.idempotencyKey,
   });
+  try {
+    if (!isDurableSessionWakeActiveForDelivery(binding)) {
+      await ackSessionDelivery(deliveryQueueId);
+      return { status: "missing", reason: "delivery_not_current" };
+    }
+    const currentSession = loadSessionEntry({ sessionKey, readConsistency: "latest" });
+    if (
+      !currentSession ||
+      (entry.sessionId !== undefined && currentSession.sessionId !== entry.sessionId)
+    ) {
+      supersedeDurableSessionWakeForGenerationChange({
+        ...binding,
+        deliveryQueueId,
+        expectedSessionId: entry.sessionId,
+        actualSessionId: currentSession?.sessionId,
+      });
+      await ackSessionDelivery(deliveryQueueId);
+      return { status: "missing", reason: "delivery_not_current" };
+    }
+  } catch (error) {
+    await failSessionDelivery(
+      deliveryQueueId,
+      error instanceof Error ? error.message : String(error),
+    );
+    throw error;
+  }
   const queued = enqueueSystemEventEntry(params.text, {
     sessionKey,
     contextKey: params.contextKey ?? params.idempotencyKey,

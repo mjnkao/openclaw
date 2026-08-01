@@ -27,10 +27,24 @@ export type DurableOwnerDispatchResult =
   | { kind: "suspended"; reason: string; evidence?: Record<string, unknown> }
   | { kind: "superseded"; reason: string; evidence?: Record<string, unknown> };
 
+export type DurableOwnerAttentionPage = {
+  facts: DurableOwnerAttentionFact[];
+  /** Opaque source-native position after the canonical records scanned by this page. */
+  nextCursor?: string;
+  complete: boolean;
+};
+
+export type DurableOwnerAttentionPageOptions = {
+  cursor?: string;
+  limit?: number;
+  now?: number;
+};
+
 export type DurableOwnerAdapter = {
   sourceOwner: string;
   inspect(sourceRef: string): DurableOwnerAttentionFact | undefined;
   listAttentionFacts(options?: { limit?: number; now?: number }): DurableOwnerAttentionFact[];
+  listAttentionFactsPage?(options?: DurableOwnerAttentionPageOptions): DurableOwnerAttentionPage;
   dispatchAttention(params: {
     wake: WakeObligation;
     claimToken: string;

@@ -9,7 +9,8 @@ const DEFAULT_WAKE_RETRY_BASE_MS = 15_000;
 const DEFAULT_WAKE_RETRY_MAX_MS = 5 * 60_000;
 const DEFAULT_WAKE_CLAIM_TTL_MS = 60_000;
 const DEFAULT_WAKE_MAX_ATTEMPTS = 6;
-const DEFAULT_NO_SILENCE_SLA_MS = 2 * 60_000;
+const DEFAULT_WAKE_OVERDUE_AFTER_MS = 2 * 60_000;
+const WAKE_OVERDUE_SCAN_PAGE_SIZE = 500;
 
 export type DurableWakeDispatcherResult = {
   ownerFactsScanned: number;
@@ -22,33 +23,52 @@ export type DurableWakeDispatcherResult = {
   suspended: number;
   superseded: number;
   overdue: number;
+  wakeOverdueNextCursor?: string;
 };
 
 function markOverdueWakes(params: {
   store: DurableRuntimeStore;
   now: number;
-  slaMs: number;
-  limit: number;
-}): number {
-  const wakes = params.store.listWakeObligationsNeedingNoSilenceDiagnostic({
-    overdueBefore: params.now - params.slaMs,
-    slaMs: params.slaMs,
-    limit: params.limit,
+  thresholdMs: number;
+  cursor?: string;
+}): { marked: number; nextCursor?: string } {
+  const overdueBefore = params.now - params.thresholdMs;
+  if (overdueBefore < 0) {
+    return { marked: 0 };
+  }
+  const page = params.store.listUnresolvedWakeObligationsPage({
+    createdAtOrBefore: overdueBefore,
+    ...(params.cursor ? { cursor: params.cursor } : {}),
+    limit: WAKE_OVERDUE_SCAN_PAGE_SIZE,
   });
-  for (const wake of wakes) {
+  let marked = 0;
+  for (const wake of page.wakes) {
     const existingMetadata = wake.metadata ?? {};
+    const existingDiagnostics =
+      typeof existingMetadata.diagnostics === "object" && existingMetadata.diagnostics
+        ? existingMetadata.diagnostics
+        : {};
+    const existingWakeOverdue =
+      typeof (existingDiagnostics as Record<string, unknown>).wakeOverdue === "object" &&
+      (existingDiagnostics as Record<string, unknown>).wakeOverdue
+        ? ((existingDiagnostics as Record<string, unknown>).wakeOverdue as Record<string, unknown>)
+        : undefined;
+    if (
+      existingWakeOverdue?.overdue === true &&
+      existingWakeOverdue.thresholdMs === params.thresholdMs
+    ) {
+      continue;
+    }
     params.store.updateWakeObligationProjection({
       wakeId: wake.wakeId,
       metadata: {
         ...existingMetadata,
         diagnostics: {
-          ...(typeof existingMetadata.diagnostics === "object" && existingMetadata.diagnostics
-            ? existingMetadata.diagnostics
-            : {}),
-          noSilenceSla: {
+          ...existingDiagnostics,
+          wakeOverdue: {
             overdue: true,
             ageMs: params.now - wake.createdAt,
-            slaMs: params.slaMs,
+            thresholdMs: params.thresholdMs,
             detectedAt: params.now,
             nextAction:
               wake.status === "suspended"
@@ -59,8 +79,12 @@ function markOverdueWakes(params: {
       },
       now: params.now,
     });
+    marked += 1;
   }
-  return wakes.length;
+  return {
+    marked,
+    ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+  };
 }
 
 function completeDispatch(params: {
@@ -145,9 +169,11 @@ export async function runDurableWakeDispatcherOnce(params: {
   retryBaseMs?: number;
   retryMaxMs?: number;
   maxAttempts?: number;
-  noSilenceSlaMs?: number;
+  wakeOverdueAfterMs?: number;
+  wakeOverdueScanCursor?: string;
   reconcileOwnerFacts?: boolean;
   ownerFactLimit?: number;
+  ownerFactReconciliationKey?: string;
 }): Promise<DurableWakeDispatcherResult> {
   const currentTime = () => params.now ?? Date.now();
   const now = currentTime();
@@ -156,6 +182,10 @@ export async function runDurableWakeDispatcherOnce(params: {
   const retryBaseMs = params.retryBaseMs ?? DEFAULT_WAKE_RETRY_BASE_MS;
   const retryMaxMs = params.retryMaxMs ?? DEFAULT_WAKE_RETRY_MAX_MS;
   const maxAttempts = Math.max(1, Math.trunc(params.maxAttempts ?? DEFAULT_WAKE_MAX_ATTEMPTS));
+  const wakeOverdueAfterMs = Math.max(
+    1,
+    Math.trunc(params.wakeOverdueAfterMs ?? DEFAULT_WAKE_OVERDUE_AFTER_MS),
+  );
   const reconciliation =
     params.reconcileOwnerFacts === false
       ? { scanned: 0, created: 0, suspended: 0, conflicts: 0 }
@@ -163,7 +193,14 @@ export async function runDurableWakeDispatcherOnce(params: {
           store: params.store,
           now,
           limit: params.ownerFactLimit,
+          reconciliationKey: params.ownerFactReconciliationKey,
         });
+  const overdueScan = markOverdueWakes({
+    store: params.store,
+    now,
+    thresholdMs: wakeOverdueAfterMs,
+    ...(params.wakeOverdueScanCursor ? { cursor: params.wakeOverdueScanCursor } : {}),
+  });
   const result: DurableWakeDispatcherResult = {
     ownerFactsScanned: reconciliation.scanned,
     obligationsCreated: reconciliation.created,
@@ -174,12 +211,8 @@ export async function runDurableWakeDispatcherOnce(params: {
     failed: 0,
     suspended: reconciliation.suspended,
     superseded: 0,
-    overdue: markOverdueWakes({
-      store: params.store,
-      now,
-      slaMs: params.noSilenceSlaMs ?? DEFAULT_NO_SILENCE_SLA_MS,
-      limit: 500,
-    }),
+    overdue: overdueScan.marked,
+    ...(overdueScan.nextCursor ? { wakeOverdueNextCursor: overdueScan.nextCursor } : {}),
   };
 
   for (let index = 0; index < limit; index += 1) {

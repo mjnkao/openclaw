@@ -1,13 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { resetConfigRuntimeState, setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import { upsertSessionEntry } from "../config/sessions/session-accessor.js";
+import { openDurableRuntimeStore } from "../durable/store-factory.js";
 import {
   enqueueSessionDelivery,
   loadPendingSessionDeliveries,
 } from "../infra/session-delivery-queue.js";
+import { peekConsumedSystemEventDeliveryQueueIds } from "../infra/system-event-delivery-state.js";
 import {
   consumeSelectedSystemEventEntries,
   enqueueSystemEventEntry,
-  peekConsumedSystemEventDeliveryQueueIds,
   peekSystemEventEntries,
   resetSystemEventsForTest,
 } from "../infra/system-events.js";
@@ -23,11 +25,13 @@ describe("session attention delivery", () => {
 
   beforeEach(() => {
     previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    setRuntimeConfigSnapshot({ durable: { mode: "observe" } });
     resetSystemEventsForTest();
   });
 
   afterEach(() => {
     resetSystemEventsForTest();
+    resetConfigRuntimeState();
     if (previousStateDir === undefined) {
       delete process.env.OPENCLAW_STATE_DIR;
     } else {
@@ -98,6 +102,17 @@ describe("session attention delivery", () => {
       process.env.OPENCLAW_STATE_DIR = stateDir;
       const sessionKey = "agent:test:session-attention-overflow";
       await upsertSessionEntry({ sessionKey }, { sessionId: "session-overflow", updatedAt: 1 });
+      const store = openDurableRuntimeStore();
+      const wake = store.createWakeObligation({
+        sourceOwner: "session_store",
+        sourceRef: sessionKey,
+        targetKind: "agent_session",
+        targetRef: sessionKey,
+        reason: "restart_interrupted",
+        occurrenceKey: "session-attention-overflow",
+        now: 1,
+      });
+      store.close();
       for (let index = 0; index < 20; index += 1) {
         enqueueSystemEventEntry(`existing durable attention ${index}`, {
           sessionKey,
@@ -110,7 +125,8 @@ describe("session attention delivery", () => {
         sessionKey,
         text: "new durable attention",
         idempotencyKey: "durable-wake:overflow",
-        wakeId: "wake-overflow",
+        wakeId: wake.wakeId,
+        deliveryRevision: wake.deliveryRevision,
       });
 
       expect(result).toMatchObject({
@@ -124,6 +140,11 @@ describe("session attention delivery", () => {
           sessionKey,
           text: "new durable attention",
           idempotencyKey: "durable-wake:overflow",
+          source: {
+            owner: "durable_wake",
+            ref: wake.wakeId,
+            deliveryRevision: wake.deliveryRevision,
+          },
         }),
       ]);
     });

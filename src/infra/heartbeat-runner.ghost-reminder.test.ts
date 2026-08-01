@@ -9,6 +9,7 @@ import {
   setupTelegramHeartbeatPluginRuntimeForTests,
   withTempHeartbeatSandbox,
 } from "./heartbeat-runner.test-utils.js";
+import { registerSystemEventDeliveryInspector } from "./system-event-delivery-state.js";
 import { enqueueSystemEvent, peekSystemEvents, resetSystemEventsForTest } from "./system-events.js";
 
 beforeEach(() => {
@@ -381,6 +382,42 @@ describe("Ghost reminder bug (issue #13317)", () => {
     expect(calledCtx?.Provider).toBe("exec-event");
     expect(calledCtx?.Body).toContain("Handle the result internally");
     expect(sendTelegram).not.toHaveBeenCalled();
+  });
+
+  it("revalidates a preflight snapshot at the model-input boundary", async () => {
+    let inspections = 0;
+    const unregister = registerSystemEventDeliveryInspector(
+      "heartbeat-model-input-race",
+      ({ deliveryQueueId }) => {
+        if (deliveryQueueId !== "queue-heartbeat-race") {
+          return undefined;
+        }
+        inspections += 1;
+        return inspections >= 4 ? "reject" : "allow";
+      },
+    );
+    try {
+      const { calledCtx, replyCallCount, sessionKey } = await runHeartbeatCase({
+        tmpPrefix: "openclaw-heartbeat-model-input-race-",
+        replyText: "must not be used",
+        reason: "exec-event",
+        target: "none",
+        enqueue: (key) => {
+          enqueueSystemEvent("exec finished: stale durable result", {
+            sessionKey: key,
+            deliveryQueueId: "queue-heartbeat-race",
+          });
+        },
+      });
+
+      expect(inspections).toBeGreaterThanOrEqual(4);
+      expect(calledCtx?.Provider).toBe("heartbeat");
+      expect(calledCtx?.Body).not.toContain("stale durable result");
+      expect(replyCallCount).toBe(1);
+      expect(peekSystemEvents(sessionKey)).toEqual([]);
+    } finally {
+      unregister();
+    }
   });
 
   it("includes untrusted exec completion details in user-relay prompts", async () => {

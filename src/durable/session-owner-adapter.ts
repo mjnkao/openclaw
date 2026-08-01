@@ -1,16 +1,24 @@
 import { loadSessionEntry } from "../config/sessions/session-accessor.js";
+import { formatErrorMessage } from "../infra/errors.js";
 import { requestHeartbeat } from "../infra/heartbeat-wake.js";
+import {
+  inspectSessionDeliveryForPrompt,
+  rejectSessionDeliveryBeforePrompt,
+  retireSessionDeliveryBeforePrompt,
+} from "../infra/session-delivery-queue-storage.js";
 import {
   drainPendingSessionDeliveries,
   type QueuedSessionDelivery,
   type SessionDeliveryRecoveryLogger,
 } from "../infra/session-delivery-queue.js";
 import {
-  enqueueSystemEventEntry,
   peekConsumedSystemEventDeliveryQueueIds,
-  peekSystemEventEntries,
-} from "../infra/system-events.js";
+  registerSystemEventDeliveryInspector,
+  rejectSystemEventDeliveryQueueId,
+} from "../infra/system-event-delivery-state.js";
+import { enqueueSystemEventEntry, peekSystemEventEntries } from "../infra/system-events.js";
 import { requestSessionAttentionDelivery } from "../sessions/session-attention.js";
+import { normalizeSessionKeyPreservingOpaquePeerIds } from "../sessions/session-key-utils.js";
 import { isDurableRuntimeEnabled } from "./config.js";
 import type {
   DurableOwnerAdapter,
@@ -20,9 +28,150 @@ import type {
 import { openDurableRuntimeStore } from "./store-factory.js";
 import type { WakeObligation } from "./types.js";
 
+type DurableSessionWakeBinding = {
+  wakeId: string;
+  deliveryRevision?: number;
+  deliveryQueueId?: string;
+  sessionKey: string;
+  queuedSessionKey?: string;
+};
+
+function requireDurableSessionWakeBinding(
+  store: ReturnType<typeof openDurableRuntimeStore>,
+  params: DurableSessionWakeBinding,
+): {
+  wake: WakeObligation;
+  deliveryRevision: number;
+  controlDeliveryRevision: number;
+  staleRevision: boolean;
+} {
+  const deliveryRevision = params.deliveryRevision;
+  if (
+    deliveryRevision === undefined ||
+    !Number.isSafeInteger(deliveryRevision) ||
+    deliveryRevision <= 0
+  ) {
+    throw new Error(`durable session delivery is missing its wake revision: ${params.wakeId}`);
+  }
+  const wake = store.getWakeObligation(params.wakeId);
+  if (!wake) {
+    throw new Error(`durable session delivery references a missing wake: ${params.wakeId}`);
+  }
+  if (wake.targetKind !== "agent_session") {
+    throw new Error(`durable session delivery references a non-session wake: ${params.wakeId}`);
+  }
+  const targetRef = normalizeSessionKeyPreservingOpaquePeerIds(wake.targetRef);
+  const sessionKey = normalizeSessionKeyPreservingOpaquePeerIds(params.sessionKey);
+  const queuedSessionKey = normalizeSessionKeyPreservingOpaquePeerIds(
+    params.queuedSessionKey ?? params.sessionKey,
+  );
+  if (!targetRef || !sessionKey || !queuedSessionKey) {
+    throw new Error(`durable session delivery has an incomplete session binding: ${params.wakeId}`);
+  }
+  if (targetRef !== sessionKey || targetRef !== queuedSessionKey) {
+    throw new Error(`durable session delivery target does not match its session: ${params.wakeId}`);
+  }
+  const settledAcceptedAttempt =
+    wake.status === "handoff_accepted" &&
+    wake.deliveryRevision === deliveryRevision + 1 &&
+    store
+      .listDeliveryAttemptEvidence({
+        wakeId: wake.wakeId,
+        status: "handoff_accepted",
+        limit: 1,
+      })
+      .some((attempt) => attempt.claimedWakeDeliveryRevision === deliveryRevision);
+  return {
+    wake,
+    deliveryRevision,
+    controlDeliveryRevision: wake.deliveryRevision,
+    staleRevision: wake.deliveryRevision !== deliveryRevision && !settledAcceptedAttempt,
+  };
+}
+
+function requireCurrentDurableSessionWakeBinding(
+  store: ReturnType<typeof openDurableRuntimeStore>,
+  params: DurableSessionWakeBinding,
+): {
+  wake: WakeObligation;
+  deliveryRevision: number;
+  controlDeliveryRevision: number;
+} {
+  const binding = requireDurableSessionWakeBinding(store, params);
+  if (binding.staleRevision) {
+    throw new Error(`durable session delivery wake revision changed: ${params.wakeId}`);
+  }
+  return binding;
+}
+
+function inspectDurableSessionDeliveryForPrompt(params: {
+  sessionKey: string;
+  deliveryQueueId: string;
+}): "allow" | "reject" | undefined {
+  const entry = inspectSessionDeliveryForPrompt(params.deliveryQueueId);
+  if (entry?.kind !== "systemEvent" || entry.source?.owner !== "durable_wake") {
+    return undefined;
+  }
+  try {
+    const store = openDurableRuntimeStore();
+    let binding: ReturnType<typeof requireDurableSessionWakeBinding>;
+    try {
+      binding = requireDurableSessionWakeBinding(store, {
+        wakeId: entry.source.ref,
+        deliveryRevision: entry.source.deliveryRevision,
+        sessionKey: params.sessionKey,
+        queuedSessionKey: entry.sessionKey,
+      });
+    } finally {
+      store.close();
+    }
+    if (
+      binding.staleRevision ||
+      binding.wake.status === "acked" ||
+      binding.wake.status === "superseded"
+    ) {
+      retireSessionDeliveryBeforePrompt(entry.id);
+      return "reject";
+    }
+    const currentSession = loadSessionEntry({
+      sessionKey: params.sessionKey,
+      readConsistency: "latest",
+    });
+    if (
+      !currentSession ||
+      (entry.expectedSessionId !== undefined &&
+        currentSession.sessionId !== entry.expectedSessionId)
+    ) {
+      supersedeDurableSessionWakeForGenerationChange({
+        wakeId: entry.source.ref,
+        deliveryRevision: entry.source.deliveryRevision,
+        deliveryQueueId: entry.id,
+        sessionKey: params.sessionKey,
+        queuedSessionKey: entry.sessionKey,
+        expectedSessionId: entry.expectedSessionId,
+        actualSessionId: currentSession?.sessionId,
+      });
+      retireSessionDeliveryBeforePrompt(entry.id);
+      return "reject";
+    }
+    return "allow";
+  } catch (error) {
+    rejectSessionDeliveryBeforePrompt(entry.id, formatErrorMessage(error));
+    return "reject";
+  }
+}
+
+registerSystemEventDeliveryInspector(
+  "durable-session-wake",
+  inspectDurableSessionDeliveryForPrompt,
+);
+
 export function supersedeDurableSessionWakeForGenerationChange(params: {
   wakeId: string;
+  deliveryRevision?: number;
   deliveryQueueId: string;
+  sessionKey: string;
+  queuedSessionKey?: string;
   expectedSessionId?: string;
   actualSessionId?: string;
 }): void {
@@ -31,6 +180,7 @@ export function supersedeDurableSessionWakeForGenerationChange(params: {
   }
   const store = openDurableRuntimeStore();
   try {
+    const binding = requireCurrentDurableSessionWakeBinding(store, params);
     const wake = store.supersedeWakeObligation({
       wakeId: params.wakeId,
       actorKind: "system_worker",
@@ -38,7 +188,11 @@ export function supersedeDurableSessionWakeForGenerationChange(params: {
       reason: "target session generation changed before attached-session consumption",
       decisionRef: `session-delivery:${params.deliveryQueueId}`,
       idempotencyKey: `session-delivery-generation:${params.deliveryQueueId}`,
+      expectedDeliveryRevision: binding.controlDeliveryRevision,
       evidence: {
+        sessionKey: params.sessionKey,
+        queuedSessionKey: params.queuedSessionKey ?? params.sessionKey,
+        deliveryRevision: binding.deliveryRevision,
         expectedSessionId: params.expectedSessionId,
         actualSessionId: params.actualSessionId,
         deliveryQueueId: params.deliveryQueueId,
@@ -58,8 +212,10 @@ export function supersedeDurableSessionWakeForGenerationChange(params: {
 
 export function acknowledgeDurableSessionWakeConsumption(params: {
   wakeId: string;
+  deliveryRevision?: number;
   deliveryQueueId: string;
   sessionKey: string;
+  queuedSessionKey?: string;
   expectedSessionId?: string;
 }): void {
   if (!isDurableRuntimeEnabled()) {
@@ -67,6 +223,7 @@ export function acknowledgeDurableSessionWakeConsumption(params: {
   }
   const store = openDurableRuntimeStore();
   try {
+    const binding = requireCurrentDurableSessionWakeBinding(store, params);
     const wake = store.acknowledgeWakeObligation({
       wakeId: params.wakeId,
       actorKind: "system_worker",
@@ -74,8 +231,11 @@ export function acknowledgeDurableSessionWakeConsumption(params: {
       reason: "target session completed an agent run containing the durable attention event",
       decisionRef: `session-delivery:${params.deliveryQueueId}`,
       idempotencyKey: `session-delivery-consumed:${params.deliveryQueueId}`,
+      expectedDeliveryRevision: binding.controlDeliveryRevision,
       evidence: {
         sessionKey: params.sessionKey,
+        queuedSessionKey: params.queuedSessionKey ?? params.sessionKey,
+        deliveryRevision: binding.deliveryRevision,
         expectedSessionId: params.expectedSessionId,
         deliveryQueueId: params.deliveryQueueId,
         attachedSessionConsumptionProven: true,
@@ -102,18 +262,24 @@ function isQueuedDurableSessionAttention(
   return entry.kind === "systemEvent" && entry.source?.owner === "durable_wake";
 }
 
-/** Fail closed for orphaned queue rows; return false for already-terminal wakes. */
-export function isDurableSessionWakeActiveForDelivery(wakeId: string): boolean {
+/** Fail closed for unbound queue rows; return false for already-terminal wakes. */
+export function isDurableSessionWakeActiveForDelivery(params: DurableSessionWakeBinding): boolean {
   if (!isDurableRuntimeEnabled()) {
     throw new Error("durable runtime is disabled while a durable session wake is pending");
   }
   const store = openDurableRuntimeStore();
   try {
-    const wake = store.getWakeObligation(wakeId);
-    if (!wake) {
-      throw new Error(`durable session delivery references a missing wake: ${wakeId}`);
+    const { wake, staleRevision } = requireDurableSessionWakeBinding(store, params);
+    const active = !staleRevision && wake.status !== "acked" && wake.status !== "superseded";
+    if (!active && params.deliveryQueueId) {
+      rejectSystemEventDeliveryQueueId(params.deliveryQueueId);
     }
-    return wake.status !== "acked" && wake.status !== "superseded";
+    return active;
+  } catch (error) {
+    if (params.deliveryQueueId) {
+      rejectSystemEventDeliveryQueueId(params.deliveryQueueId);
+    }
+    throw error;
   } finally {
     store.close();
   }
@@ -132,7 +298,15 @@ export async function recoverDurableSessionAttentionDeliveries(params: {
       if (!isQueuedDurableSessionAttention(entry)) {
         return undefined;
       }
-      if (!isDurableSessionWakeActiveForDelivery(entry.source.ref)) {
+      if (
+        !isDurableSessionWakeActiveForDelivery({
+          wakeId: entry.source.ref,
+          deliveryRevision: entry.source.deliveryRevision,
+          deliveryQueueId: entry.id,
+          sessionKey: entry.sessionKey,
+          queuedSessionKey: entry.sessionKey,
+        })
+      ) {
         return undefined;
       }
       const session = loadSessionEntry({ sessionKey: entry.sessionKey, readConsistency: "latest" });
@@ -142,10 +316,14 @@ export async function recoverDurableSessionAttentionDeliveries(params: {
       ) {
         supersedeDurableSessionWakeForGenerationChange({
           wakeId: entry.source.ref,
+          deliveryRevision: entry.source.deliveryRevision,
           deliveryQueueId: entry.id,
+          sessionKey: entry.sessionKey,
+          queuedSessionKey: entry.sessionKey,
           expectedSessionId: entry.expectedSessionId,
           actualSessionId: session?.sessionId,
         });
+        rejectSystemEventDeliveryQueueId(entry.id);
         return undefined;
       }
       if (peekConsumedSystemEventDeliveryQueueIds(entry.sessionKey).includes(entry.id)) {
@@ -213,6 +391,7 @@ export const sessionStoreOwnerAdapter: DurableOwnerAdapter = {
       text: formatInterruptedSessionAttention(wake),
       idempotencyKey: `durable-wake:${wake.wakeId}`,
       wakeId: wake.wakeId,
+      deliveryRevision: wake.deliveryRevision,
     });
     if (result.status === "missing") {
       return {
