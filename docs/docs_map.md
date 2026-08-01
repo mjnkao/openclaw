@@ -8767,6 +8767,59 @@ Do not edit it by hand; run `pnpm docs:map:gen`.
   - H2: Acceptance Tests
   - H2: Open Questions
 
+## specs/durable-runtime-architecture.md
+
+- Route: /specs/durable-runtime-architecture
+- Headings:
+  - H1: Durable Runtime Residual-Gap Architecture Proposal
+  - H2: Candidate General Durable Runtime RFC
+  - H2: What Problem This Solves
+  - H2: Why The Residual Gap Matters
+  - H2: Ownership And Source-Of-Truth Position
+  - H3: Candidate Residual Schema
+  - H2: Durable Runtime Boundary
+  - H2: Canonical Owner Compatibility Contract
+  - H2: Upstream-Independent Capability Contract
+  - H2: Bounded Reconciliation And State Transactions
+  - H2: Store Paging, Claims, And Safe Resume
+  - H2: Schema, Metadata, And Protocol Evolution
+  - H2: Admission Reservation And Owner Acceptance
+  - H2: Evidence Retention And Source Deletion
+  - H2: Clocks, Storage Pressure, And State Authority
+  - H2: Candidate Integration Boundary
+  - H2: Intended User Value
+  - H2: Core Invariants
+  - H2: Durable Wake And Attention Obligations
+  - H2: Non Goals
+  - H2: Related
+
+## specs/durable-runtime-compatibility.md
+
+- Route: /specs/durable-runtime-compatibility
+- Headings:
+  - H1: Durable Runtime Residual-Gap Compatibility Check Plan
+  - H2: Scope
+  - H2: Root-Cause Coverage
+  - H2: Compatibility Check Hygiene
+  - H2: Docs-Only Validation Gate
+  - H2: Candidate Compatibility Matrix
+  - H3: Exact Schema Gate
+  - H3: Acceptance Front-Door Gate
+  - H2: Candidate Scenarios
+  - H3: Canonical Owner Compatibility
+  - H3: Upstream Independence Matrix
+  - H3: Bounded Recovery And State Transactions
+  - H3: Session Lifecycle And Multipart Delivery
+  - H3: Disabled Paths Never Mutate
+  - H3: Runtime Opt-In Without Worker Mutation
+  - H3: Store Pagination And Query Plans
+  - H3: Schema Evolution, Retention, And Storage Faults
+  - H3: Wake And Owner Attention
+  - H3: Restart And Side-Effect Uncertainty
+  - H3: Privacy, Retention, And Compaction
+  - H2: Live Proof Policy
+  - H2: Related
+
 ## start/bootstrapping.md
 
 - Route: /start/bootstrapping
