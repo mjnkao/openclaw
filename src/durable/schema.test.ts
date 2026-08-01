@@ -6,7 +6,11 @@ import { describe, expect, it } from "vitest";
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
 import { OPENCLAW_STATE_SCHEMA_VERSION } from "../state/openclaw-state-db.js";
 import { DURABLE_RUNTIME_SCHEMA_SQL } from "./schema.generated.js";
-import { ensureDurableRuntimeSchema, openDurableRuntimeSchemaReadOnly } from "./schema.js";
+import {
+  DURABLE_RUNTIME_TABLE_NAMES,
+  ensureDurableRuntimeSchema,
+  openDurableRuntimeSchemaReadOnly,
+} from "./schema.js";
 
 function listSchemaTables(db: DatabaseSync): string[] {
   return (
@@ -54,17 +58,52 @@ function closeForReadOnly(db: DatabaseSync): void {
 }
 
 describe("durable runtime schema compatibility", () => {
-  it("derives the table set dynamically and installs it when no durable table exists", () => {
+  it("installs exactly the declared eleven-table durable schema", () => {
     const { DatabaseSync } = requireNodeSqlite();
     const expected = new DatabaseSync(":memory:");
     const actual = new DatabaseSync(":memory:");
     try {
       expected.exec(DURABLE_RUNTIME_SCHEMA_SQL);
       ensureDurableRuntimeSchema(actual);
-      expect(listSchemaTables(actual)).toEqual(listSchemaTables(expected));
+      expect(listSchemaTables(expected)).toEqual([...DURABLE_RUNTIME_TABLE_NAMES].toSorted());
+      expect(listSchemaTables(actual)).toEqual([...DURABLE_RUNTIME_TABLE_NAMES].toSorted());
     } finally {
       expected.close();
       actual.close();
+    }
+  });
+
+  it("stores wake mutation authority in typed schema columns", () => {
+    const { DatabaseSync } = requireNodeSqlite();
+    const db = new DatabaseSync(":memory:");
+    try {
+      db.exec(DURABLE_RUNTIME_SCHEMA_SQL);
+      const wakeColumns = db.prepare("PRAGMA table_info(wake_obligations)").all() as Array<{
+        name: string;
+        type: string;
+        notnull: number;
+      }>;
+      const attemptColumns = db
+        .prepare("PRAGMA table_info(delivery_attempt_evidence)")
+        .all() as Array<{ name: string; type: string; notnull: number }>;
+
+      expect(wakeColumns).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ name: "delivery_revision", type: "INTEGER", notnull: 1 }),
+          expect.objectContaining({ name: "suspension_class", type: "TEXT" }),
+        ]),
+      );
+      expect(attemptColumns).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: "claimed_wake_delivery_revision",
+            type: "INTEGER",
+            notnull: 1,
+          }),
+        ]),
+      );
+    } finally {
+      db.close();
     }
   });
 
@@ -141,6 +180,41 @@ describe("durable runtime schema compatibility", () => {
         writable.close();
       }
     });
+  });
+
+  it("rejects unknown tables in the plural wake-obligations namespace", () => {
+    const { DatabaseSync } = requireNodeSqlite();
+    const db = new DatabaseSync(":memory:");
+    try {
+      db.exec(DURABLE_RUNTIME_SCHEMA_SQL);
+      db.exec("CREATE TABLE wake_obligations_archive (id TEXT PRIMARY KEY)");
+      expect(() => ensureDurableRuntimeSchema(db)).toThrow(
+        /unknown durable tables for shared schema version/,
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+  it("rolls back every durable object when first-install validation fails", () => {
+    const { DatabaseSync } = requireNodeSqlite();
+    const db = new DatabaseSync(":memory:");
+    try {
+      db.exec("CREATE TABLE install_probe (id TEXT PRIMARY KEY)");
+      db.exec("CREATE INDEX idx_wake_obligations_status ON install_probe(id)");
+
+      expect(() => ensureDurableRuntimeSchema(db)).toThrow(
+        /incompatible durable index .*expected owner/,
+      );
+      const tables = listSchemaTables(db);
+      expect(tables).toEqual(["install_probe"]);
+      expect(tables.filter((name) => DURABLE_RUNTIME_TABLE_NAMES.includes(name as never))).toEqual(
+        [],
+      );
+      expect(db.prepare("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
+    } finally {
+      db.close();
+    }
   });
 
   it("rejects a wrong durable column shape without repairing indexes", () => {

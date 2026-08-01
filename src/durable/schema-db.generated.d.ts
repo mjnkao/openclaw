@@ -12,6 +12,7 @@ export type Generated<T> =
 
 export interface DeliveryAttemptEvidence {
   attempted_at: number | null;
+  claimed_wake_delivery_revision: number;
   created_at: number;
   dedupe_key: string;
   delivery_attempt_id: string;
@@ -188,6 +189,7 @@ export interface WakeObligations {
   attempt_count: Generated<number>;
   coalescing_mode: string;
   created_at: number;
+  delivery_revision: Generated<number>;
   facts_ref: string | null;
   failed_reason: string | null;
   last_attempt_at: number | null;
@@ -204,6 +206,7 @@ export interface WakeObligations {
   source_ref: string;
   source_run_id: string | null;
   status: string;
+  suspension_class: string | null;
   target_kind: string | null;
   target_ref: string | null;
   target_resolution_reason: string | null;

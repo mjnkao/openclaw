@@ -998,12 +998,24 @@ export function openOpenClawStateDatabase(
     closeOpenClawStateDatabaseHandle(pathname, cached);
   }
 
+  if (existsSync(pathname)) {
+    const sqlite = requireNodeSqlite();
+    const preflight = new sqlite.DatabaseSync(pathname, { readOnly: true });
+    try {
+      assertSupportedSchemaVersion(preflight, pathname);
+    } finally {
+      preflight.close();
+    }
+  }
+
   ensureOpenClawStatePermissions(pathname, env);
   const sqlite = requireNodeSqlite();
   const db = new sqlite.DatabaseSync(pathname);
   const walMaintenance = (() => {
     let maintenance: SqliteWalMaintenance | undefined;
     try {
+      // Recheck on the writable handle before a persistent journal-mode change.
+      assertSupportedSchemaVersion(db, pathname);
       maintenance = configureSqliteConnectionPragmas(db, {
         busyTimeoutMs: OPENCLAW_SQLITE_BUSY_TIMEOUT_MS,
         databaseLabel: "openclaw-state",

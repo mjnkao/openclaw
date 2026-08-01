@@ -852,6 +852,10 @@ describe("openclaw state database", () => {
     const { DatabaseSync } = requireNodeSqlite();
     const db = new DatabaseSync(databasePath);
     db.exec("PRAGMA user_version = 2;");
+    expect(db.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: "delete" });
+    const schemaBefore = db
+      .prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name")
+      .all();
     db.close();
 
     expect(() =>
@@ -859,6 +863,20 @@ describe("openclaw state database", () => {
         env: { OPENCLAW_STATE_DIR: stateDir },
       }),
     ).toThrow(/newer schema version 2/);
+    expect(fs.existsSync(`${databasePath}-wal`)).toBe(false);
+    expect(fs.existsSync(`${databasePath}-shm`)).toBe(false);
+    const verify = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      expect(verify.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: "delete" });
+      expect(verify.prepare("PRAGMA user_version").get()).toEqual({ user_version: 2 });
+      expect(
+        verify
+          .prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name")
+          .all(),
+      ).toEqual(schemaBefore);
+    } finally {
+      verify.close();
+    }
   });
 
   it("does not chmod shared parent directories for explicit database paths", () => {
