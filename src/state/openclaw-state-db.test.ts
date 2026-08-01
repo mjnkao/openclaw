@@ -4189,6 +4189,43 @@ INSERT INTO macos_port_guardian_records VALUES (4242, 18789, '/usr/bin/ssh', 're
     expect(openOpenClawStateDatabase(options).db.isOpen).toBe(true);
   });
 
+  it("does not mutate a newer global schema before rejecting it", () => {
+    const stateDir = createTempStateDir();
+    const env = { OPENCLAW_STATE_DIR: stateDir };
+    const databasePath = resolveOpenClawStateSqlitePath(env);
+    fs.mkdirSync(path.dirname(databasePath), { recursive: true });
+    const { DatabaseSync } = requireNodeSqlite();
+    const db = new DatabaseSync(databasePath);
+    db.exec(`PRAGMA user_version = ${OPENCLAW_STATE_SCHEMA_VERSION + 1};`);
+    expect(db.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: "delete" });
+    const schemaBefore = db
+      .prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name")
+      .all();
+    db.close();
+
+    expect(() =>
+      openOpenClawStateDatabase({
+        env,
+      }),
+    ).toThrow(new RegExp(`newer schema version ${OPENCLAW_STATE_SCHEMA_VERSION + 1}`));
+    expect(fs.existsSync(`${databasePath}-wal`)).toBe(false);
+    expect(fs.existsSync(`${databasePath}-shm`)).toBe(false);
+    const verify = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      expect(verify.prepare("PRAGMA journal_mode").get()).toEqual({ journal_mode: "delete" });
+      expect(verify.prepare("PRAGMA user_version").get()).toEqual({
+        user_version: OPENCLAW_STATE_SCHEMA_VERSION + 1,
+      });
+      expect(
+        verify
+          .prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name")
+          .all(),
+      ).toEqual(schemaBefore);
+    } finally {
+      verify.close();
+    }
+  });
+
   it("does not chmod shared parent directories for explicit database paths", () => {
     const databasePath = path.join(
       os.tmpdir(),

@@ -74,6 +74,20 @@ type DurableSchemaContract = {
 
 let expectedDurableSchemaContract: DurableSchemaContract | undefined;
 
+export const DURABLE_RUNTIME_TABLE_NAMES = [
+  "delivery_attempt_evidence",
+  "durable_event_evidence",
+  "durable_execution_records",
+  "durable_execution_steps",
+  "durable_payload_refs",
+  "durable_run_correlations",
+  "durable_signal_evidence",
+  "durable_timer_obligations",
+  "uncertainty_facts",
+  "wake_obligation_occurrences",
+  "wake_obligations",
+] as const;
+
 function quoteSqliteIdentifier(identifier: string): string {
   return `"${identifier.replaceAll('"', '""')}"`;
 }
@@ -267,6 +281,13 @@ function collectExpectedDurableSchemaContract(): DurableSchemaContract {
     if (tableRows.length === 0) {
       throw new Error("Durable runtime schema SQL does not define any tables.");
     }
+    const expectedTableNames = [...DURABLE_RUNTIME_TABLE_NAMES].toSorted();
+    const generatedTableNames = tableRows.map((row) => row.name);
+    if (!isDeepStrictEqual(generatedTableNames, expectedTableNames)) {
+      throw new Error(
+        `Durable runtime schema SQL must define exactly ${expectedTableNames.length} tables: ${expectedTableNames.join(", ")}.`,
+      );
+    }
     return {
       tables: new Map(tableRows.map((row) => [row.name, collectTableShape(db, row.name)] as const)),
     };
@@ -333,6 +354,7 @@ function assertNoUnknownDurableTables(
         !expectedNames.has(name) &&
         (name.startsWith("durable_") ||
           name.startsWith("wake_obligation_") ||
+          name.startsWith("wake_obligations_") ||
           name.startsWith("delivery_attempt_") ||
           name.startsWith("uncertainty_")),
     );

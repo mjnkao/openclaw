@@ -161,11 +161,24 @@ export type WakeObligationControlDecision = {
   decisionRef?: string;
   idempotencyKey?: string;
   expectedSourceRevision?: string;
-  expectedDeliveryRevision?: string;
+  expectedDeliveryRevision?: number;
   evidence?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
   decidedAt: number;
 };
+
+export type WakeObligationSuspensionClass =
+  | "capability_unavailable"
+  | "target_unavailable_before_attempt"
+  | "delivery_outcome_unknown"
+  | "reconciliation_conflict"
+  | "owner_decision_required"
+  | "retry_exhausted";
+
+export type AutoResumableWakeObligationSuspensionClass = Extract<
+  WakeObligationSuspensionClass,
+  "capability_unavailable" | "target_unavailable_before_attempt"
+>;
 
 export type DurableRuntimeRun = {
   runtimeRunId: string;
@@ -191,6 +204,13 @@ export type DurableRuntimeRun = {
   createdAt: number;
   updatedAt: number;
   completedAt?: number;
+};
+
+export type DurableRuntimeRunPage = {
+  runs: DurableRuntimeRun[];
+  complete: boolean;
+  /** Opaque continuation bound to the filters used to create this page. */
+  nextCursor?: string;
 };
 
 export type DurableRuntimeStep = {
@@ -312,7 +332,8 @@ export type WakeObligation = {
   sourceRunId?: string;
   sourceRevision?: string;
   /** Store-owned projection and occurrence revision used to fence delivery consumers. */
-  deliveryRevision: string;
+  deliveryRevision: number;
+  suspensionClass?: WakeObligationSuspensionClass;
   attemptCount: number;
   lastAttemptAt?: number;
   nextAttemptAt?: number;
@@ -357,6 +378,7 @@ export type DeliveryAttemptEvidence = {
   routeKind?: WakeObligationTargetKind;
   routeRef?: string;
   status: DeliveryAttemptEvidenceStatus;
+  claimedWakeDeliveryRevision: number;
   evidence?: Record<string, unknown>;
   error?: string;
   scheduledAt: number;
@@ -406,6 +428,13 @@ export type WakeObligationInspection = {
     parentRunId?: string;
     parentSessionKey?: string;
   };
+};
+
+export type WakeObligationPage = {
+  wakes: WakeObligation[];
+  complete: boolean;
+  /** Opaque continuation bound to the filters used to create this page. */
+  nextCursor?: string;
 };
 
 export type DurableUnresolvedObligationKind =
@@ -665,6 +694,7 @@ export type UpdateWakeObligationProjectionInput = {
 
 export type SuspendWakeObligationInput = {
   wakeId: string;
+  suspensionClass: WakeObligationSuspensionClass;
   failedReason: string;
   metadata?: Record<string, unknown>;
   now?: number;
@@ -680,7 +710,7 @@ export type WakeObligationControlInput = {
   metadata?: Record<string, unknown>;
   idempotencyKey?: string;
   expectedSourceRevision?: string;
-  expectedDeliveryRevision?: string;
+  expectedDeliveryRevision?: number;
   now?: number;
 };
 
@@ -695,7 +725,10 @@ export type MarkWakeObligationDecisionRequiredInput = WakeObligationControlInput
   >;
 };
 
-export type ResumeWakeObligationInput = WakeObligationControlInput;
+export type ResumeWakeObligationInput = WakeObligationControlInput & {
+  expectedDeliveryRevision: number;
+  expectedSuspensionClass: AutoResumableWakeObligationSuspensionClass;
+};
 
 export type CreateUncertaintyFactInput = {
   factId?: string;
@@ -816,7 +849,12 @@ export type DurableRuntimeStore = {
   updateRun(input: UpdateDurableRuntimeRunInput): DurableRuntimeRun | undefined;
   appendEvent(input: AppendDurableRuntimeEventInput): DurableRuntimeEvent;
   listRuns(options?: { limit?: number }): DurableRuntimeRun[];
-  listOpenRuns(options?: { operationKind?: string; limit?: number }): DurableRuntimeRun[];
+  listOpenRuns(options?: {
+    operationKind?: string;
+    updatedAtOrBefore?: number;
+    cursor?: string;
+    limit?: number;
+  }): DurableRuntimeRunPage;
   createStep(input: CreateDurableRuntimeStepInput): DurableRuntimeStep;
   updateStep(input: UpdateDurableRuntimeStepInput): DurableRuntimeStep | undefined;
   claimNextRunnableStep(input: ClaimDurableRuntimeStepInput): DurableRuntimeStepClaim | undefined;
@@ -887,9 +925,9 @@ export type DurableRuntimeStore = {
   listUnresolvedWakeObligationsPage(input: {
     sourceOwner?: string;
     createdAtOrBefore?: number;
-    afterWakeId?: string;
+    cursor?: string;
     limit: number;
-  }): WakeObligation[];
+  }): WakeObligationPage;
   recordUncertaintyFact(input: CreateUncertaintyFactInput): UncertaintyFact;
   resolveUncertaintyFact(input: ResolveUncertaintyFactInput): UncertaintyFact | undefined;
   listUncertaintyFacts(options?: {

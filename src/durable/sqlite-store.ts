@@ -34,6 +34,7 @@ import type {
   WakeObligation,
   WakeObligationClaim,
   WakeObligationOwnerKind,
+  WakeObligationSuspensionClass,
   WakeObligationStatus,
   WakeObligationTargetKind,
   WakeObligationTargetResolutionStatus,
@@ -45,6 +46,7 @@ import type {
   DurableRuntimeRef,
   DurableRuntimeRefKind,
   DurableRuntimeRun,
+  DurableRuntimeRunPage,
   DurableRuntimeRunStatus,
   DurableRuntimeReadStore,
   DurableRuntimeSignal,
@@ -65,6 +67,7 @@ import type {
   DeliveryAttemptEvidence,
   DeliveryAttemptEvidenceStatus,
   WakeObligationInspection,
+  WakeObligationPage,
   UpdateDurableRuntimeRunInput,
   UpdateDurableRuntimeLinkInput,
   ResumeWakeObligationInput,
@@ -139,6 +142,7 @@ type WakeObligationRow = Omit<
   | "target_resolution_status"
   | "reason"
   | "status"
+  | "suspension_class"
 > & {
   coalescing_mode: "none" | "while_unresolved";
   recurrence_policy: "never" | "after_terminal" | null;
@@ -147,6 +151,7 @@ type WakeObligationRow = Omit<
   target_resolution_status: WakeObligationTargetResolutionStatus | null;
   reason: WakeObligation["reason"];
   status: WakeObligationStatus;
+  suspension_class: WakeObligationSuspensionClass | null;
 };
 
 type WakeObligationOccurrenceRow = DurableRow<"wake_obligation_occurrences">;
@@ -202,6 +207,10 @@ const DURABLE_STEP_LEASE_SCOPE = "durable_execution_step";
 const WAKE_OBLIGATION_LEASE_SCOPE = "wake_obligation";
 const WAKE_RECONCILIATION_PAGE_SIZE = 64;
 const WAKE_RECONCILIATION_MAX_PAGES = 8;
+const MAX_UNRESOLVED_WAKE_PAGE_SIZE = 500;
+const UNRESOLVED_WAKE_CURSOR_VERSION = 1;
+const MAX_OPEN_RUN_PAGE_SIZE = 500;
+const OPEN_RUN_CURSOR_VERSION = 1;
 const MAX_WAKE_INSPECTION_RELATED_ITEMS = 100;
 const MAX_WAKE_INSPECTION_OCCURRENCE_KEYS = 100;
 const MAX_DURABLE_JSON_BYTES = 64 * 1024;
@@ -562,46 +571,53 @@ function parseMetadata(value: string | null): Record<string, unknown> {
 
 const DELIVERY_ATTEMPT_INTERNAL_METADATA_KEY = "__durableInternal";
 const DELIVERY_ATTEMPT_INTERNAL_METADATA_VERSION = 1;
+const WAKE_SUSPENSION_METADATA_KEY = "durableSuspension";
 const LEGACY_CLAIMED_WAKE_SOURCE_REVISION_KEY = "claimedWakeSourceRevision";
 const LEGACY_CLAIMED_WAKE_OCCURRENCE_KEY = "claimedWakeOccurrenceKey";
 
-function wakeDeliveryRevision(row: WakeObligationRow): string {
-  const metadata = parseMetadata(row.metadata_json);
+function wakeProjectionFingerprint(
+  row: WakeObligationRow,
+  metadataJson = row.metadata_json,
+  factsRef = row.facts_ref,
+): string {
+  const metadata = parseMetadata(metadataJson);
   const reconciliation = isRecordValue(metadata.wakeReconciliation)
     ? metadata.wakeReconciliation
     : {};
-  const projection = {
-    sourceOwner: row.source_owner,
-    sourceRef: row.source_ref,
-    parentRunId: row.parent_run_id,
-    parentSessionKey: row.parent_session_key,
-    targetKind: row.target_kind,
-    targetRef: row.target_ref,
-    ownerKind: row.owner_kind,
-    ownerRef: row.owner_ref,
-    reportRouteRef: row.report_route_ref,
-    targetResolutionStatus: row.target_resolution_status,
-    targetResolutionReason: row.target_resolution_reason,
-    reason: row.reason,
-    factsRef: row.facts_ref,
-    sourceRunId: row.source_run_id,
-    sourceRevision: metadataText(metadata.sourceRevision) ?? null,
-    metadata: wakeDeliveryMetadata(metadata),
-    policy:
-      row.coalescing_mode === "none"
-        ? { mode: "none" }
-        : { mode: "while_unresolved", recurrence: row.recurrence_policy },
-    latestOccurrenceKey: metadataText(reconciliation.latestOccurrenceKey) ?? null,
-  };
-  const hash = createHash("sha256").update(stableJsonStringify(projection)).digest("hex");
-  return `v1:${hash}`;
+  return createHash("sha256")
+    .update(
+      stableJsonStringify({
+        sourceOwner: row.source_owner,
+        sourceRef: row.source_ref,
+        parentRunId: row.parent_run_id,
+        parentSessionKey: row.parent_session_key,
+        targetKind: row.target_kind,
+        targetRef: row.target_ref,
+        ownerKind: row.owner_kind,
+        ownerRef: row.owner_ref,
+        reportRouteRef: row.report_route_ref,
+        targetResolutionStatus: row.target_resolution_status,
+        targetResolutionReason: row.target_resolution_reason,
+        reason: row.reason,
+        factsRef,
+        sourceRunId: row.source_run_id,
+        sourceRevision: metadataText(metadata.sourceRevision) ?? null,
+        metadata: wakeDeliveryMetadata(metadata),
+        policy:
+          row.coalescing_mode === "none"
+            ? { mode: "none" }
+            : { mode: "while_unresolved", recurrence: row.recurrence_policy },
+        latestOccurrenceKey: metadataText(reconciliation.latestOccurrenceKey) ?? null,
+      }),
+    )
+    .digest("hex");
 }
 
 function attemptMatchesClaimedWakeRevision(
   attempt: DeliveryAttemptEvidenceRow,
   wake: WakeObligationRow,
 ): boolean {
-  return deliveryAttemptClaimedWakeRevision(attempt) === wakeDeliveryRevision(wake);
+  return attempt.claimed_wake_delivery_revision === wake.delivery_revision;
 }
 
 function deliveryAttemptClaimMetadata(
@@ -623,12 +639,6 @@ function deliveryAttemptClaimedOptionalText(
   }
   const value = internal[key];
   return value === null ? null : metadataText(value);
-}
-
-function deliveryAttemptClaimedWakeRevision(
-  attempt: DeliveryAttemptEvidenceRow,
-): string | undefined {
-  return metadataText(deliveryAttemptClaimMetadata(attempt)?.claimedWakeDeliveryRevision);
 }
 
 function deliveryAttemptPublicMetadata(
@@ -724,9 +734,10 @@ function matchesExpectedWakeRevision(
   ) {
     return false;
   }
-  const expectedDeliveryRevision = optionalText(input.expectedDeliveryRevision);
-  if (expectedDeliveryRevision) {
-    return wakeDeliveryRevision(current) === expectedDeliveryRevision;
+  const expectedDeliveryRevision = input.expectedDeliveryRevision;
+  if (expectedDeliveryRevision !== undefined) {
+    requirePositiveSafeInteger(expectedDeliveryRevision, "Expected wake delivery revision");
+    return current.delivery_revision === expectedDeliveryRevision;
   }
   return input.actorKind === "operator" || input.actorKind === "admin";
 }
@@ -907,7 +918,8 @@ function rowToWakeObligation(row: WakeObligationRow): WakeObligation {
     ...(row.facts_ref ? { factsRef: row.facts_ref } : {}),
     ...(row.source_run_id ? { sourceRunId: row.source_run_id } : {}),
     ...(sourceRevision ? { sourceRevision } : {}),
-    deliveryRevision: wakeDeliveryRevision(row),
+    deliveryRevision: row.delivery_revision,
+    ...(row.suspension_class ? { suspensionClass: row.suspension_class } : {}),
     attemptCount: row.attempt_count,
     ...(row.last_attempt_at == null ? {} : { lastAttemptAt: row.last_attempt_at }),
     ...(row.next_attempt_at == null ? {} : { nextAttemptAt: row.next_attempt_at }),
@@ -959,6 +971,7 @@ function rowToDeliveryAttemptEvidence(row: DeliveryAttemptEvidenceRow): Delivery
     ...(row.route_kind ? { routeKind: row.route_kind } : {}),
     ...(row.route_ref ? { routeRef: row.route_ref } : {}),
     status: row.status,
+    claimedWakeDeliveryRevision: row.claimed_wake_delivery_revision,
     ...(row.evidence_json
       ? { evidence: parseStoredJsonRecord(row.evidence_json, "Durable delivery evidence") }
       : {}),
@@ -1019,6 +1032,108 @@ function count(db: DatabaseSync, query: SyncQuery<CountRow>): number {
 
 function normalizeQueryLimit(limit: number | undefined, fallback: number): number {
   return Math.max(1, Math.min(5000, Math.trunc(limit ?? fallback)));
+}
+
+type UnresolvedWakePageCursor = {
+  version: typeof UNRESOLVED_WAKE_CURSOR_VERSION;
+  sourceOwner: string | null;
+  createdAtOrBefore: number | null;
+  createdAt: number;
+  wakeId: string;
+};
+
+function encodeUnresolvedWakePageCursor(cursor: UnresolvedWakePageCursor): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function decodeUnresolvedWakePageCursor(value: string): UnresolvedWakePageCursor {
+  try {
+    if (Buffer.byteLength(value, "utf8") > 2048) {
+      throw new Error("cursor is too large");
+    }
+    const decoded = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as unknown;
+    if (!isRecordValue(decoded)) {
+      throw new Error("cursor is not an object");
+    }
+    const sourceOwner = decoded.sourceOwner;
+    const createdAtOrBefore = decoded.createdAtOrBefore;
+    const createdAt = decoded.createdAt;
+    const wakeId = decoded.wakeId;
+    if (
+      decoded.version !== UNRESOLVED_WAKE_CURSOR_VERSION ||
+      (sourceOwner !== null &&
+        (typeof sourceOwner !== "string" || optionalText(sourceOwner) !== sourceOwner)) ||
+      (createdAtOrBefore !== null &&
+        (typeof createdAtOrBefore !== "number" ||
+          !Number.isSafeInteger(createdAtOrBefore) ||
+          createdAtOrBefore < 0)) ||
+      typeof createdAt !== "number" ||
+      !Number.isSafeInteger(createdAt) ||
+      typeof wakeId !== "string" ||
+      optionalText(wakeId) !== wakeId
+    ) {
+      throw new Error("cursor fields are invalid");
+    }
+    return {
+      version: UNRESOLVED_WAKE_CURSOR_VERSION,
+      sourceOwner,
+      createdAtOrBefore,
+      createdAt,
+      wakeId,
+    };
+  } catch {
+    throw new Error("Invalid unresolved wake page cursor");
+  }
+}
+
+type OpenRunPageCursor = {
+  version: typeof OPEN_RUN_CURSOR_VERSION;
+  operationKind: string | null;
+  updatedAtOrBefore: number | null;
+  updatedAt: number;
+  runtimeRunId: string;
+};
+
+function encodeOpenRunPageCursor(cursor: OpenRunPageCursor): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function decodeOpenRunPageCursor(value: string): OpenRunPageCursor {
+  try {
+    if (Buffer.byteLength(value, "utf8") > 2048) {
+      throw new Error("cursor is too large");
+    }
+    const decoded = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as unknown;
+    if (!isRecordValue(decoded)) {
+      throw new Error("cursor is not an object");
+    }
+    const operationKind = decoded.operationKind;
+    const updatedAtOrBefore = decoded.updatedAtOrBefore;
+    const updatedAt = decoded.updatedAt;
+    const runtimeRunId = decoded.runtimeRunId;
+    if (
+      decoded.version !== OPEN_RUN_CURSOR_VERSION ||
+      (operationKind !== null &&
+        (typeof operationKind !== "string" || optionalText(operationKind) !== operationKind)) ||
+      (updatedAtOrBefore !== null &&
+        (typeof updatedAtOrBefore !== "number" || !Number.isSafeInteger(updatedAtOrBefore))) ||
+      typeof updatedAt !== "number" ||
+      !Number.isSafeInteger(updatedAt) ||
+      typeof runtimeRunId !== "string" ||
+      optionalText(runtimeRunId) !== runtimeRunId
+    ) {
+      throw new Error("cursor fields are invalid");
+    }
+    return {
+      version: OPEN_RUN_CURSOR_VERSION,
+      operationKind,
+      updatedAtOrBefore,
+      updatedAt,
+      runtimeRunId,
+    };
+  } catch {
+    throw new Error("Invalid open durable run page cursor");
+  }
 }
 
 function isTerminalRunStatus(status: DurableRuntimeRunStatus): boolean {
@@ -1215,7 +1330,7 @@ export function openDurableRuntimeSqliteStore(
       input.attempt,
       "claimedSourceRunId",
     );
-    const claimedWakeDeliveryRevision = deliveryAttemptClaimedWakeRevision(input.attempt);
+    const claimedWakeDeliveryRevision = input.attempt.claimed_wake_delivery_revision;
     executeQuery(
       db,
       durableDb
@@ -1235,7 +1350,7 @@ export function openDurableRuntimeSqliteStore(
           facts_json: serializeJson({
             wakeId: input.wake.wake_id,
             deliveryAttemptId: input.attempt.delivery_attempt_id,
-            ...(claimedWakeDeliveryRevision ? { claimedWakeDeliveryRevision } : {}),
+            claimedWakeDeliveryRevision,
             ...(claimedFactsRef !== undefined ? { claimedFactsRef } : {}),
             ...(claimedSourceRunId !== undefined ? { claimedSourceRunId } : {}),
             ...(input.evidence ? { evidence: input.evidence } : {}),
@@ -1328,6 +1443,8 @@ export function openDurableRuntimeSqliteStore(
         reason: input.reason,
         facts_ref: optionalText(input.factsRef),
         source_run_id: optionalText(input.sourceRunId),
+        delivery_revision: 1,
+        suspension_class: null,
         attempt_count: 0,
         last_attempt_at: null,
         next_attempt_at: null,
@@ -1595,6 +1712,8 @@ export function openDurableRuntimeSqliteStore(
                 status: "superseded",
                 coalescing_mode: "none",
                 recurrence_policy: null,
+                delivery_revision: duplicate.delivery_revision + 1,
+                suspension_class: null,
                 failed_reason: "coalesced during durable wake reconciliation",
                 updated_at: prepared.now,
                 metadata_json: serializeJson({
@@ -1628,6 +1747,7 @@ export function openDurableRuntimeSqliteStore(
               facts_ref: optionalText(candidate.factsRef) ?? canonical.facts_ref,
               source_run_id: optionalText(candidate.sourceRunId) ?? canonical.source_run_id,
               recurrence_policy: recurrence,
+              delivery_revision: canonical.delivery_revision + 1,
               metadata_json: serializeJson({
                 ...currentMetadata,
                 ...wakeProjectionMetadata(candidate),
@@ -1727,6 +1847,7 @@ export function openDurableRuntimeSqliteStore(
     nextAttemptAt?: number | null;
     ackedAt?: number | null;
     failedReason?: string | null;
+    suspensionClass?: WakeObligationSuspensionClass | null;
     metadata?: Record<string, unknown>;
     factsRef?: string;
     now?: number;
@@ -1809,12 +1930,21 @@ export function openDurableRuntimeSqliteStore(
         input.failedReason === undefined
           ? current.failed_reason
           : optionalText(input.failedReason ?? undefined);
+      const nextSuspensionClass =
+        input.suspensionClass === undefined ? current.suspension_class : input.suspensionClass;
       const nextMetadataJson =
         input.metadata === undefined
           ? current.metadata_json
           : serializeJson({ ...parseMetadata(current.metadata_json), ...input.metadata });
       const nextFactsRef =
         input.factsRef === undefined ? current.facts_ref : optionalText(input.factsRef);
+      const projectionChanged =
+        wakeProjectionFingerprint(current) !==
+        wakeProjectionFingerprint(current, nextMetadataJson, nextFactsRef);
+      const authorityChanged =
+        projectionChanged ||
+        nextStatus !== current.status ||
+        nextSuspensionClass !== current.suspension_class;
       if (isTerminalWakeStatus(current.status)) {
         const isNoOp =
           nextStatus === current.status &&
@@ -1823,6 +1953,7 @@ export function openDurableRuntimeSqliteStore(
           isSameSqlValue(nextNextAttemptAt, current.next_attempt_at) &&
           isSameSqlValue(nextAckedAt, current.acked_at) &&
           isSameSqlValue(nextFailedReason, current.failed_reason) &&
+          isSameSqlValue(nextSuspensionClass, current.suspension_class) &&
           isSameSqlValue(nextFactsRef, current.facts_ref) &&
           isSameSqlValue(nextMetadataJson, current.metadata_json);
         if (!isNoOp) {
@@ -1845,6 +1976,8 @@ export function openDurableRuntimeSqliteStore(
             next_attempt_at: nextNextAttemptAt,
             acked_at: nextAckedAt,
             failed_reason: nextFailedReason,
+            suspension_class: nextSuspensionClass,
+            delivery_revision: current.delivery_revision + (authorityChanged ? 1 : 0),
             facts_ref: nextFactsRef,
             updated_at: now,
             metadata_json: nextMetadataJson,
@@ -1879,20 +2012,33 @@ export function openDurableRuntimeSqliteStore(
   const suspendWakeObligationRecord = (
     input: SuspendWakeObligationInput,
   ): WakeObligation | undefined => {
-    const current = getWakeObligationRecord(input.wakeId);
-    if (!current || isTerminalWakeStatus(current.status)) {
-      return undefined;
-    }
-    return updateWakeObligationRecord({
-      wakeId: input.wakeId,
-      status: "suspended",
-      failedReason: input.failedReason,
-      metadata: sanitizeWakeProjectionMetadata(input.metadata),
-      finalizeActiveClaim: {
-        attemptStatus: "unknown",
-        error: "wake suspended while dispatch outcome was unresolved",
-      },
-      now: input.now,
+    const now = input.now ?? Date.now();
+    return runSqliteImmediateTransactionSync(db, () => {
+      const current = queryFirst<WakeObligationRow>(
+        db,
+        durableDb.selectFrom("wake_obligations").selectAll().where("wake_id", "=", input.wakeId),
+      );
+      if (!current || isTerminalWakeStatus(current.status)) {
+        return undefined;
+      }
+      return updateWakeObligationRecord({
+        wakeId: input.wakeId,
+        status: "suspended",
+        failedReason: input.failedReason,
+        metadata: {
+          ...sanitizeWakeProjectionMetadata(input.metadata),
+          [WAKE_SUSPENSION_METADATA_KEY]: {
+            suspendedAt: now,
+            deliveryRevisionBeforeSuspension: current.delivery_revision,
+          },
+        },
+        suspensionClass: input.suspensionClass,
+        finalizeActiveClaim: {
+          attemptStatus: "unknown",
+          error: "wake suspended while dispatch outcome was unresolved",
+        },
+        now,
+      });
     });
   };
 
@@ -1975,17 +2121,36 @@ export function openDurableRuntimeSqliteStore(
   const listUnresolvedWakeObligationsPageRecords = (input: {
     sourceOwner?: string;
     createdAtOrBefore?: number;
-    afterWakeId?: string;
+    cursor?: string;
     limit: number;
-  }): WakeObligation[] => {
-    const sourceOwner = optionalText(input.sourceOwner);
+  }): WakeObligationPage => {
+    requirePositiveSafeInteger(input.limit, "Unresolved wake page limit");
+    if (input.limit > MAX_UNRESOLVED_WAKE_PAGE_SIZE) {
+      throw new Error(
+        `Unresolved wake page limit must not exceed ${MAX_UNRESOLVED_WAKE_PAGE_SIZE}`,
+      );
+    }
     if (
       input.createdAtOrBefore !== undefined &&
       (!Number.isSafeInteger(input.createdAtOrBefore) || input.createdAtOrBefore < 0)
     ) {
       throw new Error("Unresolved wake createdAtOrBefore must be a non-negative safe integer");
     }
-    const afterWakeId = optionalText(input.afterWakeId);
+    const requestedSourceOwner = optionalText(input.sourceOwner);
+    const requestedCreatedAtOrBefore = input.createdAtOrBefore ?? null;
+    const cursor = input.cursor ? decodeUnresolvedWakePageCursor(input.cursor) : undefined;
+    if (cursor && requestedSourceOwner !== null && requestedSourceOwner !== cursor.sourceOwner) {
+      throw new Error("Unresolved wake page cursor does not match sourceOwner");
+    }
+    if (
+      cursor &&
+      input.createdAtOrBefore !== undefined &&
+      requestedCreatedAtOrBefore !== cursor.createdAtOrBefore
+    ) {
+      throw new Error("Unresolved wake page cursor does not match createdAtOrBefore");
+    }
+    const sourceOwner = cursor?.sourceOwner ?? requestedSourceOwner;
+    const createdAtOrBefore = cursor?.createdAtOrBefore ?? requestedCreatedAtOrBefore;
     const rows = queryRows<WakeObligationRow>(
       db,
       durableDb
@@ -1993,14 +2158,40 @@ export function openDurableRuntimeSqliteStore(
         .selectAll()
         .where(unresolvedWakeStatusSql())
         .$if(Boolean(sourceOwner), (qb) => qb.where("source_owner", "=", sourceOwner!))
-        .$if(input.createdAtOrBefore !== undefined, (qb) =>
-          qb.where("created_at", "<=", input.createdAtOrBefore!),
+        .$if(createdAtOrBefore !== null, (qb) => qb.where("created_at", "<=", createdAtOrBefore!))
+        .$if(cursor !== undefined, (qb) =>
+          qb.where((eb) =>
+            eb.or([
+              eb("created_at", ">", cursor!.createdAt),
+              eb.and([
+                eb("created_at", "=", cursor!.createdAt),
+                eb("wake_id", ">", cursor!.wakeId),
+              ]),
+            ]),
+          ),
         )
-        .$if(Boolean(afterWakeId), (qb) => qb.where("wake_id", ">", afterWakeId!))
+        .orderBy("created_at", "asc")
         .orderBy("wake_id", "asc")
-        .limit(normalizeQueryLimit(input.limit, 500)),
+        .limit(input.limit + 1),
     );
-    return rows.map(rowToWakeObligation);
+    const pageRows = rows.slice(0, input.limit);
+    const complete = rows.length <= input.limit;
+    const last = pageRows.at(-1);
+    return {
+      wakes: pageRows.map(rowToWakeObligation),
+      complete,
+      ...(!complete && last
+        ? {
+            nextCursor: encodeUnresolvedWakePageCursor({
+              version: UNRESOLVED_WAKE_CURSOR_VERSION,
+              sourceOwner,
+              createdAtOrBefore,
+              createdAt: last.created_at,
+              wakeId: last.wake_id,
+            }),
+          }
+        : {}),
+    };
   };
 
   const storeListUncertaintyFacts = (options?: {
@@ -2060,6 +2251,7 @@ export function openDurableRuntimeSqliteStore(
         wakeId: input.wakeId,
         status: "acked",
         ackedAt: now,
+        suspensionClass: null,
         metadata: mergeWakeControlMetadata(current.metadata_json, decision),
         finalizeActiveClaim: { attemptStatus: "handoff_accepted" },
         now,
@@ -2101,6 +2293,7 @@ export function openDurableRuntimeSqliteStore(
         wakeId: input.wakeId,
         status: "superseded",
         failedReason: input.reason ?? "superseded",
+        suspensionClass: null,
         metadata: mergeWakeControlMetadata(
           current.metadata_json,
           decision,
@@ -2135,12 +2328,28 @@ export function openDurableRuntimeSqliteStore(
           ? rowToWakeObligation(current)
           : undefined;
       }
+      if (current.suspension_class !== input.expectedSuspensionClass) {
+        return undefined;
+      }
+      const unsafeAttempt = queryFirst<{ delivery_attempt_id: string }>(
+        db,
+        durableDb
+          .selectFrom("delivery_attempt_evidence")
+          .select("delivery_attempt_id")
+          .where("wake_id", "=", input.wakeId)
+          .where("status", "in", ["attempted", "unknown", "handoff_accepted"])
+          .limit(1),
+      );
+      if (unsafeAttempt) {
+        return undefined;
+      }
       const decision = buildWakeControlDecision(input, "resumed", now);
       return updateWakeObligationRecord({
         wakeId: input.wakeId,
         status: "pending",
         failedReason: null,
         nextAttemptAt: null,
+        suspensionClass: null,
         metadata: mergeWakeControlMetadata(current.metadata_json, decision),
         now,
       });
@@ -2171,6 +2380,8 @@ export function openDurableRuntimeSqliteStore(
       return updateWakeObligationRecord({
         wakeId: input.wakeId,
         status: current.status,
+        suspensionClass:
+          current.status === "suspended" ? "owner_decision_required" : current.suspension_class,
         metadata: mergeWakeControlMetadata(current.metadata_json, decision),
         now,
       });
@@ -2303,6 +2514,8 @@ export function openDurableRuntimeSqliteStore(
             .updateTable("wake_obligations")
             .set({
               status: "suspended",
+              suspension_class: "delivery_outcome_unknown",
+              delivery_revision: candidate.delivery_revision + 1,
               failed_reason: "dispatch_outcome_unknown",
               updated_at: now,
             })
@@ -2344,26 +2557,21 @@ export function openDurableRuntimeSqliteStore(
           .where("scope", "=", WAKE_OBLIGATION_LEASE_SCOPE)
           .where("expires_at", "<=", now),
       );
-      const candidates = queryRows<WakeObligationRow>(
-        db,
-        durableDb
-          .selectFrom("wake_obligations as w")
-          .leftJoin("state_leases as l", (join) =>
-            join
-              .onRef("l.lease_key", "=", "w.wake_id")
-              .on("l.scope", "=", WAKE_OBLIGATION_LEASE_SCOPE),
-          )
-          .selectAll("w")
-          .where("w.status", "in", ["pending", "failed"])
-          .where((eb) =>
-            eb.or([eb("w.next_attempt_at", "is", null), eb("w.next_attempt_at", "<=", now)]),
-          )
-          .where("l.lease_key", "is", null)
-          .orderBy("w.next_attempt_at", "asc")
-          .orderBy("w.updated_at", "asc")
-          .orderBy("w.wake_id", "asc")
-          .limit(100),
-      );
+      // SQLite's planner otherwise prefers the status index and sorts every matching row.
+      const candidateQuery = sql<WakeObligationRow> /* kysely-allow-raw: bounded claim plan */ `
+          SELECT w.*
+            FROM wake_obligations AS w INDEXED BY idx_wake_obligations_claimable
+            LEFT JOIN state_leases AS l
+              ON l.lease_key = w.wake_id AND l.scope = ${WAKE_OBLIGATION_LEASE_SCOPE}
+           WHERE w.status IN ('pending', 'failed')
+             AND (w.next_attempt_at IS NULL OR w.next_attempt_at <= ${now})
+             AND l.lease_key IS NULL
+           ORDER BY w.next_attempt_at, w.updated_at, w.wake_id
+           LIMIT 100
+        `;
+      const candidates = executeSqliteQuerySync(db, {
+        compile: () => candidateQuery.compile(durableDb),
+      }).rows;
       for (const candidate of candidates) {
         const ambiguousAttempt = queryFirst<DeliveryAttemptEvidenceRow>(
           db,
@@ -2422,6 +2630,7 @@ export function openDurableRuntimeSqliteStore(
             route_kind: candidate.target_kind,
             route_ref: candidate.report_route_ref ?? candidate.target_ref,
             status: "attempted",
+            claimed_wake_delivery_revision: candidate.delivery_revision,
             evidence_json: serializeJson({ workerId: input.workerId }),
             error_message: null,
             scheduled_at: now,
@@ -2436,7 +2645,6 @@ export function openDurableRuntimeSqliteStore(
             metadata_json: serializeJson({
               [DELIVERY_ATTEMPT_INTERNAL_METADATA_KEY]: {
                 version: DELIVERY_ATTEMPT_INTERNAL_METADATA_VERSION,
-                claimedWakeDeliveryRevision: wakeDeliveryRevision(candidate),
                 claimedFactsRef: candidate.facts_ref,
                 claimedSourceRunId: candidate.source_run_id,
               },
@@ -2566,6 +2774,13 @@ export function openDurableRuntimeSqliteStore(
           .updateTable("wake_obligations")
           .set({
             status: input.wakeStatus,
+            suspension_class:
+              input.wakeStatus === "suspended"
+                ? input.attemptStatus === "unknown"
+                  ? "delivery_outcome_unknown"
+                  : "owner_decision_required"
+                : null,
+            delivery_revision: wake.delivery_revision + 1,
             acked_at: input.wakeStatus === "acked" ? now : null,
             failed_reason:
               input.wakeStatus === "failed" || input.wakeStatus === "suspended"
@@ -3024,9 +3239,42 @@ export function openDurableRuntimeSqliteStore(
       return rows.map(rowToRun);
     },
 
-    listOpenRuns(options?: { operationKind?: string; limit?: number }): DurableRuntimeRun[] {
-      const limit = Math.max(1, Math.min(5000, Math.trunc(options?.limit ?? 500)));
-      const operationKind = optionalText(options?.operationKind);
+    listOpenRuns(options?: {
+      operationKind?: string;
+      updatedAtOrBefore?: number;
+      cursor?: string;
+      limit?: number;
+    }): DurableRuntimeRunPage {
+      const limit = options?.limit ?? MAX_OPEN_RUN_PAGE_SIZE;
+      requirePositiveSafeInteger(limit, "Open durable run page limit");
+      if (limit > MAX_OPEN_RUN_PAGE_SIZE) {
+        throw new Error(`Open durable run page limit must not exceed ${MAX_OPEN_RUN_PAGE_SIZE}`);
+      }
+      if (
+        options?.updatedAtOrBefore !== undefined &&
+        !Number.isSafeInteger(options.updatedAtOrBefore)
+      ) {
+        throw new Error("Open durable run updatedAtOrBefore must be a safe integer");
+      }
+      const requestedOperationKind = optionalText(options?.operationKind);
+      const requestedUpdatedAtOrBefore = options?.updatedAtOrBefore ?? null;
+      const cursor = options?.cursor ? decodeOpenRunPageCursor(options.cursor) : undefined;
+      if (
+        cursor &&
+        requestedOperationKind !== null &&
+        requestedOperationKind !== cursor.operationKind
+      ) {
+        throw new Error("Open durable run page cursor does not match operationKind");
+      }
+      if (
+        cursor &&
+        options?.updatedAtOrBefore !== undefined &&
+        requestedUpdatedAtOrBefore !== cursor.updatedAtOrBefore
+      ) {
+        throw new Error("Open durable run page cursor does not match updatedAtOrBefore");
+      }
+      const operationKind = cursor?.operationKind ?? requestedOperationKind;
+      const updatedAtOrBefore = cursor?.updatedAtOrBefore ?? requestedUpdatedAtOrBefore;
       const query = durableDb
         .selectFrom("durable_execution_records")
         .selectAll()
@@ -3034,10 +3282,40 @@ export function openDurableRuntimeSqliteStore(
         .where("recovery_state", "!=", "terminal")
         .where("completed_at", "is", null)
         .$if(Boolean(operationKind), (qb) => qb.where("operation_kind", "=", operationKind!))
+        .$if(updatedAtOrBefore !== null, (qb) => qb.where("updated_at", "<=", updatedAtOrBefore!))
+        .$if(cursor !== undefined, (qb) =>
+          qb.where((eb) =>
+            eb.or([
+              eb("updated_at", ">", cursor!.updatedAt),
+              eb.and([
+                eb("updated_at", "=", cursor!.updatedAt),
+                eb("runtime_run_id", ">", cursor!.runtimeRunId),
+              ]),
+            ]),
+          ),
+        )
         .orderBy("updated_at", "asc")
         .orderBy("runtime_run_id", "asc")
-        .limit(limit);
-      return queryRows<DurableRuntimeRunRow>(db, query).map(rowToRun);
+        .limit(limit + 1);
+      const rows = queryRows<DurableRuntimeRunRow>(db, query);
+      const pageRows = rows.slice(0, limit);
+      const complete = rows.length <= limit;
+      const last = pageRows.at(-1);
+      return {
+        runs: pageRows.map(rowToRun),
+        complete,
+        ...(!complete && last
+          ? {
+              nextCursor: encodeOpenRunPageCursor({
+                version: OPEN_RUN_CURSOR_VERSION,
+                operationKind,
+                updatedAtOrBefore,
+                updatedAt: last.updated_at,
+                runtimeRunId: last.runtime_run_id,
+              }),
+            }
+          : {}),
+      };
     },
 
     createStep(input: CreateDurableRuntimeStepInput): DurableRuntimeStep {
@@ -4110,9 +4388,9 @@ export function openDurableRuntimeSqliteStore(
     listUnresolvedWakeObligationsPage(input: {
       sourceOwner?: string;
       createdAtOrBefore?: number;
-      afterWakeId?: string;
+      cursor?: string;
       limit: number;
-    }): WakeObligation[] {
+    }): WakeObligationPage {
       return listUnresolvedWakeObligationsPageRecords(input);
     },
 

@@ -587,6 +587,14 @@ export function openOpenClawStateDatabase(
     closeOpenClawStateDatabaseHandle(pathname, cached);
   }
   assertOpenClawStateDatabaseFreshOpenAllowed(options);
+  if (existsSync(pathname)) {
+    const preflight = openNodeSqliteDatabase(pathname, { readOnly: true });
+    try {
+      assertSupportedSchemaVersion(preflight, pathname);
+    } finally {
+      preflight.close();
+    }
+  }
   ensureOpenClawStatePermissions(pathname, env);
   const db = openNodeSqliteDatabase(pathname);
   enableNodeSqliteKyselyStatementCache(db);
@@ -594,6 +602,7 @@ export function openOpenClawStateDatabase(
     let maintenance: SqliteWalMaintenance | undefined;
     try {
       db.exec(`PRAGMA busy_timeout = ${OPENCLAW_SQLITE_BUSY_TIMEOUT_MS};`);
+      // Recheck on the writable handle before any persistent connection pragma.
       assertSupportedSchemaVersion(db, pathname);
       assertStateDatabaseIntegrityBeforeMutation(db, pathname);
       configureSqlitePreSchemaPragmas(db, {

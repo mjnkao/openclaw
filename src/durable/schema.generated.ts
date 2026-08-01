@@ -35,6 +35,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_execution_records_idempotency
 CREATE INDEX IF NOT EXISTS idx_durable_execution_records_status
   ON durable_execution_records(status, updated_at, runtime_run_id);
 
+CREATE INDEX IF NOT EXISTS idx_durable_execution_records_open
+  ON durable_execution_records(updated_at, runtime_run_id)
+  WHERE status NOT IN ('succeeded', 'failed', 'cancelled', 'lost')
+    AND recovery_state != 'terminal'
+    AND completed_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_durable_execution_records_open_operation
+  ON durable_execution_records(operation_kind, updated_at, runtime_run_id)
+  WHERE status NOT IN ('succeeded', 'failed', 'cancelled', 'lost')
+    AND recovery_state != 'terminal'
+    AND completed_at IS NULL;
+
 CREATE INDEX IF NOT EXISTS idx_durable_execution_records_work_unit
   ON durable_execution_records(work_unit_id, updated_at, runtime_run_id)
   WHERE work_unit_id IS NOT NULL;
@@ -204,6 +216,17 @@ CREATE TABLE IF NOT EXISTS wake_obligations (
   reason TEXT NOT NULL,
   facts_ref TEXT,
   source_run_id TEXT,
+  delivery_revision INTEGER NOT NULL DEFAULT 1 CHECK (delivery_revision > 0),
+  suspension_class TEXT CHECK (
+    suspension_class IS NULL OR suspension_class IN (
+      'capability_unavailable',
+      'target_unavailable_before_attempt',
+      'delivery_outcome_unknown',
+      'reconciliation_conflict',
+      'owner_decision_required',
+      'retry_exhausted'
+    )
+  ),
   attempt_count INTEGER NOT NULL DEFAULT 0,
   last_attempt_at INTEGER,
   next_attempt_at INTEGER,
@@ -221,6 +244,10 @@ CREATE TABLE IF NOT EXISTS wake_obligations (
 
 CREATE INDEX IF NOT EXISTS idx_wake_obligations_status
   ON wake_obligations(status, next_attempt_at, updated_at, wake_id);
+
+CREATE INDEX IF NOT EXISTS idx_wake_obligations_claimable
+  ON wake_obligations(next_attempt_at, updated_at, wake_id)
+  WHERE status IN ('pending', 'failed');
 
 CREATE INDEX IF NOT EXISTS idx_wake_obligations_source
   ON wake_obligations(source_owner, source_ref, updated_at, wake_id);
@@ -260,6 +287,14 @@ CREATE INDEX IF NOT EXISTS idx_wake_obligations_terminal_identity
     wake_id DESC
   )
   WHERE status IN ('acked', 'superseded');
+
+CREATE INDEX IF NOT EXISTS idx_wake_obligations_unresolved_scan
+  ON wake_obligations(created_at, wake_id)
+  WHERE status NOT IN ('acked', 'superseded');
+
+CREATE INDEX IF NOT EXISTS idx_wake_obligations_unresolved_owner_scan
+  ON wake_obligations(source_owner, created_at, wake_id)
+  WHERE status NOT IN ('acked', 'superseded');
 
 CREATE TABLE IF NOT EXISTS wake_obligation_occurrences (
   source_owner TEXT NOT NULL,
@@ -318,6 +353,8 @@ CREATE TABLE IF NOT EXISTS delivery_attempt_evidence (
   route_kind TEXT,
   route_ref TEXT,
   status TEXT NOT NULL,
+  claimed_wake_delivery_revision INTEGER NOT NULL
+    CHECK (claimed_wake_delivery_revision > 0),
   evidence_json TEXT,
   error_message TEXT,
   scheduled_at INTEGER NOT NULL,
@@ -335,6 +372,10 @@ CREATE TABLE IF NOT EXISTS delivery_attempt_evidence (
 
 CREATE INDEX IF NOT EXISTS idx_delivery_attempt_evidence_status
   ON delivery_attempt_evidence(status, scheduled_at, delivery_attempt_id);
+
+CREATE INDEX IF NOT EXISTS idx_delivery_attempt_evidence_expired_claim
+  ON delivery_attempt_evidence(status, delivery_claim_expires_at, delivery_attempt_id)
+  WHERE delivery_claim_expires_at IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_delivery_attempt_evidence_source
   ON delivery_attempt_evidence(source_owner, source_ref, scheduled_at, delivery_attempt_id);
