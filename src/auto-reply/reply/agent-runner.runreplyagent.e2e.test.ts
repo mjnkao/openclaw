@@ -55,8 +55,10 @@ type AgentRunParams = {
 };
 
 const state = vi.hoisted(() => ({
+  acknowledgeConsumedSessionAttentionDeliveriesMock: vi.fn(),
   compactEmbeddedAgentSessionMock: vi.fn(),
   queueEmbeddedAgentMessageMock: vi.fn(),
+  releaseConsumedSessionAttentionDeliveriesMock: vi.fn(),
   runEmbeddedAgentMock: vi.fn(),
 }));
 
@@ -170,6 +172,13 @@ vi.mock("./queue.js", () => ({
   scheduleFollowupDrain: vi.fn(),
 }));
 
+vi.mock("../../sessions/session-attention.js", () => ({
+  acknowledgeConsumedSessionAttentionDeliveries: (sessionKey: string) =>
+    state.acknowledgeConsumedSessionAttentionDeliveriesMock(sessionKey),
+  releaseConsumedSessionAttentionDeliveries: (sessionKey: string) =>
+    state.releaseConsumedSessionAttentionDeliveriesMock(sessionKey),
+}));
+
 beforeAll(async () => {
   // Avoid attributing the initial agent-runner import cost to the first test case.
   modelFallbackModule = await import("../../agents/model-fallback.js");
@@ -179,6 +188,11 @@ beforeAll(async () => {
 
 beforeEach(() => {
   replyRunTesting.resetReplyRunRegistry();
+  state.acknowledgeConsumedSessionAttentionDeliveriesMock.mockReset();
+  state.acknowledgeConsumedSessionAttentionDeliveriesMock.mockResolvedValue({
+    acknowledgedIds: [],
+    failed: [],
+  });
   state.compactEmbeddedAgentSessionMock.mockReset();
   state.compactEmbeddedAgentSessionMock.mockResolvedValue({
     ok: true,
@@ -192,6 +206,7 @@ beforeEach(() => {
   });
   state.queueEmbeddedAgentMessageMock.mockReset();
   state.queueEmbeddedAgentMessageMock.mockReturnValue(false);
+  state.releaseConsumedSessionAttentionDeliveriesMock.mockReset();
   vi.mocked(enqueueFollowupRun).mockReset().mockReturnValue(true);
   vi.mocked(refreshQueuedFollowupSession).mockReset();
   vi.mocked(scheduleFollowupDrain).mockReset();
@@ -384,6 +399,22 @@ describe("runReplyAgent active steering", () => {
 });
 
 describe("runReplyAgent heartbeat followup guard", () => {
+  it("leaves successful heartbeat attention for the heartbeat owner to acknowledge", async () => {
+    state.runEmbeddedAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "HEARTBEAT_OK" }],
+      meta: {},
+    });
+    const { run } = createMinimalRun({
+      opts: { isHeartbeat: true },
+      sessionKey: "main",
+    });
+
+    await run();
+
+    expect(state.acknowledgeConsumedSessionAttentionDeliveriesMock).not.toHaveBeenCalled();
+    expect(state.releaseConsumedSessionAttentionDeliveriesMock).not.toHaveBeenCalled();
+  });
+
   it("drops heartbeat runs when reply-lane admission finds an active owner", async () => {
     const runState: ReplyOperationRunState = {};
     const active = createReplyOperation({

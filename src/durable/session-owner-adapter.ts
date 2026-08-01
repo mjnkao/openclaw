@@ -36,6 +36,16 @@ type DurableSessionWakeBinding = {
   queuedSessionKey?: string;
 };
 
+type DurableSessionRuntimeGuard = {
+  durableRuntimeEnabled?: boolean;
+};
+
+function requireDurableRuntimeEnabled(options?: DurableSessionRuntimeGuard): void {
+  if (!(options?.durableRuntimeEnabled ?? isDurableRuntimeEnabled())) {
+    throw new Error("durable runtime is disabled while a durable session wake is pending");
+  }
+}
+
 function requireDurableSessionWakeBinding(
   store: ReturnType<typeof openDurableRuntimeStore>,
   params: DurableSessionWakeBinding,
@@ -166,18 +176,19 @@ registerSystemEventDeliveryInspector(
   inspectDurableSessionDeliveryForPrompt,
 );
 
-export function supersedeDurableSessionWakeForGenerationChange(params: {
-  wakeId: string;
-  deliveryRevision?: number;
-  deliveryQueueId: string;
-  sessionKey: string;
-  queuedSessionKey?: string;
-  expectedSessionId?: string;
-  actualSessionId?: string;
-}): void {
-  if (!isDurableRuntimeEnabled()) {
-    throw new Error("durable runtime is disabled while a durable session wake is pending");
-  }
+export function supersedeDurableSessionWakeForGenerationChange(
+  params: {
+    wakeId: string;
+    deliveryRevision?: number;
+    deliveryQueueId: string;
+    sessionKey: string;
+    queuedSessionKey?: string;
+    expectedSessionId?: string;
+    actualSessionId?: string;
+  },
+  options?: DurableSessionRuntimeGuard,
+): void {
+  requireDurableRuntimeEnabled(options);
   const store = openDurableRuntimeStore();
   try {
     const binding = requireCurrentDurableSessionWakeBinding(store, params);
@@ -210,17 +221,18 @@ export function supersedeDurableSessionWakeForGenerationChange(params: {
   }
 }
 
-export function acknowledgeDurableSessionWakeConsumption(params: {
-  wakeId: string;
-  deliveryRevision?: number;
-  deliveryQueueId: string;
-  sessionKey: string;
-  queuedSessionKey?: string;
-  expectedSessionId?: string;
-}): void {
-  if (!isDurableRuntimeEnabled()) {
-    throw new Error("durable runtime is disabled while a durable session wake is pending");
-  }
+export function acknowledgeDurableSessionWakeConsumption(
+  params: {
+    wakeId: string;
+    deliveryRevision?: number;
+    deliveryQueueId: string;
+    sessionKey: string;
+    queuedSessionKey?: string;
+    expectedSessionId?: string;
+  },
+  options?: DurableSessionRuntimeGuard,
+): void {
+  requireDurableRuntimeEnabled(options);
   const store = openDurableRuntimeStore();
   try {
     const binding = requireCurrentDurableSessionWakeBinding(store, params);
@@ -263,10 +275,11 @@ function isQueuedDurableSessionAttention(
 }
 
 /** Fail closed for unbound queue rows; return false for already-terminal wakes. */
-export function isDurableSessionWakeActiveForDelivery(params: DurableSessionWakeBinding): boolean {
-  if (!isDurableRuntimeEnabled()) {
-    throw new Error("durable runtime is disabled while a durable session wake is pending");
-  }
+export function isDurableSessionWakeActiveForDelivery(
+  params: DurableSessionWakeBinding,
+  options?: DurableSessionRuntimeGuard,
+): boolean {
+  requireDurableRuntimeEnabled(options);
   const store = openDurableRuntimeStore();
   try {
     const { wake, staleRevision } = requireDurableSessionWakeBinding(store, params);
@@ -340,7 +353,7 @@ export async function recoverDurableSessionAttentionDeliveries(params: {
           deliveryQueueId: entry.id,
         });
         requestHeartbeat({
-          source: "other",
+          source: "hook",
           intent: "immediate",
           reason: "durable-attention-recovery",
           sessionKey: entry.sessionKey,

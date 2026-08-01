@@ -19,14 +19,9 @@ import {
   recordConsumedSystemEventDeliveryQueueIds,
   resetSystemEventDeliveryStateForTest,
 } from "./system-event-delivery-state.js";
+import type { SystemEvent } from "./system-event-types.js";
 
-export type SystemEvent = {
-  text: string;
-  ts: number;
-  contextKey?: string | null;
-  deliveryContext?: DeliveryContext;
-  deliveryQueueIds?: string[];
-};
+export type { SystemEvent } from "./system-event-types.js";
 
 const MAX_EVENTS = 20;
 

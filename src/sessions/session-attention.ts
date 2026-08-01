@@ -29,8 +29,13 @@ export type SessionAttentionDeliveryResult =
       reason: "invalid_session_key" | "session_not_found" | "delivery_not_current";
     };
 
+type SessionAttentionAcknowledgementOptions = {
+  durableRuntimeEnabled?: boolean;
+};
+
 export async function acknowledgeConsumedSessionAttentionDeliveries(
   sessionKey: string,
+  options?: SessionAttentionAcknowledgementOptions,
 ): Promise<{ acknowledgedIds: string[]; failed: Array<{ id: string; error: unknown }> }> {
   const acknowledgedIds: string[] = [];
   const failed: Array<{ id: string; error: unknown }> = [];
@@ -50,7 +55,7 @@ export async function acknowledgeConsumedSessionAttentionDeliveries(
           sessionKey,
           queuedSessionKey: entry.sessionKey,
         };
-        if (!isDurableSessionWakeActiveForDelivery(binding)) {
+        if (!isDurableSessionWakeActiveForDelivery(binding, options)) {
           await ackSessionDelivery(id);
           acknowledgedIds.push(id);
           continue;
@@ -59,18 +64,24 @@ export async function acknowledgeConsumedSessionAttentionDeliveries(
           entry.expectedSessionId !== undefined &&
           currentSession?.sessionId !== entry.expectedSessionId
         ) {
-          supersedeDurableSessionWakeForGenerationChange({
-            ...binding,
-            deliveryQueueId: id,
-            expectedSessionId: entry.expectedSessionId,
-            actualSessionId: currentSession?.sessionId,
-          });
+          supersedeDurableSessionWakeForGenerationChange(
+            {
+              ...binding,
+              deliveryQueueId: id,
+              expectedSessionId: entry.expectedSessionId,
+              actualSessionId: currentSession?.sessionId,
+            },
+            options,
+          );
         } else {
-          acknowledgeDurableSessionWakeConsumption({
-            ...binding,
-            deliveryQueueId: id,
-            expectedSessionId: entry.expectedSessionId,
-          });
+          acknowledgeDurableSessionWakeConsumption(
+            {
+              ...binding,
+              deliveryQueueId: id,
+              expectedSessionId: entry.expectedSessionId,
+            },
+            options,
+          );
         }
       }
       await ackSessionDelivery(id);
@@ -173,7 +184,7 @@ export async function requestSessionAttentionDelivery(params: {
     );
   const immediateAdmission = queued ? "queued" : admitted ? "coalesced" : "deferred";
   requestHeartbeat({
-    source: "other",
+    source: "hook",
     intent: "immediate",
     reason: "durable-attention",
     sessionKey,

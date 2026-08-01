@@ -1,6 +1,6 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { resolveGlobalMap } from "../shared/global-singleton.js";
-import type { SystemEvent } from "./system-events.js";
+import type { SystemEvent } from "./system-event-types.js";
 
 const CONSUMED_SYSTEM_EVENT_DELIVERIES_KEY = Symbol.for("openclaw.systemEvents.consumedDeliveries");
 const SYSTEM_EVENT_DELIVERY_INSPECTORS_KEY = Symbol.for("openclaw.systemEvents.deliveryInspectors");

@@ -1010,7 +1010,31 @@ describe("durable canonical owner adapters", () => {
     ]);
 
     consumeSelectedSystemEventEntries(sessionKey, peekSystemEventEntries(sessionKey));
-    await expect(acknowledgeConsumedSessionAttentionDeliveries(sessionKey)).resolves.toEqual({
+    resetConfigRuntimeState();
+    const disabledAcknowledgement = await acknowledgeConsumedSessionAttentionDeliveries(
+      sessionKey,
+      { durableRuntimeEnabled: false },
+    );
+    expect(disabledAcknowledgement.acknowledgedIds).toEqual([]);
+    expect(disabledAcknowledgement.failed).toEqual([
+      expect.objectContaining({ id: result.evidence.deliveryQueueId }),
+    ]);
+    expect(await loadPendingSessionDeliveries()).toEqual([
+      expect.objectContaining({ id: result.evidence.deliveryQueueId }),
+    ]);
+    const disabledStore = openDurableRuntimeStore();
+    try {
+      expect(disabledStore.getWakeObligation(wake.wakeId)).toMatchObject({
+        status: "handoff_accepted",
+      });
+    } finally {
+      disabledStore.close();
+    }
+    await expect(
+      acknowledgeConsumedSessionAttentionDeliveries(sessionKey, {
+        durableRuntimeEnabled: true,
+      }),
+    ).resolves.toEqual({
       acknowledgedIds: [result.evidence.deliveryQueueId],
       failed: [],
     });

@@ -2662,7 +2662,11 @@ export async function runReplyAgent(params: {
     }
 
     const attentionSessionKey = sessionKey ?? followupRun.run.sessionKey;
-    if (attentionSessionKey) {
+    if (isHeartbeat) {
+      // The heartbeat owner settles consumed attention after this successful
+      // run using the Gateway's authoritative runtime config.
+      sessionAttentionAcknowledged = true;
+    } else if (attentionSessionKey) {
       const acknowledgement =
         await acknowledgeConsumedSessionAttentionDeliveries(attentionSessionKey);
       for (const failure of acknowledgement.failed) {
@@ -2681,6 +2685,14 @@ export async function runReplyAgent(params: {
 
     return result;
   } catch (error) {
+    if (isHeartbeat) {
+      const attentionSessionKey = sessionKey ?? followupRun.run.sessionKey;
+      if (attentionSessionKey) {
+        // Heartbeat success is acknowledged by the heartbeat owner after this
+        // function returns. Failed runs must release their claim for retry.
+        releaseConsumedSessionAttentionDeliveries(attentionSessionKey);
+      }
+    }
     // Drain/restart aborts stay silent and defer to post-restart main-session
     // recovery, which resumes the interrupted turn (or emits its own genuine
     // non-resumable notice). Surfacing a generic "try again" here is a false
@@ -2738,7 +2750,7 @@ export async function runReplyAgent(params: {
     returnWithQueuedFollowupDrain(undefined);
     throw error;
   } finally {
-    if (!sessionAttentionAcknowledged) {
+    if (!sessionAttentionAcknowledged && !isHeartbeat) {
       const attentionSessionKey = sessionKey ?? followupRun.run.sessionKey;
       if (attentionSessionKey) {
         releaseConsumedSessionAttentionDeliveries(attentionSessionKey);

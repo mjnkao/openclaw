@@ -1,16 +1,24 @@
 // Covers heartbeat handling of queued reminder system events.
 import fs from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { drainFormattedSystemEvents } from "../auto-reply/reply/session-system-events.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { resolveMainSessionKey } from "../config/sessions/main-session.js";
+import { openDurableRuntimeStore } from "../durable/store-factory.js";
 import { runHeartbeatOnce } from "./heartbeat-runner.js";
 import {
   seedMainSessionStore,
   setupTelegramHeartbeatPluginRuntimeForTests,
   withTempHeartbeatSandbox,
 } from "./heartbeat-runner.test-utils.js";
+import { enqueueSessionDelivery, loadPendingSessionDeliveries } from "./session-delivery-queue.js";
 import { registerSystemEventDeliveryInspector } from "./system-event-delivery-state.js";
-import { enqueueSystemEvent, peekSystemEvents, resetSystemEventsForTest } from "./system-events.js";
+import {
+  enqueueSystemEvent,
+  enqueueSystemEventEntry,
+  peekSystemEvents,
+  resetSystemEventsForTest,
+} from "./system-events.js";
 
 beforeEach(() => {
   setupTelegramHeartbeatPluginRuntimeForTests();
@@ -549,6 +557,86 @@ describe("Ghost reminder bug (issue #13317)", () => {
         text: "Restart complete",
         messageThreadId: 42,
       });
+    });
+  });
+
+  it("settles durable attention consumed by the attached heartbeat run", async () => {
+    await withTempHeartbeatSandbox(async ({ tmpDir, storePath }) => {
+      const { cfg, sessionKey } = await createConfig({ tmpDir, storePath, target: "none" });
+      cfg.durable = { mode: "authority" };
+      const durableStore = openDurableRuntimeStore();
+      const wake = durableStore.createWakeObligation({
+        sourceOwner: "session_store",
+        sourceRef: sessionKey,
+        targetKind: "agent_session",
+        targetRef: sessionKey,
+        reason: "restart_interrupted",
+        occurrenceKey: "persisted-attention:test",
+        now: 100,
+      });
+      const claim = durableStore.claimNextWakeObligation({
+        workerId: "heartbeat-test",
+        claimTtlMs: 1_000,
+        retryBaseMs: 1_000,
+        retryMaxMs: 10_000,
+        now: 110,
+      });
+      durableStore.completeWakeObligationClaim({
+        wakeId: wake.wakeId,
+        deliveryAttemptId: claim!.deliveryAttempt.deliveryAttemptId,
+        claimToken: claim!.claimToken,
+        attemptStatus: "handoff_accepted",
+        wakeStatus: "handoff_accepted",
+        now: 120,
+      });
+      durableStore.close();
+      const deliveryQueueId = await enqueueSessionDelivery({
+        kind: "systemEvent",
+        sessionKey,
+        text: "inspect persisted attention",
+        source: {
+          owner: "durable_wake",
+          ref: wake.wakeId,
+          deliveryRevision: wake.deliveryRevision,
+        },
+        idempotencyKey: "persisted-attention:test",
+      });
+      enqueueSystemEventEntry("inspect persisted attention", {
+        sessionKey,
+        contextKey: "persisted-attention:test",
+        deliveryQueueId,
+      });
+      const getReplySpy = vi.fn(async () => {
+        await drainFormattedSystemEvents({
+          cfg,
+          sessionKey,
+          isMainSession: true,
+          isNewSession: false,
+          suppressHeartbeatOwnedEvents: true,
+        });
+        return { text: "HEARTBEAT_OK" };
+      });
+
+      const result = await runHeartbeatOnce({
+        cfg,
+        agentId: "main",
+        source: "interval",
+        intent: "scheduled",
+        reason: "interval",
+        deps: { getReplyFromConfig: getReplySpy },
+      });
+
+      expect(result.status).toBe("ran");
+      expect(await loadPendingSessionDeliveries()).toEqual([]);
+      const acknowledgedStore = openDurableRuntimeStore();
+      try {
+        expect(acknowledgedStore.getWakeObligation(wake.wakeId)).toMatchObject({
+          status: "acked",
+          deliveryRevision: 3,
+        });
+      } finally {
+        acknowledgedStore.close();
+      }
     });
   });
 

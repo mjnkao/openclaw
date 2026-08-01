@@ -89,6 +89,7 @@ import type { AgentDefaultsConfig } from "../config/types.agent-defaults.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { hasActiveCronJobs } from "../cron/active-jobs.js";
 import { resolveCronSession } from "../cron/isolated-agent/session.js";
+import { isDurableRuntimeEnabled } from "../durable/config.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { getActivePluginChannelRegistry } from "../plugins/runtime.js";
 import {
@@ -1876,11 +1877,15 @@ export async function runHeartbeatOnce(opts: {
   };
 
   const consumeInspectedSystemEvents = async () => {
-    if (!preflight.shouldInspectPendingEvents || inspectedSystemEventsToConsume.length === 0) {
-      return;
+    if (preflight.shouldInspectPendingEvents && inspectedSystemEventsToConsume.length > 0) {
+      consumeSelectedSystemEventEntries(sessionKey, inspectedSystemEventsToConsume);
     }
-    consumeSelectedSystemEventEntries(sessionKey, inspectedSystemEventsToConsume);
-    const acknowledgement = await acknowledgeConsumedSessionAttentionDeliveries(sessionKey);
+    // The agent runner can consume a generic persisted event while assembling
+    // the prompt before this heartbeat-owned snapshot is drained. Always
+    // settle queue ids that actually crossed that prompt after the run succeeds.
+    const acknowledgement = await acknowledgeConsumedSessionAttentionDeliveries(sessionKey, {
+      durableRuntimeEnabled: isDurableRuntimeEnabled(cfg.durable),
+    });
     for (const failure of acknowledgement.failed) {
       log.warn("failed to acknowledge consumed session delivery", {
         sessionKey,

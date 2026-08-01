@@ -1,7 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetConfigRuntimeState, setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import { upsertSessionEntry } from "../config/sessions/session-accessor.js";
 import { openDurableRuntimeStore } from "../durable/store-factory.js";
+import {
+  resetHeartbeatWakeStateForTests,
+  setHeartbeatWakeHandler,
+} from "../infra/heartbeat-wake.js";
 import {
   enqueueSessionDelivery,
   loadPendingSessionDeliveries,
@@ -27,10 +31,12 @@ describe("session attention delivery", () => {
     previousStateDir = process.env.OPENCLAW_STATE_DIR;
     setRuntimeConfigSnapshot({ durable: { mode: "observe" } });
     resetSystemEventsForTest();
+    resetHeartbeatWakeStateForTests();
   });
 
   afterEach(() => {
     resetSystemEventsForTest();
+    resetHeartbeatWakeStateForTests();
     resetConfigRuntimeState();
     if (previousStateDir === undefined) {
       delete process.env.OPENCLAW_STATE_DIR;
@@ -147,6 +153,47 @@ describe("session attention delivery", () => {
           },
         }),
       ]);
+    });
+  });
+
+  it("requests an immediate wake that inspects durable session attention", async () => {
+    await withTempDir({ prefix: "openclaw-session-attention-" }, async (stateDir) => {
+      process.env.OPENCLAW_STATE_DIR = stateDir;
+      const sessionKey = "agent:test:session-attention-wake";
+      await upsertSessionEntry({ sessionKey }, { sessionId: "session-wake", updatedAt: 1 });
+      const store = openDurableRuntimeStore();
+      const wake = store.createWakeObligation({
+        sourceOwner: "session_store",
+        sourceRef: sessionKey,
+        targetKind: "agent_session",
+        targetRef: sessionKey,
+        reason: "restart_interrupted",
+        occurrenceKey: "session-attention-wake",
+        now: 1,
+      });
+      store.close();
+      const handler = vi.fn(async () => ({ status: "ran" as const, durationMs: 1 }));
+      const dispose = setHeartbeatWakeHandler(handler);
+
+      await requestSessionAttentionDelivery({
+        sessionKey,
+        text: "inspect interrupted durable work",
+        idempotencyKey: "durable-wake:wake-request",
+        wakeId: wake.wakeId,
+        deliveryRevision: wake.deliveryRevision,
+      });
+
+      await vi.waitFor(() => {
+        expect(handler).toHaveBeenCalledWith(
+          expect.objectContaining({
+            source: "hook",
+            intent: "immediate",
+            reason: "durable-attention",
+            sessionKey,
+          }),
+        );
+      });
+      dispose();
     });
   });
 });
