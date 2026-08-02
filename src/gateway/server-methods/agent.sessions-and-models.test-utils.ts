@@ -1809,6 +1809,7 @@ describe("gateway agent handler", () => {
       mockMainSessionEntry(
         {
           sessionId: "expected-stale-session-id",
+          lifecycleRevision: "expected-stale-revision",
           updatedAt: now,
           sessionStartedAt: now - 25 * 60 * 60_000,
           lastInteractionAt: now - 25 * 60 * 60_000,
@@ -1843,6 +1844,7 @@ describe("gateway agent handler", () => {
           agentId: "main",
           sessionKey: "agent:main:main",
           expectedExistingSessionId: "expected-stale-session-id",
+          expectedLifecycleRevision: "expected-stale-revision",
           idempotencyKey: "expected-stale-agent-session",
         },
         {
@@ -1863,6 +1865,36 @@ describe("gateway agent handler", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("rejects backend work after a reset retains the expected session id", async () => {
+    mockMainSessionEntry({
+      sessionId: "retained-session-id",
+      lifecycleRevision: "replacement-revision",
+      updatedAt: Date.now(),
+    });
+    mocks.agentCommand.mockClear();
+    const respond = vi.fn();
+
+    await invokeAgent(
+      {
+        message: "resume replaced requester",
+        agentId: "main",
+        sessionKey: "agent:main:main",
+        expectedExistingSessionId: "retained-session-id",
+        expectedLifecycleRevision: "original-revision",
+        idempotencyKey: "expected-replaced-lifecycle",
+      },
+      {
+        reqId: "expected-replaced-lifecycle",
+        client: backendGatewayClient(),
+        respond,
+      },
+    );
+
+    expect(mocks.agentCommand).not.toHaveBeenCalled();
+    const error = expectRespondError(respond, { code: ErrorCodes.UNAVAILABLE });
+    expectStringFieldContains(error, "message", "changed before expected work could start");
   });
 
   it("forwards the selected agent id with canonical global session keys", async () => {

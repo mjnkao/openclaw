@@ -777,6 +777,20 @@ describe("subagent registry seam flow", () => {
     });
   });
 
+  it("persists the requester lifecycle captured at spawn admission", () => {
+    mod.registerSubagentRun({
+      runId: "run-requester-owner",
+      childSessionKey: "agent:main:subagent:requester-owner",
+      requesterLifecycleRevision: "requester-revision",
+      task: "preserve requester ownership",
+      expectsCompletionMessage: true,
+    });
+
+    expect(mod.getSubagentRunByRunId("run-requester-owner")).toMatchObject({
+      requesterLifecycleRevision: "requester-revision",
+    });
+  });
+
   it("tracks missing-entry lifecycle result refresh until capture and persistence settle", async () => {
     const childSessionKey = "agent:main:subagent:refresh-admission";
     mocks.callGateway.mockImplementation(async (request: { method?: string }) =>

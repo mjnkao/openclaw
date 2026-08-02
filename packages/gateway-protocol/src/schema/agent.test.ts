@@ -76,6 +76,7 @@ describe("AgentParamsSchema", () => {
         message: "resume",
         sessionKey: "agent:main:main",
         expectedExistingSessionId: "session-1",
+        expectedLifecycleRevision: "revision-1",
         idempotencyKey: "recovery-1",
       }),
     ).toBe(true);

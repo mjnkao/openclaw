@@ -13,7 +13,15 @@ const deliverSpy = vi.fn(
   }),
 );
 
-let sessionStore: Record<string, { sessionId?: string; lastChannel?: string; lastTo?: string }>;
+let sessionStore: Record<
+  string,
+  {
+    sessionId?: string;
+    lifecycleRevision?: string;
+    lastChannel?: string;
+    lastTo?: string;
+  }
+>;
 
 const { registryRuntimeMock } = vi.hoisted(() => ({
   registryRuntimeMock: {
@@ -154,7 +162,9 @@ describe("maybeWakeRequesterAfterAllChildrenSettled", () => {
     deliverSpy.mockClear();
     transitionBatchSpy.mockClear();
     completeBatchSpy.mockClear();
-    sessionStore = { [REQUESTER]: { sessionId: "sess-main" } };
+    sessionStore = {
+      [REQUESTER]: { sessionId: "sess-main", lifecycleRevision: "requester-revision" },
+    };
     registryRuntimeMock.hasDescendantRunAwaitingSettle.mockReset().mockReturnValue(false);
     registryRuntimeMock.listSubagentRunsForRequester.mockReset().mockReturnValue([]);
     registryRuntimeMock.getLatestSubagentRunByChildSessionKey
@@ -191,6 +201,125 @@ describe("maybeWakeRequesterAfterAllChildrenSettled", () => {
     expect(registryRuntimeMock.hasDescendantRunAwaitingSettle).toHaveBeenCalledWith(
       REQUESTER,
       "run-b",
+    );
+  });
+
+  it("delivers when the requester lifecycle still matches spawn admission", async () => {
+    const children = [
+      makeSettledChild({
+        runId: "run-a",
+        requesterLifecycleRevision: "requester-revision",
+      }),
+      makeSettledChild({
+        runId: "run-b",
+        requesterLifecycleRevision: "requester-revision",
+      }),
+    ];
+    registryRuntimeMock.listSubagentRunsForRequester.mockReturnValue(children);
+
+    await expect(
+      maybeWakeRequesterAfterAllChildrenSettled(wakeParams({ settledEntry: children[1] })),
+    ).resolves.toBe(true);
+
+    expect(deliverSpy).toHaveBeenCalledOnce();
+    expect(deliveredCallArg().expectedRequesterLifecycleRevision).toBe("requester-revision");
+    expect(completeBatchSpy).toHaveBeenCalledWith(["run-a", "run-b"]);
+  });
+
+  it("preserves the wake when gateway admission observes a replacement race", async () => {
+    const children = [
+      makeSettledChild({
+        runId: "run-a",
+        requesterLifecycleRevision: "requester-revision",
+      }),
+      makeSettledChild({
+        runId: "run-b",
+        requesterLifecycleRevision: "requester-revision",
+      }),
+    ];
+    registryRuntimeMock.listSubagentRunsForRequester.mockReturnValue(children);
+    deliverSpy.mockResolvedValueOnce({
+      delivered: false,
+      path: "direct",
+      reason: "requester_replaced",
+    });
+
+    await expect(
+      maybeWakeRequesterAfterAllChildrenSettled(wakeParams({ settledEntry: children[1] })),
+    ).resolves.toBe(false);
+
+    expect(completeBatchSpy).not.toHaveBeenCalled();
+    expect(transitionBatchSpy).toHaveBeenCalledWith(
+      ["run-a", "run-b"],
+      expect.objectContaining({
+        status: "pending",
+        lastError: "requester lifecycle changed",
+      }),
+    );
+  });
+
+  it("preserves the wake when reset replaces the requester lifecycle without changing session id", async () => {
+    const children = [
+      makeSettledChild({
+        runId: "run-a",
+        requesterLifecycleRevision: "requester-revision",
+      }),
+      makeSettledChild({
+        runId: "run-b",
+        requesterLifecycleRevision: "requester-revision",
+      }),
+    ];
+    registryRuntimeMock.listSubagentRunsForRequester.mockReturnValue(children);
+    sessionStore[REQUESTER] = {
+      sessionId: "sess-main",
+      lifecycleRevision: "replacement-revision",
+    };
+
+    await expect(
+      maybeWakeRequesterAfterAllChildrenSettled(wakeParams({ settledEntry: children[1] })),
+    ).resolves.toBe(false);
+
+    expect(deliverSpy).not.toHaveBeenCalled();
+    expect(completeBatchSpy).not.toHaveBeenCalled();
+    expect(transitionBatchSpy).toHaveBeenCalledWith(["run-a", "run-b"], {
+      status: "pending",
+      attemptCount: 0,
+      batchRunIds: ["run-a", "run-b"],
+      lastError: "requester lifecycle changed",
+    });
+    expect(children[0].requesterSettleWake).toMatchObject({
+      status: "pending",
+      batchRunIds: ["run-a", "run-b"],
+      lastError: "requester lifecycle changed",
+    });
+
+    transitionBatchSpy.mockClear();
+    await expect(
+      maybeWakeRequesterAfterAllChildrenSettled(wakeParams({ settledEntry: children[0] })),
+    ).resolves.toBe(false);
+    expect(transitionBatchSpy).not.toHaveBeenCalled();
+    expect(deliverSpy).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when a wake batch contains mixed requester ownership", async () => {
+    const children = [
+      makeSettledChild({
+        runId: "run-a",
+        requesterLifecycleRevision: "requester-revision",
+      }),
+      makeSettledChild({ runId: "run-b" }),
+    ];
+    registryRuntimeMock.listSubagentRunsForRequester.mockReturnValue(children);
+
+    await expect(
+      maybeWakeRequesterAfterAllChildrenSettled(wakeParams({ settledEntry: children[1] })),
+    ).resolves.toBe(false);
+
+    expect(deliverSpy).not.toHaveBeenCalled();
+    expect(completeBatchSpy).not.toHaveBeenCalled();
+    expect(transitionBatchSpy).toHaveBeenCalledWith(
+      ["run-a", "run-b"],
+      expect.objectContaining({ lastError: "requester lifecycle changed" }),
     );
   });
 

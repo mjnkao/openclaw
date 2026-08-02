@@ -1964,6 +1964,7 @@ describe("sessions_spawn tool", () => {
   it("passes completionOwnerKey through to spawnSubagentDirect separately from agentSessionKey", async () => {
     const tool = createSessionsSpawnTool({
       agentSessionKey: "agent:main:telegram:default:direct:456",
+      requesterLifecycleRevision: "requester-revision",
       completionOwnerKey: "agent:main:main",
       agentChannel: "telegram",
       agentAccountId: "default",
@@ -1974,6 +1975,7 @@ describe("sessions_spawn tool", () => {
 
     const spawnContext = mockCallArg(hoisted.spawnSubagentDirectMock, 0, 1, "spawnSubagentDirect");
     expect(spawnContext.agentSessionKey).toBe("agent:main:telegram:default:direct:456");
+    expect(spawnContext.requesterLifecycleRevision).toBe("requester-revision");
     expect(spawnContext.completionOwnerKey).toBe("agent:main:main");
   });
 
@@ -1981,6 +1983,7 @@ describe("sessions_spawn tool", () => {
     registerAcpBackendForTest();
     const tool = createSessionsSpawnTool({
       agentSessionKey: "agent:main:telegram:default:direct:456",
+      requesterLifecycleRevision: "requester-revision",
       completionOwnerKey: "agent:main:main",
       agentChannel: "telegram",
       agentAccountId: "default",
@@ -1995,6 +1998,7 @@ describe("sessions_spawn tool", () => {
 
     const spawnContext = mockCallArg(hoisted.spawnAcpDirectMock, 0, 1, "spawnAcpDirect");
     expect(spawnContext.agentSessionKey).toBe("agent:main:telegram:default:direct:456");
+    expect(spawnContext.requesterLifecycleRevision).toBe("requester-revision");
     expect(spawnContext.completionOwnerKey).toBe("agent:main:main");
   });
 });

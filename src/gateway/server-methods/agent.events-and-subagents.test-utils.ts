@@ -226,6 +226,7 @@ describe("gateway agent handler", () => {
       { suppressPromptPersistence: true, idempotencyKey: "test-public-prompt-suppress" },
       {
         expectedExistingSessionId: "existing-session-id",
+        expectedLifecycleRevision: "existing-revision",
         idempotencyKey: "test-public-expected-session",
       },
       {

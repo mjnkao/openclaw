@@ -122,6 +122,7 @@ type SpawnAcpParams = {
 export type SpawnAcpContext = {
   agentSessionKey?: string;
   requesterTurnRunId?: string;
+  requesterLifecycleRevision?: string;
   completionOwnerKey?: string;
   requesterAgentIdOverride?: string;
   agentChannel?: string;
@@ -652,6 +653,7 @@ export async function spawnAcpDirect(
       return {
         runId,
         requesterTurnRunId: ctx.requesterTurnRunId,
+        requesterLifecycleRevision: ctx.requesterLifecycleRevision,
         childSessionKey: sessionKey,
         controllerSessionKey: ownership.controllerSessionKey,
         requesterSessionKey: ownership.completionRequesterSessionKey,

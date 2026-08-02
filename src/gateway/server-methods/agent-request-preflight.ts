@@ -170,6 +170,7 @@ export function prepareAgentRequestPreflight(
   const expectedSessionResult = resolveExpectedExistingSessionConstraint({
     canUseInternalRuntimeHandoff,
     expectedExistingSessionId: request.expectedExistingSessionId,
+    expectedLifecycleRevision: request.expectedLifecycleRevision,
     internalRuntimeHandoffId: request.internalRuntimeHandoffId,
   });
   if (!expectedSessionResult.ok) {

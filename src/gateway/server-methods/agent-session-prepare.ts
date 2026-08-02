@@ -26,6 +26,11 @@ import { parseCronRunScopeSuffix } from "../../sessions/session-key-utils.js";
 import { sessionDeliveryChannel } from "../../utils/delivery-context.shared.js";
 import { loadSessionEntry } from "../session-utils.js";
 import {
+  assertExpectedExistingSession,
+  ExpectedExistingSessionChangedError,
+  type ExpectedExistingSessionConstraint,
+} from "./agent-expected-session.js";
+import {
   respondDeletedAgentSession,
   type RestoredCronContinuation,
 } from "./agent-handler-helpers.js";
@@ -63,7 +68,7 @@ type PreparedAgentSession = {
 export function prepareAgentSession(params: {
   requestedSessionKey: string;
   requestedSessionId?: string;
-  expectedExistingSessionId?: string;
+  expectedSession?: ExpectedExistingSessionConstraint;
   agentId?: string;
   recipientChannel?: string;
   request: AgentRunRequest;
@@ -77,15 +82,17 @@ export function prepareAgentSession(params: {
     params.requestedSessionKey,
     { ...(params.agentId ? { agentId: params.agentId } : {}), clone: false },
   );
-  if (params.expectedExistingSessionId && entry?.sessionId !== params.expectedExistingSessionId) {
-    params.respond(
-      false,
-      undefined,
-      errorShape(
-        ErrorCodes.UNAVAILABLE,
-        `Session "${canonicalKey}" changed before expected work could start.`,
-      ),
-    );
+  try {
+    assertExpectedExistingSession({
+      constraint: params.expectedSession,
+      entry,
+      message: `Session "${canonicalKey}" changed before expected work could start.`,
+    });
+  } catch (error) {
+    if (!(error instanceof ExpectedExistingSessionChangedError)) {
+      throw error;
+    }
+    params.respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, error.message));
     return undefined;
   }
 
@@ -215,7 +222,7 @@ export function prepareAgentSession(params: {
       })
     : undefined;
   const skipImplicitExpiry =
-    params.expectedExistingSessionId !== undefined ||
+    params.expectedSession !== undefined ||
     restoredCronContinuationIdentity !== undefined ||
     entry?.modelSelectionLocked === true ||
     (resetPolicy.configured !== true && hasProviderOwnedSession(entry));

@@ -1350,6 +1350,93 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
     });
   });
 
+  it("binds requester settle wakes to gateway lifecycle admission", async () => {
+    const dispatchGatewayMethodInProcess = createInProcessGatewayMock();
+    testing.setDepsForTest({
+      dispatchGatewayMethodInProcess,
+      getRequesterSessionActivity: () => ({
+        sessionId: "requester-session-local",
+        isActive: false,
+      }),
+      getRuntimeConfig: () => ({}) as never,
+      loadRequesterSessionEntry: () => ({
+        cfg: {},
+        entry: {
+          sessionId: "requester-session-local",
+          lifecycleRevision: "revision-1",
+          updatedAt: 1,
+        },
+        canonicalKey: "agent:main:main",
+      }),
+    });
+
+    await expect(
+      deliverSubagentAnnouncement({
+        requesterSessionKey: "agent:main:main",
+        targetRequesterSessionKey: "agent:main:main",
+        triggerMessage: "all children settled",
+        steerMessage: "all children settled",
+        requesterIsSubagent: false,
+        expectsCompletionMessage: false,
+        requireDirectDelivery: true,
+        expectedRequesterLifecycleRevision: "revision-1",
+        directIdempotencyKey: "requester-settle-1",
+      }),
+    ).resolves.toMatchObject({ delivered: true, path: "direct" });
+
+    expectInProcessAgentParams(dispatchGatewayMethodInProcess, {
+      sessionKey: "agent:main:main",
+      expectedExistingSessionId: "requester-session-local",
+      expectedLifecycleRevision: "revision-1",
+    });
+  });
+
+  it("reports a requester replacement observed by gateway admission", async () => {
+    const changedError = Object.assign(
+      new Error('Session "agent:main:main" changed while starting expected work. Retry.'),
+      { gatewayCode: "UNAVAILABLE" },
+    );
+    const dispatchGatewayMethodInProcess = vi.fn(async () => {
+      throw changedError;
+    }) as unknown as typeof runtimeDispatchGatewayMethodInProcess;
+    testing.setDepsForTest({
+      dispatchGatewayMethodInProcess,
+      getRequesterSessionActivity: () => ({
+        sessionId: "requester-session-local",
+        isActive: false,
+      }),
+      getRuntimeConfig: () => ({}) as never,
+      loadRequesterSessionEntry: () => ({
+        cfg: {},
+        entry: {
+          sessionId: "requester-session-local",
+          lifecycleRevision: "revision-2",
+          updatedAt: 2,
+        },
+        canonicalKey: "agent:main:main",
+      }),
+    });
+
+    await expect(
+      deliverSubagentAnnouncement({
+        requesterSessionKey: "agent:main:main",
+        targetRequesterSessionKey: "agent:main:main",
+        triggerMessage: "all children settled",
+        steerMessage: "all children settled",
+        requesterIsSubagent: false,
+        expectsCompletionMessage: false,
+        requireDirectDelivery: true,
+        expectedRequesterLifecycleRevision: "revision-1",
+        directIdempotencyKey: "requester-settle-2",
+      }),
+    ).resolves.toMatchObject({
+      delivered: false,
+      path: "direct",
+      reason: "requester_replaced",
+      error: "requester lifecycle changed",
+    });
+  });
+
   it.each([
     { name: "no payloads", result: { payloads: [] } },
     {

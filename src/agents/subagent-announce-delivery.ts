@@ -439,6 +439,19 @@ function isPermanentAnnounceDeliveryError(error: unknown): boolean {
   );
 }
 
+function isExpectedRequesterSessionChangedError(error: unknown): boolean {
+  return hasAnnounceErrorMatch(error, (candidate) => {
+    if (!candidate || typeof candidate !== "object") {
+      return false;
+    }
+    const record = candidate as { gatewayCode?: unknown };
+    return (
+      record.gatewayCode === "UNAVAILABLE" &&
+      /session .* changed (?:before|while).* expected work/i.test(summarizeDeliveryError(candidate))
+    );
+  });
+}
+
 function isIncompleteAnnounceAgentResultError(error: unknown): boolean {
   const message = summarizeDeliveryError(error);
   return /(?:incomplete terminal response|code=incomplete_result)\b/i.test(message);
@@ -784,6 +797,7 @@ async function sendSubagentAnnounceDirectly(params: {
   sourceSessionKey?: string;
   sourceChannel?: string;
   sourceTool?: string;
+  expectedRequesterLifecycleRevision?: string;
   requesterIsSubagent: boolean;
   onDeliveryResult?: (delivery: SubagentAnnounceDeliveryResult) => void;
   signal?: AbortSignal;
@@ -987,6 +1001,12 @@ async function sendSubagentAnnounceDirectly(params: {
         ? { sourceReplyDeliveryMode: completionSourceReplyDeliveryMode }
         : {}),
       idempotencyKey: params.directIdempotencyKey,
+      ...(params.expectedRequesterLifecycleRevision && requesterEntry?.sessionId
+        ? {
+            expectedExistingSessionId: requesterEntry.sessionId,
+            expectedLifecycleRevision: params.expectedRequesterLifecycleRevision,
+          }
+        : {}),
     };
     let directAnnounceResponse: unknown;
     try {
@@ -1163,6 +1183,14 @@ async function sendSubagentAnnounceDirectly(params: {
       path: "direct",
     };
   } catch (err) {
+    if (isExpectedRequesterSessionChangedError(err)) {
+      return {
+        delivered: false,
+        path: "direct",
+        reason: "requester_replaced",
+        error: "requester lifecycle changed",
+      };
+    }
     const terminal = isPermanentAnnounceDeliveryError(err) && hasAnnounceSendEvidence(err);
     return {
       delivered: false,
@@ -1187,6 +1215,7 @@ export async function deliverSubagentAnnouncement(params: {
   sourceSessionKey?: string;
   sourceChannel?: string;
   sourceTool?: string;
+  expectedRequesterLifecycleRevision?: string;
   targetRequesterSessionKey: string;
   requesterIsSubagent: boolean;
   expectsCompletionMessage: boolean;
@@ -1336,6 +1365,7 @@ export async function deliverSubagentAnnouncement(params: {
         sourceSessionKey: params.sourceSessionKey,
         sourceChannel: params.sourceChannel,
         sourceTool: params.sourceTool,
+        expectedRequesterLifecycleRevision: params.expectedRequesterLifecycleRevision,
         requesterIsSubagent: params.requesterIsSubagent,
         expectsCompletionMessage: params.expectsCompletionMessage,
         onDeliveryResult: params.onDeliveryResult,

@@ -305,6 +305,8 @@ type OpenClawCodingToolsOptions = {
    * sandbox/policy session key used to construct the tool set.
    */
   runSessionKey?: string;
+  /** Session owner revision captured when the run was admitted. */
+  sessionLifecycleRevision?: string;
   /** Ephemeral session UUID — regenerated on /new and /reset. */
   sessionId?: string;
   /**
@@ -991,6 +993,7 @@ function createOpenClawCodingToolsInternal(options?: OpenClawCodingToolsOptions)
             agentSessionKey: options?.sessionKey,
             runId: options?.runId,
             runSessionKey: options?.runSessionKey,
+            sessionLifecycleRevision: options?.sessionLifecycleRevision,
             agentChannel: resolveGatewayMessageChannel(
               options?.messageChannel ?? options?.messageProvider,
             ),

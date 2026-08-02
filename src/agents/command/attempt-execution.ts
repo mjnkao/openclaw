@@ -1190,6 +1190,7 @@ export function runAgentAttempt(params: {
     runTimeoutOverrideMs: params.runTimeoutOverrideMs,
     runId: params.runId,
     lifecycleGeneration: params.lifecycleGeneration,
+    sessionLifecycleRevision: params.sessionEntry?.lifecycleRevision,
     lane: params.opts.lane,
     // Hidden internal runs lack an event consumer; visible lanes still feed UI and parent relays.
     suppressLiveStreamOutput: shouldSuppressEmbeddedLiveStreamOutput(params),

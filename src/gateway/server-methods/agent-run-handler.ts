@@ -242,7 +242,7 @@ export const agentRunHandler: GatewayRequestHandlers["agent"] = async ({
       const preparedSession = prepareAgentSession({
         requestedSessionKey,
         requestedSessionId,
-        expectedExistingSessionId,
+        expectedSession,
         agentId,
         recipientChannel,
         request,

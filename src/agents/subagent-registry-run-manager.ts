@@ -213,6 +213,7 @@ export function markSubagentRunPausedAfterYield(params: {
 export type RegisterSubagentRunParams = {
   runId: string;
   requesterTurnRunId?: string;
+  requesterLifecycleRevision?: string;
   childSessionKey: string;
   controllerSessionKey?: string;
   requesterSessionKey: string;
@@ -830,6 +831,9 @@ export function createSubagentRunManager(params: {
       taskRunId: runId,
       ...(requesterTurnRunId && registerParams.expectsCompletionMessage === true
         ? { requesterTurnRunId }
+        : {}),
+      ...(registerParams.requesterLifecycleRevision?.trim()
+        ? { requesterLifecycleRevision: registerParams.requesterLifecycleRevision.trim() }
         : {}),
       childSessionKey,
       controllerSessionKey,

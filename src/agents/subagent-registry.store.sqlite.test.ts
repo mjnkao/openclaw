@@ -91,6 +91,7 @@ describe("subagent registry sqlite store", () => {
     await withTempStateEnv(async () => {
       const run = createRun({
         requesterTurnRunId: "run-requester",
+        requesterLifecycleRevision: "requester-revision",
         requesterTurnYielded: true,
         retireAfterRequesterTurn: true,
         endedReason: "subagent-error",
@@ -123,6 +124,7 @@ describe("subagent registry sqlite store", () => {
         runId: run.runId,
         childSessionKey: run.childSessionKey,
         requesterSessionKey: run.requesterSessionKey,
+        requesterLifecycleRevision: "requester-revision",
         task: run.task,
         requesterTurnRunId: "run-requester",
         requesterTurnYielded: true,

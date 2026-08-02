@@ -110,6 +110,8 @@ export function createOpenClawTools(
      * sandbox/policy session key used to construct the tool set.
      */
     runSessionKey?: string;
+    /** Session owner revision captured when the run was admitted. */
+    sessionLifecycleRevision?: string;
     agentChannel?: GatewayMessageChannel;
     runId?: string;
     agentAccountId?: string;
@@ -658,6 +660,7 @@ export function createOpenClawTools(
           createSessionsSpawnTool({
             agentSessionKey: options?.agentSessionKey,
             requesterTurnRunId: options?.runId,
+            requesterLifecycleRevision: options?.sessionLifecycleRevision,
             completionOwnerKey: options?.runSessionKey,
             agentChannel: options?.agentChannel,
             agentAccountId: options?.agentAccountId,

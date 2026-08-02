@@ -57,6 +57,7 @@ export type RequesterSettleWakeBatchState = Omit<RequesterSettleWakeState, "reti
 const REQUESTER_SETTLE_WAKE_MAX_ATTEMPTS = 3;
 const REQUESTER_SETTLE_WAKE_MAX_AMBIGUOUS_REPLAYS = 3;
 const REQUESTER_SETTLE_WAKE_RETRY_DELAYS_MS = [30_000, 120_000] as const;
+const REQUESTER_SETTLE_WAKE_OWNER_CHANGED = "requester lifecycle changed";
 const activeRequesterSettleWakeBatches = new Set<string>();
 
 function buildRequesterSettleWakeMessage(params: { findings?: string }): string {
@@ -188,6 +189,47 @@ function completeRequesterSettleWakeBatch(params: {
   params.completeBatch(params.runIds, params.state.rearmGeneration);
 }
 
+function readExpectedRequesterLifecycleRevision(
+  batch: readonly SubagentRunRecord[],
+): { status: "legacy" } | { status: "owned"; lifecycleRevision: string } | { status: "conflict" } {
+  const revisions = batch.map((entry) => entry.requesterLifecycleRevision?.trim() || undefined);
+  const expected = new Set(revisions.filter((revision): revision is string => Boolean(revision)));
+  if (expected.size === 0) {
+    return { status: "legacy" };
+  }
+  if (expected.size !== 1 || revisions.some((revision) => revision === undefined)) {
+    return { status: "conflict" };
+  }
+  return { status: "owned", lifecycleRevision: [...expected][0]! };
+}
+
+function preserveRequesterSettleWakeAfterOwnerChange(params: {
+  batchRunIds: readonly string[];
+  state: RequesterSettleWakeBatchState;
+  transitionBatch: (runIds: readonly string[], state: RequesterSettleWakeBatchState) => void;
+}): void {
+  if (
+    params.state.status === "pending" &&
+    params.state.lastError === REQUESTER_SETTLE_WAKE_OWNER_CHANGED &&
+    params.state.batchRunIds?.length === params.batchRunIds.length &&
+    params.state.batchRunIds.every((runId, index) => runId === params.batchRunIds[index])
+  ) {
+    return;
+  }
+  params.transitionBatch(params.batchRunIds, {
+    status: "pending",
+    attemptCount: params.state.attemptCount,
+    ...(params.state.replayCount !== undefined ? { replayCount: params.state.replayCount } : {}),
+    batchRunIds: [...params.batchRunIds],
+    ...(params.state.requesterYieldBatch === true ? { requesterYieldBatch: true } : {}),
+    ...(params.state.afterRequesterYield === true ? { afterRequesterYield: true } : {}),
+    ...(params.state.rearmGeneration !== undefined
+      ? { rearmGeneration: params.state.rearmGeneration }
+      : {}),
+    lastError: REQUESTER_SETTLE_WAKE_OWNER_CHANGED,
+  });
+}
+
 /**
  * Wakes a registry-less top-level requester once its last spawned child
  * reaches terminal settle. Durable state transitions happen synchronously
@@ -307,6 +349,19 @@ export async function maybeWakeRequesterAfterAllChildrenSettled(params: {
     });
     return false;
   }
+  const expectedRequesterOwner = readExpectedRequesterLifecycleRevision(settledBatch);
+  if (
+    expectedRequesterOwner.status === "conflict" ||
+    (expectedRequesterOwner.status === "owned" &&
+      requesterEntry?.lifecycleRevision !== expectedRequesterOwner.lifecycleRevision)
+  ) {
+    preserveRequesterSettleWakeAfterOwnerChange({
+      batchRunIds,
+      state: selectedState,
+      transitionBatch: params.transitionBatch,
+    });
+    return false;
+  }
 
   const findings = buildChildCompletionFindings(
     dedupeLatestChildCompletionRows(
@@ -396,6 +451,11 @@ export async function maybeWakeRequesterAfterAllChildrenSettled(params: {
         sourceSessionKey: currentSettledEntry.childSessionKey,
         sourceChannel: INTERNAL_MESSAGE_CHANNEL,
         sourceTool: "subagent_announce",
+        ...(expectedRequesterOwner.status === "owned"
+          ? {
+              expectedRequesterLifecycleRevision: expectedRequesterOwner.lifecycleRevision,
+            }
+          : {}),
         targetRequesterSessionKey: requesterSessionKey,
         requesterIsSubagent: false,
         expectsCompletionMessage: false,
@@ -447,6 +507,14 @@ export async function maybeWakeRequesterAfterAllChildrenSettled(params: {
         completeBatch,
       });
       return true;
+    }
+    if (delivery.reason === "requester_replaced") {
+      preserveRequesterSettleWakeAfterOwnerChange({
+        batchRunIds,
+        state,
+        transitionBatch: params.transitionBatch,
+      });
+      return false;
     }
     if (delivery.terminal === true || delivery.reason === "requester_abandoned") {
       completeRequesterSettleWakeBatch({

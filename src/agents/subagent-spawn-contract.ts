@@ -41,6 +41,7 @@ export type SpawnSubagentParams = {
 export type SpawnSubagentContext = {
   agentSessionKey?: string;
   requesterTurnRunId?: string;
+  requesterLifecycleRevision?: string;
   /** Separate key used only for completion routing, not sandbox policy. */
   completionOwnerKey?: string;
   agentChannel?: string;

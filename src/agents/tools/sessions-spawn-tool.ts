@@ -266,6 +266,7 @@ export function createSessionsSpawnTool(
   opts?: {
     agentSessionKey?: string;
     requesterTurnRunId?: string;
+    requesterLifecycleRevision?: string;
     /** Separate key used only for completion routing (registerSubagentRun requesterSessionKey). */
     completionOwnerKey?: string;
     agentChannel?: GatewayMessageChannel;
@@ -493,6 +494,7 @@ export function createSessionsSpawnTool(
           {
             agentSessionKey: opts?.agentSessionKey,
             requesterTurnRunId: opts?.requesterTurnRunId,
+            requesterLifecycleRevision: opts?.requesterLifecycleRevision,
             completionOwnerKey: opts?.completionOwnerKey,
             requesterAgentIdOverride: opts?.requesterAgentIdOverride,
             agentChannel: opts?.agentChannel,
@@ -557,6 +559,7 @@ export function createSessionsSpawnTool(
         {
           agentSessionKey: opts?.agentSessionKey,
           requesterTurnRunId: opts?.requesterTurnRunId,
+          requesterLifecycleRevision: opts?.requesterLifecycleRevision,
           completionOwnerKey: opts?.completionOwnerKey,
           agentChannel: opts?.agentChannel,
           agentAccountId: opts?.agentAccountId,

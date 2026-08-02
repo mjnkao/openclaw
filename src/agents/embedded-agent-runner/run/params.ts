@@ -86,6 +86,8 @@ export type RunEmbeddedAgentParams = {
   sessionTarget?: AgentRunSessionTarget;
   /** Immutable gateway lifecycle ownership captured when this execution was admitted. */
   lifecycleGeneration?: string;
+  /** Session owner revision captured when this execution was admitted. */
+  sessionLifecycleRevision?: string;
   /** Provider prompt-cache affinity key; distinct from transcript/session identity. */
   promptCacheKey?: string;
   /** Session-like key for sandbox and tool-policy resolution. Defaults to sessionKey. */
