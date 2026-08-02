@@ -348,7 +348,11 @@ describe("durable runtime sqlite store", () => {
         verifyDb
           .prepare("SELECT meta_key, role, schema_version FROM schema_meta WHERE meta_key = ?")
           .get("primary"),
-      ).toEqual({ meta_key: "primary", role: "global", schema_version: 1 });
+      ).toEqual({
+        meta_key: "primary",
+        role: "global",
+        schema_version: OPENCLAW_STATE_SCHEMA_VERSION,
+      });
       expect(
         verifyDb
           .prepare("SELECT meta_key, role, schema_version FROM schema_meta WHERE meta_key = ?")

@@ -2,6 +2,7 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import { pathToFileURL } from "node:url";
 import {
   clearNodeSqliteKyselyCacheForDatabase,
   enableNodeSqliteKyselyStatementCache,
@@ -588,9 +589,19 @@ export function openOpenClawStateDatabase(
   }
   assertOpenClawStateDatabaseFreshOpenAllowed(options);
   if (existsSync(pathname)) {
-    const preflight = openNodeSqliteDatabase(pathname, { readOnly: true });
+    // Inspect the main database image without joining recovery or writer locks.
+    // The writable owner rechecks after opening, before persistent pragmas.
+    const preflight = openNodeSqliteDatabase(
+      `${pathToFileURL(pathname).href}?mode=ro&immutable=1`,
+      { readOnly: true },
+    );
     try {
       assertSupportedSchemaVersion(preflight, pathname);
+    } catch (error) {
+      if (error instanceof Error && error.name === "SqliteSchemaVersionError") {
+        recordOpenClawStateDatabaseOpenFailure(pathname, error);
+      }
+      throw error;
     } finally {
       preflight.close();
     }

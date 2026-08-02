@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
-import { requireNodeSqlite } from "../infra/node-sqlite.js";
+import { openNodeSqliteDatabase } from "../infra/node-sqlite.js";
 import { runSqliteImmediateTransactionSync } from "../infra/sqlite-transaction.js";
 import { readSqliteUserVersion } from "../infra/sqlite-user-version.js";
 import { OPENCLAW_STATE_SCHEMA_VERSION } from "../state/openclaw-state-db.js";
@@ -98,13 +98,13 @@ function normalizeSqlFragment(sql: string): string {
   let quote: "'" | '"' | "`" | "]" | undefined;
   let pendingSpace = false;
   for (let index = 0; index < source.length; index += 1) {
-    const character = source[index];
+    const character = source.charAt(index);
     if (quote) {
       normalized += character;
       const quoteEnd = quote === "]" ? "]" : quote;
       if (character === quoteEnd) {
-        if (source[index + 1] === quoteEnd && quote !== "]") {
-          normalized += source[index + 1];
+        if (source.charAt(index + 1) === quoteEnd && quote !== "]") {
+          normalized += source.charAt(index + 1);
           index += 1;
         } else {
           quote = undefined;
@@ -158,7 +158,7 @@ function extractWhereClause(sql: string | null): string | null {
     return null;
   }
   const match = /\bWHERE\b([\s\S]*)$/i.exec(sql);
-  return match ? normalizeSqlFragment(match[1]) : null;
+  return match?.[1] ? normalizeSqlFragment(match[1]) : null;
 }
 
 function collectColumns(db: DatabaseSync, tableName: string): SqliteColumnRow[] {
@@ -265,8 +265,7 @@ function collectTableShape(db: DatabaseSync, tableName: string): DurableTableSha
 }
 
 function collectExpectedDurableSchemaContract(): DurableSchemaContract {
-  const { DatabaseSync } = requireNodeSqlite();
-  const db = new DatabaseSync(":memory:");
+  const db = openNodeSqliteDatabase(":memory:");
   try {
     db.exec(DURABLE_RUNTIME_SCHEMA_SQL);
     const tableRows = db
@@ -490,8 +489,7 @@ export function openDurableRuntimeSchemaReadOnly(pathname: string): DatabaseSync
   if (!existsSync(pathname)) {
     throw new Error(`Durable runtime database ${pathname} is not initialized.`);
   }
-  const { DatabaseSync } = requireNodeSqlite();
-  const db = new DatabaseSync(pathname, { readOnly: true });
+  const db = openNodeSqliteDatabase(pathname, { readOnly: true });
   try {
     assertSupportedSharedStateSchemaVersion(db, pathname);
     const contract = getExpectedDurableSchemaContract();
