@@ -2,7 +2,6 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { pathToFileURL } from "node:url";
 import {
   clearNodeSqliteKyselyCacheForDatabase,
   enableNodeSqliteKyselyStatementCache,
@@ -65,6 +64,7 @@ import * as operatorApprovalMigration from "./openclaw-state-db-operator-approva
 import { ensureOpenClawStatePermissions } from "./openclaw-state-db-permissions.js";
 import { ensureAdditiveStateColumns } from "./openclaw-state-db-schema-additive.js";
 import { tableExists } from "./openclaw-state-db-schema-helpers.js";
+import { assertOpenClawStateSchemaVersionBeforeOpen } from "./openclaw-state-db-schema-preflight.js";
 import {
   assertCanonicalStateSchemaShape,
   detectOpenClawStateDatabaseSchemaMigrationsFromDatabase,
@@ -102,10 +102,6 @@ export { withOpenClawStateStartupMigrationCheckpointDatabase } from "./openclaw-
  * tables, private file permissions, cached handles, and audit rows for
  * migrations/backups that operate on local state.
  */
-export type OpenClawStateDatabaseLease = {
-  database: OpenClawStateDatabase;
-  release: () => void;
-};
 const cachedDatabases = new Map<string, OpenClawStateDatabase>();
 const cachedDatabaseLeaseCounts = new Map<OpenClawStateDatabase, number>();
 const cachedDatabasesPendingClose = new Set<OpenClawStateDatabase>();
@@ -588,24 +584,7 @@ export function openOpenClawStateDatabase(
     closeOpenClawStateDatabaseHandle(pathname, cached);
   }
   assertOpenClawStateDatabaseFreshOpenAllowed(options);
-  if (existsSync(pathname)) {
-    // Inspect the main database image without joining recovery or writer locks.
-    // The writable owner rechecks after opening, before persistent pragmas.
-    const preflight = openNodeSqliteDatabase(
-      `${pathToFileURL(pathname).href}?mode=ro&immutable=1`,
-      { readOnly: true },
-    );
-    try {
-      assertSupportedSchemaVersion(preflight, pathname);
-    } catch (error) {
-      if (error instanceof Error && error.name === "SqliteSchemaVersionError") {
-        recordOpenClawStateDatabaseOpenFailure(pathname, error);
-      }
-      throw error;
-    } finally {
-      preflight.close();
-    }
-  }
+  assertOpenClawStateSchemaVersionBeforeOpen(pathname, recordOpenClawStateDatabaseOpenFailure);
   ensureOpenClawStatePermissions(pathname, env);
   const db = openNodeSqliteDatabase(pathname);
   enableNodeSqliteKyselyStatementCache(db);
@@ -667,9 +646,7 @@ function closeOpenClawStateDatabaseHandle(pathname: string, database: OpenClawSt
   cachedDatabasesPendingClose.delete(database);
 }
 
-export function acquireOpenClawStateDatabaseLease(
-  options: OpenClawStateDatabaseOptions = {},
-): OpenClawStateDatabaseLease {
+export function acquireOpenClawStateDatabaseLease(options: OpenClawStateDatabaseOptions = {}) {
   const database = openOpenClawStateDatabase(options);
   const pathname = database.path;
   if (cachedDatabases.get(pathname) !== database) {
