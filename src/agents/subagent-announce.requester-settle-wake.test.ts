@@ -287,7 +287,7 @@ describe("maybeWakeRequesterAfterAllChildrenSettled", () => {
       batchRunIds: ["run-a", "run-b"],
       lastError: "requester lifecycle changed",
     });
-    expect(children[0].requesterSettleWake).toMatchObject({
+    expect(children[0]!.requesterSettleWake).toMatchObject({
       status: "pending",
       batchRunIds: ["run-a", "run-b"],
       lastError: "requester lifecycle changed",
