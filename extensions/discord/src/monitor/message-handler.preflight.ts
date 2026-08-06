@@ -78,6 +78,20 @@ export {
   shouldIgnoreBoundThreadWebhookMessage,
 } from "./message-handler.preflight-helpers.js";
 
+function requiresNativeDiscordMention(params: {
+  mentionPatterns?: NonNullable<DiscordMessagePreflightParams["discordConfig"]>["mentionPatterns"];
+  conversationId: string;
+  parentConversationId?: string;
+}): boolean {
+  const denyIn = new Set(
+    (params.mentionPatterns?.denyIn ?? []).map((value) => value.trim()).filter(Boolean),
+  );
+  return (
+    denyIn.has(params.conversationId) ||
+    Boolean(params.parentConversationId && denyIn.has(params.parentConversationId))
+  );
+}
+
 const DISCORD_HISTORY_MEDIA_MAX_ATTACHMENTS = 4;
 const DISCORD_HISTORY_MEDIA_MAX_BYTES = 10 * 1024 * 1024;
 const DISCORD_HISTORY_MEDIA_IDLE_TIMEOUT_MS = 1_000;
@@ -415,7 +429,12 @@ export async function preflightDiscordMessage(
     return null;
   }
   const isBoundThreadSession = Boolean(threadBinding && earlyThreadChannel);
-  const bypassMentionRequirement = isBoundThreadSession;
+  const requireNativeMention = requiresNativeDiscordMention({
+    mentionPatterns: params.discordConfig?.mentionPatterns,
+    conversationId: messageChannelId,
+    parentConversationId: earlyThreadParentId,
+  });
+  const bypassMentionRequirement = isBoundThreadSession && !requireNativeMention;
   if (
     isBoundThreadBotSystemMessage({
       isBoundThreadSession,
@@ -426,11 +445,13 @@ export async function preflightDiscordMessage(
     logVerbose(`discord: drop bound-thread bot system message ${message.id}`);
     return null;
   }
-  const mentionRegexes = buildMentionRegexes(params.cfg, effectiveRoute.agentId, {
-    provider: "discord",
-    conversationId: messageChannelId,
-    providerPolicy: params.discordConfig?.mentionPatterns,
-  });
+  const mentionRegexes = requireNativeMention
+    ? []
+    : buildMentionRegexes(params.cfg, effectiveRoute.agentId, {
+        provider: "discord",
+        conversationId: messageChannelId,
+        providerPolicy: params.discordConfig?.mentionPatterns,
+      });
   const explicitlyMentioned = Boolean(
     botId && message.mentionedUsers?.some((user: User) => user.id === botId),
   );
@@ -576,7 +597,7 @@ export async function preflightDiscordMessage(
   }
 
   const mentionText = hasTypedText ? baseText : "";
-  const { implicitMentionKinds, wasMentioned } = resolveDiscordMentionState({
+  const resolvedMentionState = resolveDiscordMentionState({
     authorIsBot: Boolean(author.bot),
     botId,
     hasAnyMention,
@@ -589,6 +610,12 @@ export async function preflightDiscordMessage(
     senderIsPluralKit: sender.isPluralKit,
     transcript: preflightTranscript,
   });
+  const implicitMentionKinds = requireNativeMention
+    ? []
+    : resolvedMentionState.implicitMentionKinds;
+  const wasMentioned = requireNativeMention
+    ? explicitlyMentioned
+    : resolvedMentionState.wasMentioned;
   logDiscordPreflightInboundSummary({
     messageId: message.id,
     guildId: params.data.guild_id ?? undefined,
@@ -619,7 +646,7 @@ export async function preflightDiscordMessage(
       memberAccessConfigured: hasAccessRestrictions,
       memberAllowed,
       allowNameMatching,
-      allowTextCommands,
+      allowTextCommands: requireNativeMention ? false : allowTextCommands,
       hasControlCommand: hasControlCommandInMessage,
     });
     commandAuthorized = commandAccess.authorized;

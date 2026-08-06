@@ -179,6 +179,7 @@ async function runThreadBoundPreflight(params: {
   message: import("../internal/discord.js").Message;
   threadBinding: import("openclaw/plugin-sdk/conversation-runtime").SessionBindingRecord;
   discordConfig: DiscordConfig;
+  guildEntries?: Parameters<typeof preflightDiscordMessage>[0]["guildEntries"];
   registerBindingAdapter?: boolean;
 }) {
   if (params.registerBindingAdapter) {
@@ -208,6 +209,7 @@ async function runThreadBoundPreflight(params: {
       }),
       client,
     }),
+    guildEntries: params.guildEntries,
     threadBindings: {
       getByThreadId: (id: string) => (id === params.threadId ? params.threadBinding : undefined),
     } as import("./thread-bindings.js").ThreadBindingManager,
@@ -1097,6 +1099,110 @@ describe("preflightDiscordMessage", () => {
     const preflight = expectPreflightResult(result);
     expect(preflight.boundSessionKey).toBe(threadBinding.targetSessionKey);
     expect(preflight.shouldRequireMention).toBe(false);
+  });
+
+  it("requires a native bot mention in denylisted parent channels even for bound threads", async () => {
+    const threadBinding = createThreadBinding();
+    const threadId = "thread-native-mention-only";
+    const parentId = "channel-native-mention-only";
+    const guildEntries = {
+      "guild-1": {
+        channels: {
+          [parentId]: {
+            enabled: true,
+            requireMention: true,
+          },
+        },
+      },
+    };
+    const discordConfig = {
+      mentionPatterns: { mode: "allow", denyIn: [parentId] },
+    } as DiscordConfig;
+
+    const withoutMention = await runThreadBoundPreflight({
+      threadId,
+      parentId,
+      threadBinding,
+      discordConfig,
+      guildEntries,
+      message: createDiscordMessage({
+        id: "m-native-mention-only-1",
+        channelId: threadId,
+        content: "hello without mention",
+        author: { id: "user-1", bot: false, username: "Alice" },
+      }),
+    });
+    expect(withoutMention).toBeNull();
+  });
+
+  it("allows a native bot mention in denylisted parent channels", async () => {
+    const threadBinding = createThreadBinding();
+    const threadId = "thread-native-mention-present";
+    const parentId = "channel-native-mention-present";
+    const withMention = await runThreadBoundPreflight({
+      threadId,
+      parentId,
+      threadBinding,
+      registerBindingAdapter: true,
+      discordConfig: {
+        mentionPatterns: { mode: "allow", denyIn: [parentId] },
+      } as DiscordConfig,
+      guildEntries: {
+        "guild-1": {
+          channels: {
+            [parentId]: {
+              enabled: true,
+              requireMention: true,
+            },
+          },
+        },
+      },
+      message: createDiscordMessage({
+        id: "m-native-mention-present",
+        channelId: threadId,
+        content: "<@openclaw-bot> hello",
+        mentionedUsers: [{ id: "openclaw-bot" }],
+        author: { id: "user-1", bot: false, username: "Alice" },
+      }),
+    });
+    expect(expectPreflightResult(withMention).shouldRequireMention).toBe(true);
+  });
+
+  it("does not treat a reply to the bot as a native mention in denylisted parent channels", async () => {
+    const threadBinding = createThreadBinding();
+    const threadId = "thread-native-reply-only";
+    const parentId = "channel-native-reply-only";
+    const message = {
+      ...createDiscordMessage({
+        id: "m-native-reply-only",
+        channelId: threadId,
+        content: "reply without an explicit mention",
+        author: { id: "user-1", bot: false, username: "Alice" },
+      }),
+      referencedMessage: { author: { id: "openclaw-bot" } },
+    } as import("../internal/discord.js").Message;
+
+    const result = await runThreadBoundPreflight({
+      threadId,
+      parentId,
+      threadBinding,
+      message,
+      discordConfig: {
+        mentionPatterns: { mode: "allow", denyIn: [parentId] },
+      } as DiscordConfig,
+      guildEntries: {
+        "guild-1": {
+          channels: {
+            [parentId]: {
+              enabled: true,
+              requireMention: true,
+            },
+          },
+        },
+      },
+    });
+
+    expect(result).toBeNull();
   });
 
   it("drops bot messages without mention when allowBots=mentions", async () => {
